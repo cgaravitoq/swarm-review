@@ -1,0 +1,31 @@
+{
+  "providers": {
+    "cloudflare-workers-ai": {
+      "modelOverrides": {
+        "@cf/deepseek-ai/deepseek-v4-flash-0731": {
+          "contextWindow": 1048576,
+          "maxTokens": 65536
+        }
+      }
+    },
+    "cloudflare-ai-gateway": {
+      "models": [
+        {
+          "id": "xai/grok-4.6",
+          "api": "openai-completions",
+          "reasoning": true,
+          "contextWindow": 500000,
+          "maxTokens": 32768
+        }
+      ],
+      "modelOverrides": {
+        "workers-ai/@cf/deepseek-ai/deepseek-v4-flash-0731": {
+          "maxTokens": 65536
+        },
+        "workers-ai/@cf/moonshotai/kimi-k2.6": {
+          "maxTokens": 32768
+        }
+      }
+    }
+  }
+}

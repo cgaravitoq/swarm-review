@@ -1,0 +1,425 @@
+import { afterEach, describe, expect, it, vi } from "vitest";
+import {
+  canaryModel,
+  canaryModels,
+  completeOnce,
+  packedRequestBody,
+} from "../fast-review";
+
+afterEach(() => {
+  vi.unstubAllGlobals();
+});
+
+const chatCompletion = (content: string, extra: Record<string, unknown> = {}) =>
+  new Response(
+    JSON.stringify({
+      choices: [{ message: { content }, finish_reason: "stop", ...extra }],
+      usage: { prompt_tokens: 120, completion_tokens: 34 },
+    }),
+    { status: 200 },
+  );
+
+describe("completeOnce", () => {
+  it("calls the given upstream and reports what the answer cost", async () => {
+    const upstream = vi.fn<typeof fetch>(() =>
+      Promise.resolve(chatCompletion("```json\n{}\n```")),
+    );
+    vi.stubGlobal("fetch", upstream);
+
+    const answer = await completeOnce({
+      baseUrl: "https://provider.invalid/v1",
+      bearer: "token",
+      model: "grok-4.6",
+      prompt: "review",
+    });
+
+    expect(answer.content).toContain("json");
+    expect(answer.finishReason).toBe("stop");
+    // Spend is read back from the provider, never assumed.
+    expect(answer.usage).toEqual({ inputTokens: 120, outputTokens: 34 });
+    expect(upstream.mock.calls[0]?.[0]).toBe(
+      "https://provider.invalid/v1/chat/completions",
+    );
+    const init = upstream.mock.calls[0]?.[1];
+    expect(init?.headers).toMatchObject({
+      authorization: "Bearer token",
+      // A replay of the gateway's cache is not an answer to this pack, and it
+      // arrives with another call's usage attached.
+      "cf-aig-skip-cache": "true",
+    });
+    expect(JSON.parse(String(init?.body))).toMatchObject({
+      reasoning_effort: "low",
+    });
+  });
+  it("reports a completion the provider cut rather than hiding it", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn<typeof fetch>(() =>
+        Promise.resolve(
+          chatCompletion('```json\n{"status":"complete","findings":[]}\n```', {
+            finish_reason: "length",
+          }),
+        ),
+      ),
+    );
+
+    const answer = await completeOnce({
+      baseUrl: "https://provider.invalid/v1",
+      bearer: "token",
+      model: "grok-4.6",
+      prompt: "review",
+    });
+
+    // The block parses and looks clean; only the finish reason says it is not.
+    expect(answer.finishReason).toBe("length");
+  });
+
+  it("keeps the lab's own name for the reason its answer ended", async () => {
+    // The compat route does not rewrite every lab's answer, and Anthropic names
+    // a completion cut at the ceiling `max_tokens` rather than `length`. It is
+    // the same end, and the lane is cut whichever word the lab used.
+    vi.stubGlobal(
+      "fetch",
+      vi.fn<typeof fetch>(() =>
+        Promise.resolve(
+          new Response(
+            JSON.stringify({
+              choices: [
+                { message: { content: "the pack begins with the diff" } },
+              ],
+              stop_reason: "max_tokens",
+              usage: { input_tokens: 11, output_tokens: 8192 },
+            }),
+            { status: 200 },
+          ),
+        ),
+      ),
+    );
+
+    const answer = await completeOnce({
+      baseUrl: "https://gateway.invalid/v1/compat",
+      bearer: "token",
+      model: "anthropic/claude-sonnet-5",
+      prompt: "review",
+    });
+
+    expect(answer.finishReason).toBe("max_tokens");
+    expect(answer.usage).toEqual({ inputTokens: 11, outputTokens: 8192 });
+  });
+
+  it("reads the spend out of an answer the gateway pretty-printed", async () => {
+    // OpenAI's answers arrive indented, so no line of the body parses on its
+    // own and a line-by-line reader reports a paid call as free.
+    vi.stubGlobal(
+      "fetch",
+      vi.fn<typeof fetch>(() =>
+        Promise.resolve(
+          new Response(
+            JSON.stringify(
+              {
+                choices: [
+                  { message: { content: "ok" }, finish_reason: "stop" },
+                ],
+                usage: { prompt_tokens: 11001, completion_tokens: 1222 },
+              },
+              null,
+              2,
+            ),
+            { status: 200 },
+          ),
+        ),
+      ),
+    );
+
+    const answer = await completeOnce({
+      baseUrl: "https://provider.invalid/v1",
+      bearer: "token",
+      model: "openai/gpt-5.6-luna",
+      prompt: "review",
+    });
+
+    expect(answer.usage).toEqual({ inputTokens: 11001, outputTokens: 1222 });
+  });
+
+  it("throws with the provider's own words when the call is refused", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn<typeof fetch>(() =>
+        Promise.resolve(
+          new Response(JSON.stringify({ error: "invalid api key" }), {
+            status: 401,
+          }),
+        ),
+      ),
+    );
+
+    await expect(
+      completeOnce({
+        baseUrl: "https://provider.invalid/v1",
+        bearer: "wrong",
+        model: "grok-4.6",
+        prompt: "review",
+      }),
+    ).rejects.toThrow(/401.*invalid api key/);
+  });
+
+  it("sends each lab the body its own endpoint accepts", () => {
+    const base = {
+      prompt: "review",
+      maxTokens: 8192,
+      reasoning: "off",
+    } as const;
+
+    // Only the labs that understand `reasoning_effort` receive it; the two that
+    // think by default are asked for the answer instead, which is what keeps
+    // their lane inside the run's window.
+
+    // OpenAI's reasoning models take the newer completion cap, and refuse any
+    // temperature but the default: measured against the live gateway.
+    expect(
+      packedRequestBody({ ...base, model: "openai/gpt-5.6-luna" }),
+    ).toEqual({
+      model: "openai/gpt-5.6-luna",
+      messages: [{ role: "user", content: "review" }],
+      max_completion_tokens: 8192,
+      reasoning_effort: "low",
+    });
+
+    // Anthropic takes `max_tokens` and rejects `temperature` outright.
+    expect(
+      packedRequestBody({ ...base, model: "anthropic/claude-sonnet-5" }),
+    ).toEqual({
+      model: "anthropic/claude-sonnet-5",
+      messages: [{ role: "user", content: "review" }],
+      max_tokens: 8192,
+      thinking: { type: "disabled" },
+    });
+
+    expect(
+      packedRequestBody({
+        ...base,
+        model: "workers-ai/@cf/deepseek-ai/deepseek-v4-flash-0731",
+      }),
+    ).toEqual({
+      model: "workers-ai/@cf/deepseek-ai/deepseek-v4-flash-0731",
+      messages: [{ role: "user", content: "review" }],
+      max_tokens: 8192,
+      temperature: 0,
+      chat_template_kwargs: { thinking: false },
+    });
+
+    // xAI and any id without a lab prefix keep the classic shape, which is
+    // what a direct provider call has always sent.
+    expect(packedRequestBody({ ...base, model: "grok-4.6" })).toEqual({
+      model: "grok-4.6",
+      messages: [{ role: "user", content: "review" }],
+      max_tokens: 8192,
+      temperature: 0,
+      reasoning_effort: "low",
+    });
+  });
+
+  it("turns each lab's reasoning on at the level it was given", () => {
+    const base = { prompt: "review", maxTokens: 8192 };
+
+    // Anthropic needs a thinking budget, and a `max_tokens` ceiling above it:
+    // the API refuses a request whose budget does not fit under the ceiling.
+    const anthropic = (reasoning: "low" | "medium" | "high") =>
+      packedRequestBody({
+        ...base,
+        model: "anthropic/claude-sonnet-5",
+        reasoning,
+      });
+    expect(anthropic("low")).toEqual({
+      model: "anthropic/claude-sonnet-5",
+      messages: [{ role: "user", content: "review" }],
+      max_tokens: 10_240,
+      thinking: { type: "enabled", budget_tokens: 2048 },
+    });
+    expect(anthropic("medium")).toEqual({
+      model: "anthropic/claude-sonnet-5",
+      messages: [{ role: "user", content: "review" }],
+      max_tokens: 16_384,
+      thinking: { type: "enabled", budget_tokens: 8192 },
+    });
+    expect(anthropic("high")).toEqual({
+      model: "anthropic/claude-sonnet-5",
+      messages: [{ role: "user", content: "review" }],
+      max_tokens: 24_576,
+      thinking: { type: "enabled", budget_tokens: 16_384 },
+    });
+
+    // OpenAI has no off, so it takes the level straight, and no temperature.
+    expect(
+      packedRequestBody({
+        ...base,
+        model: "openai/gpt-5.6-luna",
+        reasoning: "high",
+      }),
+    ).toEqual({
+      model: "openai/gpt-5.6-luna",
+      messages: [{ role: "user", content: "review" }],
+      max_completion_tokens: 8192,
+      reasoning_effort: "high",
+    });
+
+    expect(
+      packedRequestBody({
+        ...base,
+        model: "workers-ai/@cf/deepseek-ai/deepseek-v4-flash-0731",
+        reasoning: "low",
+      }),
+    ).toEqual({
+      model: "workers-ai/@cf/deepseek-ai/deepseek-v4-flash-0731",
+      messages: [{ role: "user", content: "review" }],
+      max_tokens: 8192,
+      temperature: 0,
+      chat_template_kwargs: { thinking: true },
+    });
+
+    // xAI and ids without a lab prefix take the level as an effort, and keep
+    // their temperature.
+    expect(
+      packedRequestBody({ ...base, model: "grok-4.6", reasoning: "high" }),
+    ).toEqual({
+      model: "grok-4.6",
+      messages: [{ role: "user", content: "review" }],
+      max_tokens: 8192,
+      temperature: 0,
+      reasoning_effort: "high",
+    });
+  });
+
+  it("carries the requested output cap into the body for either family", async () => {
+    const upstream = vi.fn<typeof fetch>(() =>
+      Promise.resolve(chatCompletion("ok")),
+    );
+    vi.stubGlobal("fetch", upstream);
+
+    await completeOnce({
+      baseUrl: "https://provider.invalid/v1",
+      bearer: "token",
+      model: "openai/gpt-5.6-luna",
+      prompt: "review",
+      maxTokens: 16,
+    });
+
+    expect(JSON.parse(String(upstream.mock.calls[0]?.[1]?.body))).toMatchObject(
+      { max_completion_tokens: 16 },
+    );
+  });
+
+  it("gives every lab's body room for a whole answer by default", async () => {
+    const upstream = vi.fn<typeof fetch>(() =>
+      Promise.resolve(chatCompletion("ok")),
+    );
+    vi.stubGlobal("fetch", upstream);
+
+    await completeOnce({
+      baseUrl: "https://provider.invalid/v1",
+      bearer: "token",
+      model: "openai/gpt-5.6-luna",
+      prompt: "review",
+    });
+    await completeOnce({
+      baseUrl: "https://provider.invalid/v1",
+      bearer: "token",
+      model: "anthropic/claude-sonnet-5",
+      prompt: "review",
+    });
+
+    // The ceiling is a safety net, not a budget: a reviewer that reasons in
+    // prose before its block has to reach the block inside it. Sonnet writes
+    // the longest report of the three labs and was cut at 8k on real packs.
+    expect(JSON.parse(String(upstream.mock.calls[0]?.[1]?.body))).toMatchObject(
+      { max_completion_tokens: 8192 },
+    );
+    expect(JSON.parse(String(upstream.mock.calls[1]?.[1]?.body))).toMatchObject(
+      { max_tokens: 16_384 },
+    );
+  });
+});
+
+describe("canaryModel", () => {
+  it("asks for one word and reports the model answered", async () => {
+    const upstream = vi.fn<typeof fetch>(() =>
+      Promise.resolve(chatCompletion("ok")),
+    );
+    vi.stubGlobal("fetch", upstream);
+
+    const canary = await canaryModel({
+      baseUrl: "https://gateway.invalid/v1/compat",
+      bearer: "token",
+      model: "anthropic/claude-sonnet-5",
+    });
+
+    expect(canary).toMatchObject({
+      model: "anthropic/claude-sonnet-5",
+      ok: true,
+      error: null,
+    });
+    expect(canary.seconds).toBeGreaterThanOrEqual(0);
+    // The canary is the same wire shape as the lane, so a lab that answers it
+    // is a lab that will answer the pack.
+    expect(JSON.parse(String(upstream.mock.calls[0]?.[1]?.body))).toMatchObject(
+      {
+        model: "anthropic/claude-sonnet-5",
+        max_tokens: 256,
+        thinking: { type: "disabled" },
+      },
+    );
+  });
+
+  it("keeps the provider's own words when the lab refuses the model", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn<typeof fetch>(() =>
+        Promise.resolve(
+          new Response(
+            JSON.stringify({
+              error: { message: "model not found: anthropic/claude-sonnet-9" },
+            }),
+            { status: 404 },
+          ),
+        ),
+      ),
+    );
+
+    const canary = await canaryModel({
+      baseUrl: "https://gateway.invalid/v1/compat",
+      bearer: "token",
+      model: "anthropic/claude-sonnet-9",
+    });
+
+    expect(canary.ok).toBe(false);
+    // A blocked lane is read by a person, and the provider's own sentence is
+    // the only thing that says which lab refused it and why.
+    expect(canary.error).toContain("404");
+    expect(canary.error).toContain("model not found");
+  });
+
+  it("proves each distinct id once, in parallel", async () => {
+    const upstream = vi.fn<typeof fetch>(() =>
+      Promise.resolve(chatCompletion("ok")),
+    );
+    vi.stubGlobal("fetch", upstream);
+
+    const canaries = await canaryModels({
+      baseUrl: "https://gateway.invalid/v1/compat",
+      bearer: "token",
+      models: [
+        "anthropic/claude-sonnet-5",
+        "openai/gpt-5.6-luna",
+        "anthropic/claude-sonnet-5",
+        "workers-ai/@cf/deepseek-ai/deepseek-v4-flash-0731",
+      ],
+    });
+
+    expect(canaries.map((entry) => entry.model)).toEqual([
+      "anthropic/claude-sonnet-5",
+      "openai/gpt-5.6-luna",
+      "workers-ai/@cf/deepseek-ai/deepseek-v4-flash-0731",
+    ]);
+    expect(upstream).toHaveBeenCalledTimes(3);
+  });
+});

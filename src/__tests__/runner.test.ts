@@ -1,0 +1,2109 @@
+import { execFileSync, spawn, spawnSync } from "node:child_process";
+import { statSync } from "node:fs";
+import {
+  chmod,
+  mkdir,
+  mkdtemp,
+  readFile,
+  rm,
+  writeFile,
+} from "node:fs/promises";
+import { createConnection } from "node:net";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { fileURLToPath, URL } from "node:url";
+import { afterEach, describe, expect, it } from "vitest";
+
+const temporaryDirectories: string[] = [];
+
+afterEach(async () => {
+  await Promise.all(
+    temporaryDirectories.splice(0).map((path) => rm(path, { recursive: true })),
+  );
+});
+
+/**
+ * The file the fixture patch was cut from. `git apply` matches the hunk's
+ * context lines, so the lines above them are all the patch needs.
+ */
+const fixturePreimage = `/** Collapse repeated whitespace into single spaces and trim the result. */
+// biome-ignore lint/complexity/useRegexLiterals: literal form trips noControlCharactersInRegex.
+const CONTROL_CHARACTER_PATTERN = new RegExp(
+  String.raw\`[\\u0000-\\u001F\\u007F]\`,
+  "g",
+);
+const COPY_NAME_PATTERN = /^Copy(?: (?<number>\\d+))?(?: (?<name>.*))?$/u;
+
+function replaceControlCharactersWithSpaces(text: string) {
+  return text.replace(CONTROL_CHARACTER_PATTERN, " ");
+}
+
+export function normalizeWhitespace(text: string) {
+  return replaceControlCharactersWithSpaces(text).replace(/\\s+/g, " ").trim();
+}
+
+/** Normalize whitespace and truncate text with a plain ASCII ellipsis. */
+export function truncateNormalizedText(text: string, maxLength: number) {
+  const normalized = normalizeWhitespace(text);
+  if (normalized.length <= maxLength) return normalized;
+  if (maxLength <= 3) return normalized.slice(0, maxLength);
+  return \`\${normalized.slice(0, maxLength - 3)}...\`;
+}
+
+/** Create the next duplicate name without exceeding the database name limit. */
+export function getDuplicateName(name: string) {
+  const match = name.match(COPY_NAME_PATTERN);
+  const number = match ? Number(match.groups?.["number"] ?? 1) + 1 : null;
+  const prefix = number === null ? "Copy" : \`Copy \${number}\`;
+  const sourceName = match?.groups?.["name"] ?? name;
+
+  return \`\${prefix}\${sourceName ? \` \${sourceName}\` : ""}\`.slice(0, 255);
+}
+
+/** Return the first non-empty string after whitespace normalization. */
+`;
+
+describe("fixture transport", () => {
+  it("preserves the job patch bytes through the real clone and git apply path", async () => {
+    const root = await mkdtemp(join(tmpdir(), "review-pi-runner-"));
+    temporaryDirectories.push(root);
+    const source = join(root, "source");
+    const remote = join(root, "origin.git");
+    const run = join(root, "run");
+    const trackedPath = "packages/utils/src/lib/string.ts";
+    await mkdir(join(source, "packages/utils/src/lib"), { recursive: true });
+    await mkdir(run);
+    await writeFile(join(source, trackedPath), fixturePreimage);
+    execFileSync("git", ["init", "-q", source]);
+    execFileSync("git", ["-C", source, "add", trackedPath]);
+    execFileSync("git", [
+      "-C",
+      source,
+      "-c",
+      "user.name=review-pi-test",
+      "-c",
+      "user.email=review-pi-test@invalid",
+      "commit",
+      "-q",
+      "-m",
+      "base",
+    ]);
+    execFileSync("git", ["clone", "-q", "--bare", source, remote]);
+    const sha = execFileSync("git", ["-C", source, "rev-parse", "HEAD"], {
+      encoding: "utf8",
+    }).trim();
+    const fixture = await readFile(
+      fileURLToPath(
+        new URL("../../fixtures/duplicate-name-length.patch", import.meta.url),
+      ),
+      "utf8",
+    );
+    await writeFile(
+      join(run, "job.json"),
+      JSON.stringify({
+        runId: "fixture-transport",
+        gitRemote: remote,
+        head: { sha },
+        base: { sha },
+        fixturePatch: fixture,
+      }),
+    );
+    const runner = fileURLToPath(
+      new URL("../../container/review-run.sh", import.meta.url),
+    );
+
+    const result = spawnSync(
+      "bash",
+      ["-c", 'source "$1" "$2"; do_clone', "runner-test", runner, run],
+      { encoding: "utf8" },
+    );
+
+    expect(result.stderr).toBe("");
+    expect(result.status).toBe(0);
+    expect(await readFile(join(run, "work/fixture.patch"), "utf8")).toBe(
+      fixture,
+    );
+    expect(
+      execFileSync(
+        "git",
+        ["-C", join(run, "work/repo"), "diff", "--name-only", "base..HEAD"],
+        {
+          encoding: "utf8",
+        },
+      ).trim(),
+    ).toBe(trackedPath);
+  });
+});
+
+describe("Pi event boundary", () => {
+  const prepareReportRun = async (runId: string) => {
+    const root = await mkdtemp(join(tmpdir(), "review-pi-events-"));
+    temporaryDirectories.push(root);
+    const repo = join(root, "work/repo");
+    await mkdir(repo, { recursive: true });
+    execFileSync("git", ["init", "-q", repo]);
+    await writeFile(join(repo, "tracked.txt"), "base\n");
+    execFileSync("git", ["-C", repo, "add", "tracked.txt"]);
+    execFileSync("git", [
+      "-C",
+      repo,
+      "-c",
+      "user.name=review-pi-test",
+      "-c",
+      "user.email=review-pi-test@invalid",
+      "commit",
+      "-q",
+      "-m",
+      "base",
+    ]);
+    execFileSync("git", ["-C", repo, "branch", "base"]);
+    const sha = execFileSync("git", ["-C", repo, "rev-parse", "HEAD"], {
+      encoding: "utf8",
+    }).trim();
+    await writeFile(
+      join(root, "job.json"),
+      JSON.stringify({
+        runId,
+        head: { sha },
+        base: { sha },
+        fixturePatch: "",
+        provider: "opencode",
+        model: "deepseek-v3.2",
+      }),
+    );
+    await writeFile(join(root, "pi.stderr"), "");
+    await writeFile(join(root, "diff.stat"), "");
+    await writeFile(join(root, "check.log"), "check passed\n");
+    return root;
+  };
+
+  it("creates a report only for a complete non-empty assistant result", async () => {
+    const root = await prepareReportRun("complete-result");
+    await writeFile(
+      join(root, "pi-raw.jsonl"),
+      `${JSON.stringify({
+        type: "turn_end",
+        message: {
+          stopReason: "stop",
+          usage: { input: 2, output: 3, totalTokens: 5, cost: { total: 0 } },
+        },
+      })}\n${JSON.stringify({
+        type: "agent_end",
+        messages: [
+          { role: "assistant", content: [{ type: "text", text: "clean" }] },
+        ],
+      })}\n`,
+    );
+    const runner = fileURLToPath(
+      new URL("../../container/review-run.sh", import.meta.url),
+    );
+
+    const result = spawnSync(
+      "bash",
+      ["-c", 'source "$1" "$2"; do_report', "runner-test", runner, root],
+      { encoding: "utf8" },
+    );
+    const report = JSON.parse(
+      await readFile(join(root, "report.json"), "utf8"),
+    );
+
+    expect(result.status).toBe(0);
+    expect(report.finalText).toBe("clean");
+    expect(report.completion).toBe("complete");
+    expect(report.partialReason).toBeNull();
+    expect(report.usage).toMatchObject({ turns: 1, totalTokens: 5 });
+  });
+
+  it("marks the report partial when the lane was cut before it finished", async () => {
+    const root = await prepareReportRun("cut-lane");
+    await writeFile(
+      join(root, "pi-raw.jsonl"),
+      `${JSON.stringify({
+        type: "turn_end",
+        message: {
+          stopReason: "error",
+          errorMessage:
+            'review_pi_broker: 429 {"error":{"reason":"max_requests"}}',
+          usage: { input: 9, output: 9, totalTokens: 18 },
+        },
+      })}\n`,
+    );
+    const runner = fileURLToPath(
+      new URL("../../container/review-run.sh", import.meta.url),
+    );
+
+    const refused = spawnSync(
+      "bash",
+      ["-c", 'source "$1" "$2"; do_report', "runner-test", runner, root],
+      { encoding: "utf8" },
+    );
+    expect(refused.status).toBe(1);
+    await expect(readFile(join(root, "report.json"), "utf8")).rejects.toThrow();
+
+    const partial = spawnSync(
+      "bash",
+      [
+        "-c",
+        'source "$1" "$2"; do_partial_report; printf "%s" "$(cat "$REPORT" | jq -r .completion)"',
+        "runner-test",
+        runner,
+        root,
+      ],
+      { encoding: "utf8" },
+    );
+    const report = JSON.parse(
+      await readFile(join(root, "report.json"), "utf8"),
+    );
+
+    // A lane cut by its request cap leaves a report, and the report says it was
+    // cut: the same file marked `complete` would read as a lane that looked at
+    // the change and found nothing.
+    expect(partial.status).toBe(0);
+    expect(report.completion).toBe("partial");
+    expect(report.partialReason).toMatch(/request cap/);
+    expect(report.checkout.commitIdentityPreserved).toBe(true);
+    expect(report.usage).toMatchObject({ turns: 1, totalTokens: 18 });
+  });
+
+  it("writes the partial report and its report step when the window is spent", async () => {
+    const root = await prepareReportRun("window-spent");
+    await writeFile(join(root, "pi-raw.jsonl"), "");
+    await writeFile(join(root, "steps.jsonl"), "");
+    const runner = fileURLToPath(
+      new URL("../../container/review-run.sh", import.meta.url),
+    );
+
+    const result = spawnSync(
+      "bash",
+      ["-c", 'source "$1" "$2"; on_window_spent', "runner-test", runner, root],
+      { encoding: "utf8" },
+    );
+    const report = JSON.parse(
+      await readFile(join(root, "report.json"), "utf8"),
+    );
+    const steps = (await readFile(join(root, "steps.jsonl"), "utf8"))
+      .split("\n")
+      .filter(Boolean)
+      .map((line) => JSON.parse(line) as Record<string, unknown>);
+    const status = JSON.parse(
+      await readFile(join(root, "status.json"), "utf8"),
+    );
+
+    // The handler is what the container's own `timeout` triggers, so the lane
+    // still ends with a report and the step the driver reads as completion.
+    expect(result.status).toBe(0);
+    expect(report.completion).toBe("partial");
+    expect(report.partialReason).toMatch(/cut/);
+    expect(steps).toContainEqual(
+      expect.objectContaining({ step: "report", exit: 0 }),
+    );
+    expect(status).toMatchObject({ phase: "finished", state: "done" });
+  });
+
+  it("keeps the report it already wrote when the window expires behind it", async () => {
+    const root = await prepareReportRun("already-reported");
+    await writeFile(
+      join(root, "report.json"),
+      JSON.stringify({ completion: "complete", runId: "already-reported" }),
+    );
+    const runner = fileURLToPath(
+      new URL("../../container/review-run.sh", import.meta.url),
+    );
+
+    const result = spawnSync(
+      "bash",
+      ["-c", 'source "$1" "$2"; on_window_spent', "runner-test", runner, root],
+      { encoding: "utf8" },
+    );
+    const report = JSON.parse(
+      await readFile(join(root, "report.json"), "utf8"),
+    );
+
+    expect(result.status).toBe(0);
+    expect(report.completion).toBe("complete");
+  });
+
+  it("rejects a JSON-mode model error and preserves bounded evidence", async () => {
+    const root = await mkdtemp(join(tmpdir(), "review-pi-events-"));
+    temporaryDirectories.push(root);
+    await writeFile(
+      join(root, "job.json"),
+      JSON.stringify({ runId: "model-error" }),
+    );
+    await writeFile(join(root, "pi.stderr"), "provider stderr");
+    await writeFile(
+      join(root, "pi-raw.jsonl"),
+      `${JSON.stringify({
+        type: "turn_end",
+        message: {
+          stopReason: "error",
+          errorMessage: `Cannot continue: ${"x".repeat(5000)}`,
+          usage: { input: 0, output: 0, totalTokens: 0 },
+        },
+      })}\n`,
+    );
+    const runner = fileURLToPath(
+      new URL("../../container/review-run.sh", import.meta.url),
+    );
+
+    const result = spawnSync(
+      "bash",
+      ["-c", 'source "$1" "$2"; do_report', "runner-test", runner, root],
+      { encoding: "utf8" },
+    );
+    const evidence = JSON.parse(
+      await readFile(join(root, "review-error.json"), "utf8"),
+    );
+
+    expect(result.status).toBe(1);
+    expect(evidence).toMatchObject({
+      reason: "model_error",
+      piExit: 0,
+      stopReason: "error",
+      stderrTail: "provider stderr",
+    });
+    expect(evidence.errorMessage).toHaveLength(4000);
+  });
+
+  it("rejects a non-empty partial response with an incomplete terminal reason", async () => {
+    const root = await prepareReportRun("length-result");
+    await writeFile(
+      join(root, "pi-raw.jsonl"),
+      `${JSON.stringify({
+        type: "turn_end",
+        message: {
+          stopReason: "length",
+          errorMessage: "Maximum output length reached",
+          usage: { input: 2, output: 100, totalTokens: 102 },
+        },
+      })}\n${JSON.stringify({
+        type: "agent_end",
+        messages: [
+          {
+            role: "assistant",
+            content: [{ type: "text", text: "partial but non-empty" }],
+          },
+        ],
+      })}\n`,
+    );
+    const runner = fileURLToPath(
+      new URL("../../container/review-run.sh", import.meta.url),
+    );
+
+    const result = spawnSync(
+      "bash",
+      ["-c", 'source "$1" "$2"; do_report', "runner-test", runner, root],
+      { encoding: "utf8" },
+    );
+    const evidence = JSON.parse(
+      await readFile(join(root, "review-error.json"), "utf8"),
+    );
+
+    expect(result.status).toBe(1);
+    expect(evidence).toMatchObject({
+      reason: "incomplete_result",
+      piExit: 0,
+      stopReason: "length",
+      errorMessage: "Maximum output length reached",
+    });
+  });
+
+  it("rejects a completed turn without a non-empty agent result", async () => {
+    const root = await mkdtemp(join(tmpdir(), "review-pi-events-"));
+    temporaryDirectories.push(root);
+    await writeFile(
+      join(root, "job.json"),
+      JSON.stringify({ runId: "empty-result" }),
+    );
+    await writeFile(join(root, "pi.stderr"), "");
+    await writeFile(
+      join(root, "pi-raw.jsonl"),
+      `${JSON.stringify({
+        type: "turn_end",
+        message: { stopReason: "stop", usage: { input: 1, output: 0 } },
+      })}\n${JSON.stringify({
+        type: "agent_end",
+        messages: [
+          { role: "assistant", content: [{ type: "text", text: "  " }] },
+        ],
+      })}\n`,
+    );
+    const runner = fileURLToPath(
+      new URL("../../container/review-run.sh", import.meta.url),
+    );
+
+    const result = spawnSync(
+      "bash",
+      ["-c", 'source "$1" "$2"; do_report', "runner-test", runner, root],
+      { encoding: "utf8" },
+    );
+    const evidence = JSON.parse(
+      await readFile(join(root, "review-error.json"), "utf8"),
+    );
+
+    expect(result.status).toBe(1);
+    expect(evidence).toMatchObject({
+      reason: "empty_result",
+      piExit: 0,
+      stopReason: "stop",
+    });
+  });
+
+  it("rejects a non-empty response without terminal turn evidence", async () => {
+    const root = await prepareReportRun("missing-terminal");
+    await writeFile(
+      join(root, "pi-raw.jsonl"),
+      `${JSON.stringify({
+        type: "agent_end",
+        messages: [
+          {
+            role: "assistant",
+            content: [{ type: "text", text: "non-empty without completion" }],
+          },
+        ],
+      })}\n`,
+    );
+    const runner = fileURLToPath(
+      new URL("../../container/review-run.sh", import.meta.url),
+    );
+
+    const result = spawnSync(
+      "bash",
+      ["-c", 'source "$1" "$2"; do_report', "runner-test", runner, root],
+      { encoding: "utf8" },
+    );
+    const evidence = JSON.parse(
+      await readFile(join(root, "review-error.json"), "utf8"),
+    );
+
+    expect(result.status).toBe(1);
+    expect(evidence).toMatchObject({
+      reason: "incomplete_result",
+      piExit: 0,
+      stopReason: "",
+    });
+  });
+
+  it("identifies provider 401 as auth_blocked error", async () => {
+    const root = await mkdtemp(join(tmpdir(), "review-pi-events-"));
+    temporaryDirectories.push(root);
+    await writeFile(
+      join(root, "job.json"),
+      JSON.stringify({ runId: "auth-blocked" }),
+    );
+    await writeFile(join(root, "pi.stderr"), "401 Unauthorized: token expired");
+    await writeFile(
+      join(root, "pi-raw.jsonl"),
+      `${JSON.stringify({
+        type: "turn_end",
+        message: {
+          stopReason: "error",
+          errorMessage: "401 Unauthorized: token expired",
+          usage: { input: 0, output: 0, totalTokens: 0 },
+        },
+      })}\n`,
+    );
+    const runner = fileURLToPath(
+      new URL("../../container/review-run.sh", import.meta.url),
+    );
+
+    const result = spawnSync(
+      "bash",
+      ["-c", 'source "$1" "$2"; do_report', "runner-test", runner, root],
+      { encoding: "utf8" },
+    );
+    const evidence = JSON.parse(
+      await readFile(join(root, "review-error.json"), "utf8"),
+    );
+
+    expect(result.status).toBe(1);
+    expect(evidence).toMatchObject({
+      reason: "auth_blocked",
+      piExit: 0,
+      stopReason: "error",
+      errorMessage: "401 Unauthorized: token expired",
+    });
+  });
+
+  it("identifies provider 429 as quota_blocked error", async () => {
+    const root = await mkdtemp(join(tmpdir(), "review-pi-events-"));
+    temporaryDirectories.push(root);
+    await writeFile(
+      join(root, "job.json"),
+      JSON.stringify({ runId: "quota-blocked" }),
+    );
+    await writeFile(
+      join(root, "pi.stderr"),
+      "429 Too Many Requests: quota exceeded",
+    );
+    await writeFile(
+      join(root, "pi-raw.jsonl"),
+      `${JSON.stringify({
+        type: "turn_end",
+        message: {
+          stopReason: "error",
+          errorMessage: "Rate limit reached: insufficient_quota",
+          usage: { input: 0, output: 0, totalTokens: 0 },
+        },
+      })}\n`,
+    );
+    const runner = fileURLToPath(
+      new URL("../../container/review-run.sh", import.meta.url),
+    );
+
+    const result = spawnSync(
+      "bash",
+      ["-c", 'source "$1" "$2"; do_report', "runner-test", runner, root],
+      { encoding: "utf8" },
+    );
+    const evidence = JSON.parse(
+      await readFile(join(root, "review-error.json"), "utf8"),
+    );
+
+    expect(result.status).toBe(1);
+    expect(evidence).toMatchObject({
+      reason: "quota_blocked",
+      piExit: 0,
+      stopReason: "error",
+      errorMessage: "Rate limit reached: insufficient_quota",
+    });
+  });
+});
+
+/**
+ * The suite spawns eighteen supervised runners beside twenty other files that
+ * each spawn real processes, so a wait on one of them competes with all of
+ * them. These budgets are the point at which a state that is never coming is
+ * declared absent, not a performance assertion: a turn that normally takes
+ * 400ms gets room to take twenty seconds on a loaded machine, and still fails
+ * loudly when the state does not arrive at all.
+ */
+const SUPERVISED_WAIT_MS = 20_000;
+
+describe("supervised native Pi RPC lifecycle", { timeout: 120_000 }, () => {
+  const objectValue = (value: unknown) => {
+    if (!value || typeof value !== "object") {
+      throw new Error("Expected object value");
+    }
+    return value as Record<string, unknown>;
+  };
+
+  /** The drained output of every supervised runner this suite spawned. */
+  const runnerOutput = new WeakMap<
+    ReturnType<typeof spawn>,
+    { stdout: string; stderr: string }
+  >();
+
+  const prepareSupervisedRun = async (
+    runId: string,
+    initialPrompt: string | null = "standby",
+  ) => {
+    const root = await mkdtemp(join(tmpdir(), "review-pi-supervised-"));
+    temporaryDirectories.push(root);
+    const repo = join(root, "work/repo");
+    await mkdir(repo, { recursive: true });
+    execFileSync("git", ["init", "-q", repo]);
+    await writeFile(join(repo, "tracked.txt"), "base\n");
+    execFileSync("git", ["-C", repo, "add", "tracked.txt"]);
+    execFileSync("git", [
+      "-C",
+      repo,
+      "-c",
+      "user.name=review-pi-test",
+      "-c",
+      "user.email=review-pi-test@invalid",
+      "commit",
+      "-q",
+      "-m",
+      "base",
+    ]);
+    execFileSync("git", ["-C", repo, "branch", "base"]);
+    const sha = execFileSync("git", ["-C", repo, "rev-parse", "HEAD"], {
+      encoding: "utf8",
+    }).trim();
+
+    const binDir = join(root, "bin");
+    await mkdir(binDir, { recursive: true });
+    const fakePiPath = join(binDir, "pi");
+
+    const fakePiSource = `#!/usr/bin/env node
+const fs = require("node:fs");
+const { spawn } = require("node:child_process");
+const path = require("node:path");
+const args = process.argv.slice(2);
+if (args.includes("--version")) {
+  console.log("0.85.0");
+  process.exit(0);
+}
+
+const validFlags = new Set([
+  "--provider", "--model", "--thinking", "--mode",
+  "--session-dir", "--session-id", "--session", "--continue",
+  "--approve", "--no-extensions", "--no-skills", "--no-prompt-templates"
+]);
+for (let i = 0; i < args.length; i++) {
+  const arg = args[i];
+  if (arg.startsWith("--")) {
+    if (!validFlags.has(arg)) {
+      process.stderr.write("fake-pi error: invalid CLI flag " + arg + "\\n");
+      process.exit(2);
+    }
+    if (["--provider", "--model", "--thinking", "--mode", "--session-dir", "--session-id", "--session"].includes(arg)) {
+      if (!args[i + 1] || args[i + 1].startsWith("--")) {
+        process.stderr.write("fake-pi error: flag " + arg + " missing argument\\n");
+        process.exit(2);
+      }
+      i++;
+    }
+  }
+}
+
+const sessionFlags = ["--session-dir", "--session-id", "--session", "--continue"].filter((flag) => args.includes(flag));
+if (args.includes("--session") && sessionFlags.length !== 1) {
+  process.stderr.write("fake-pi error: --session cannot be combined with another session flag\\n");
+  process.exit(2);
+}
+if (!args.includes("--session") && (!args.includes("--session-dir") || !args.includes("--session-id"))) {
+  process.stderr.write("fake-pi error: new session requires --session-dir and --session-id\\n");
+  process.exit(2);
+}
+
+const sessionDirIdx = args.indexOf("--session-dir");
+const sessionDir = sessionDirIdx !== -1 ? args[sessionDirIdx + 1] : "/tmp";
+const sessionIdIdx = args.indexOf("--session-id");
+const savedSessionIdx = args.indexOf("--session");
+const sessionFile = savedSessionIdx !== -1 ? args[savedSessionIdx + 1] : sessionDir + "/" + args[sessionIdIdx + 1] + ".jsonl";
+const sessionId = sessionIdIdx !== -1 ? args[sessionIdIdx + 1] : path.basename(sessionFile, ".jsonl");
+if (!/^[A-Za-z0-9](?:[A-Za-z0-9._-]*[A-Za-z0-9])?$/.test(sessionId)) {
+  process.stderr.write("fake-pi error: invalid session id " + sessionId + "\\n");
+  process.exit(2);
+}
+if (process.env.PI_ARGS_LOG) {
+  fs.appendFileSync(process.env.PI_ARGS_LOG, JSON.stringify(args) + "\\n");
+}
+
+try { fs.appendFileSync(sessionFile, ""); } catch {}
+
+const allowedKeys = {
+  prompt: new Set(["id", "type", "message", "streamingBehavior", "images"]),
+  steer: new Set(["id", "type", "message", "images"]),
+  get_state: new Set(["id", "type"]),
+  abort: new Set(["id", "type"]),
+};
+
+let buffer = "";
+process.stdin.on("data", (chunk) => {
+  buffer += chunk.toString("utf8");
+  const lines = buffer.split("\\n");
+  buffer = lines.pop();
+  for (const line of lines) {
+    const clean = line.replace(/\\r$/, "");
+    if (!clean.trim()) continue;
+
+    let cmd;
+    try {
+      cmd = JSON.parse(clean);
+    } catch {
+      process.stderr.write("fake-pi error: invalid JSON input\\n");
+      process.exit(2);
+    }
+
+    if (!allowedKeys[cmd.type]) {
+      process.stderr.write("fake-pi error: invalid command type " + cmd.type + "\\n");
+      process.exit(2);
+    }
+    for (const key of Object.keys(cmd)) {
+      if (!allowedKeys[cmd.type].has(key)) {
+        process.stderr.write("fake-pi error: command " + cmd.type + " contains non-native property " + key + "\\n");
+        process.exit(2);
+      }
+    }
+
+    if (cmd.type === "prompt") {
+      if (typeof cmd.message !== "string" || !cmd.message) {
+        process.stderr.write("fake-pi error: prompt missing message string\\n");
+        process.exit(2);
+      }
+    } else if (cmd.type === "steer") {
+      if (typeof cmd.message !== "string" || !cmd.message) {
+        process.stderr.write("fake-pi error: steer missing message string\\n");
+        process.exit(2);
+      }
+    }
+
+    const cmdId = cmd.id;
+
+    if (cmd.type === "get_state") {
+      process.stdout.write(JSON.stringify({
+        id: cmdId,
+        type: "response",
+        command: "get_state",
+        success: true,
+        data: {
+          sessionId,
+          sessionFile,
+          isStreaming: false,
+          messageCount: 0,
+        },
+      }) + "\\n");
+    } else if (cmd.type === "steer") {
+      process.stdout.write(JSON.stringify({
+        id: cmdId,
+        type: "response",
+        command: "steer",
+        success: true,
+      }) + "\\n");
+    } else if (cmd.type === "abort") {
+      process.stdout.write(JSON.stringify({
+        id: cmdId,
+        type: "response",
+        command: "abort",
+        success: true,
+      }) + "\\n");
+    } else if (cmd.type === "prompt") {
+      if (cmd.message.includes("reject prompt")) {
+        process.stdout.write(JSON.stringify({
+          id: cmdId,
+          type: "response",
+          command: "prompt",
+          success: false,
+          error: "native_prompt_rejected",
+        }) + "\\n");
+        continue;
+      }
+      const promptResponse = JSON.stringify({
+        id: cmdId,
+        type: "response",
+        command: "prompt",
+        success: true,
+      });
+
+      if (cmd.message.includes("rapid final")) {
+        process.stdout.write([
+          promptResponse,
+          JSON.stringify({
+            type: "turn_end",
+            message: { stopReason: "stop", usage: { input: 2, output: 3, totalTokens: 5 } },
+          }),
+          JSON.stringify({
+            type: "agent_end",
+            messages: [{ role: "assistant", content: [{ type: "text", text: "RAPID_FINAL" }] }],
+          }),
+        ].join("\\n") + "\\n");
+        continue;
+      }
+
+      process.stdout.write(promptResponse + "\\n");
+
+      if (cmd.message.includes("split unicode")) {
+        const event = Buffer.from(JSON.stringify({
+          type: "message_update",
+          assistantMessageEvent: { type: "text_delta", delta: "café 🧪" },
+        }) + "\\n");
+        const splitAt = event.indexOf(Buffer.from("🧪")) + 2;
+        process.stdout.write(event.subarray(0, splitAt));
+        setTimeout(() => {
+          process.stdout.write(event.subarray(splitAt));
+          process.stdout.write(JSON.stringify({
+            type: "turn_end",
+            message: { stopReason: "stop", usage: { input: 1, output: 1, totalTokens: 2 } },
+          }) + "\\n");
+          process.stdout.write(JSON.stringify({
+            type: "agent_end",
+            messages: [{ role: "assistant", content: [{ type: "text", text: "UNICODE_FINAL" }] }],
+          }) + "\\n");
+        }, 20);
+        continue;
+      }
+
+      if (cmd.message.includes("silent tool")) {
+        process.stdout.write(JSON.stringify({
+          type: "tool_execution_start",
+          toolCallId: "call_tool_1",
+          toolName: "bash",
+          args: { command: "check.sh" },
+        }) + "\\n");
+
+        setTimeout(() => {
+          process.stdout.write(JSON.stringify({
+            type: "tool_execution_end",
+            toolCallId: "call_tool_1",
+            toolName: "bash",
+            isError: false,
+            result: { content: [{ type: "text", text: "tool completed" }] },
+          }) + "\\n");
+          process.stdout.write(JSON.stringify({
+            type: "turn_end",
+            message: { stopReason: "stop", usage: { input: 10, output: 10, totalTokens: 20 } },
+          }) + "\\n");
+          process.stdout.write(JSON.stringify({
+            type: "agent_end",
+            messages: [{ role: "assistant", content: [{ type: "text", text: "Tool review finished" }] }],
+          }) + "\\n");
+        }, 80);
+      } else if (cmd.message.includes("crash now")) {
+        process.stderr.write("fatal model failure in pi child\\n");
+        setTimeout(() => {
+          process.exit(1);
+        }, 30);
+      } else if (cmd.message.includes("simulate auth blocked")) {
+        process.stderr.write("401 Unauthorized: token expired\\n");
+        setTimeout(() => {
+          process.stdout.write(JSON.stringify({
+            type: "turn_end",
+            message: { stopReason: "error", errorMessage: "401 Unauthorized: token expired" },
+          }) + "\\n");
+          process.stdout.write(JSON.stringify({
+            type: "agent_end",
+            messages: [],
+          }) + "\\n");
+          setTimeout(() => process.exit(1), 10);
+        }, 30);
+      } else if (cmd.message.includes("simulate quota blocked")) {
+        process.stderr.write("429 insufficient_quota\\n");
+        setTimeout(() => {
+          process.stdout.write(JSON.stringify({
+            type: "turn_end",
+            message: { stopReason: "error", errorMessage: "429 insufficient_quota" },
+          }) + "\\n");
+          process.stdout.write(JSON.stringify({
+            type: "agent_end",
+            messages: [],
+          }) + "\\n");
+          setTimeout(() => process.exit(1), 10);
+        }, 30);
+      } else if (cmd.message.includes("simulate oauth 403")) {
+        setTimeout(() => {
+          process.stdout.write(JSON.stringify({
+            type: "turn_end",
+            message: {
+              stopReason: "error",
+              errorMessage: 'OpenAI API error (403): 403 "The OAuth2 access token could not be validated."',
+            },
+          }) + "\\n");
+          process.stdout.write(JSON.stringify({
+            type: "agent_end",
+            messages: [],
+          }) + "\\n");
+        }, 30);
+      } else if (cmd.message.includes("model error then exit")) {
+        setTimeout(() => {
+          process.stdout.write(JSON.stringify({
+            type: "turn_end",
+            message: { stopReason: "error", errorMessage: "provider model error" },
+          }) + "\\n");
+          process.stdout.write(JSON.stringify({
+            type: "agent_end",
+            messages: [],
+          }) + "\\n");
+          setTimeout(() => process.exit(1), 10);
+        }, 30);
+      } else if (cmd.message.includes("active descendant")) {
+        const descendant = spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)"], {
+          stdio: "ignore",
+        });
+        fs.writeFileSync(process.env.PI_DESCENDANT_PID, String(descendant.pid));
+        process.stdout.write(JSON.stringify({
+          type: "tool_execution_start",
+          toolCallId: "call_descendant",
+          toolName: "bash",
+          args: { command: "long-running-command" },
+        }) + "\\n");
+      } else if (cmd.message.includes("candidate then continue")) {
+        setTimeout(() => {
+          process.stdout.write(JSON.stringify({
+            type: "turn_end",
+            message: { stopReason: "stop", usage: { input: 5, output: 5, totalTokens: 10 } },
+          }) + "\\n");
+          process.stdout.write(JSON.stringify({
+            type: "agent_end",
+            messages: [{ role: "assistant", content: [{ type: "text", text: "candidate partial review" }] }],
+          }) + "\\n");
+        }, 30);
+      } else if (cmd.message.includes("provide final conclusion")) {
+        setTimeout(() => {
+          process.stdout.write(JSON.stringify({
+            type: "turn_end",
+            message: { stopReason: "stop", usage: { input: 10, output: 15, totalTokens: 25 } },
+          }) + "\\n");
+          process.stdout.write(JSON.stringify({
+            type: "agent_end",
+            messages: [{ role: "assistant", content: [{ type: "text", text: "ACCEPTED_FINAL_CONCLUSION" }] }],
+          }) + "\\n");
+        }, 30);
+      } else {
+        setTimeout(() => {
+          process.stdout.write(JSON.stringify({ type: "agent_start" }) + "\\n");
+          process.stdout.write(JSON.stringify({ type: "turn_start" }) + "\\n");
+          process.stdout.write(JSON.stringify({ type: "message_start" }) + "\\n");
+          process.stdout.write(JSON.stringify({ type: "message_update" }) + "\\n");
+          process.stdout.write(JSON.stringify({ type: "message_end" }) + "\\n");
+          process.stdout.write(JSON.stringify({
+            type: "turn_end",
+            message: { stopReason: "stop", usage: { input: 1, output: 1, totalTokens: 2 } },
+          }) + "\\n");
+          process.stdout.write(JSON.stringify({
+            type: "agent_end",
+            messages: [{ role: "assistant", content: [{ type: "text", text: "standby ready" }] }],
+          }) + "\\n");
+        }, 30);
+      }
+    }
+  }
+});
+`;
+    await writeFile(fakePiPath, fakePiSource);
+    await chmod(fakePiPath, 0o755);
+
+    await writeFile(
+      join(root, "job.json"),
+      JSON.stringify({
+        runId,
+        supervised: true,
+        head: { sha },
+        base: { sha },
+        fixturePatch: "",
+        provider: "openai-codex",
+        model: "gpt-5.6-sol",
+        ...(initialPrompt === null ? {} : { prompt: initialPrompt }),
+        checkCommand: "git --no-pager diff --stat base..HEAD",
+      }),
+    );
+    if (initialPrompt !== null) {
+      await writeFile(join(root, "prompt.txt"), initialPrompt);
+    }
+    await writeFile(join(root, "pi.stderr"), "");
+    await writeFile(join(root, "diff.stat"), "");
+    await writeFile(join(root, "check.log"), "check passed\n");
+
+    const runner = fileURLToPath(
+      new URL("../../container/review-run.sh", import.meta.url),
+    );
+
+    const runnerProc = spawn("bash", [runner, root, "--bridge"], {
+      env: {
+        ...process.env,
+        PATH: `${binDir}:${process.env.PATH}`,
+        PI_BIN: fakePiPath,
+        PI_ARGS_LOG: join(root, "pi-args.jsonl"),
+        PI_DESCENDANT_PID: join(root, "descendant.pid"),
+      },
+      stdio: ["ignore", "pipe", "pipe"],
+    });
+
+    // A piped child nobody reads blocks on write the moment the pipe buffer
+    // fills, and then never exits. The wait for its exit would hang until the
+    // test timeout and report nothing about why, so every supervised run drains
+    // its own output and keeps the tail for the failure message.
+    const captured = { stdout: "", stderr: "" };
+    runnerOutput.set(runnerProc, captured);
+    runnerProc.stdout?.setEncoding("utf8");
+    runnerProc.stderr?.setEncoding("utf8");
+    runnerProc.stdout?.on("data", (chunk: string) => {
+      captured.stdout += chunk;
+    });
+    runnerProc.stderr?.on("data", (chunk: string) => {
+      captured.stderr += chunk;
+    });
+
+    const sockPath = join(root, "rpc.sock");
+    await waitForSocket(sockPath);
+
+    return { root, sockPath, runnerProc };
+  };
+
+  const waitForSocket = async (
+    sockPath: string,
+    timeoutMs = SUPERVISED_WAIT_MS,
+  ) => {
+    const start = Date.now();
+    while (Date.now() - start < timeoutMs) {
+      try {
+        const st = statSync(sockPath);
+        if (st.isSocket()) return;
+      } catch {}
+      await new Promise((r) => setTimeout(r, 20));
+    }
+    throw new Error(`Socket ${sockPath} not ready after ${timeoutMs}ms`);
+  };
+
+  const sendCommand = (
+    sockPath: string,
+    cmd: Record<string, unknown>,
+    timeoutMs = SUPERVISED_WAIT_MS,
+    splitCharacter?: string,
+  ): Promise<Record<string, unknown>> => {
+    return new Promise((resolve, reject) => {
+      const client = createConnection(sockPath, () => {
+        const payload = Buffer.from(`${JSON.stringify(cmd)}\n`);
+        if (splitCharacter) {
+          const splitAt = payload.indexOf(Buffer.from(splitCharacter)) + 2;
+          client.write(payload.subarray(0, splitAt));
+          client.write(payload.subarray(splitAt));
+        } else {
+          client.write(payload);
+        }
+      });
+
+      const timer = setTimeout(() => {
+        client.destroy();
+        reject(new Error(`Timeout waiting for response to ${cmd["type"]}`));
+      }, timeoutMs);
+
+      let buffer = "";
+      client.setEncoding("utf8");
+      client.on("data", (chunk) => {
+        buffer += chunk;
+        const lines = buffer.split("\n");
+        if (lines.length > 1) {
+          clearTimeout(timer);
+          client.end();
+          try {
+            resolve(JSON.parse(lines[0] ?? ""));
+          } catch (err) {
+            reject(err);
+          }
+        }
+      });
+
+      client.on("error", (err) => {
+        clearTimeout(timer);
+        reject(err);
+      });
+    });
+  };
+
+  const waitForStatus = async (
+    statusPath: string,
+    predicate: (status: Record<string, unknown>) => boolean,
+    timeoutMs = SUPERVISED_WAIT_MS,
+  ) => {
+    const start = Date.now();
+    while (Date.now() - start < timeoutMs) {
+      try {
+        const content = await readFile(statusPath, "utf8");
+        const parsed = objectValue(JSON.parse(content));
+        if (predicate(parsed)) return parsed;
+      } catch {}
+      await new Promise((r) => setTimeout(r, 20));
+    }
+    throw new Error(`Predicate on ${statusPath} not met after ${timeoutMs}ms`);
+  };
+
+  /**
+   * The trace line a test is waiting for.
+   *
+   * A status wait is satisfied by the previous turn's terminal state as soon as
+   * the prompt's own events are still in flight, so a test that reads the trace
+   * waits for the trace itself rather than for a status another turn already
+   * wrote.
+   */
+  const waitForTrace = async (
+    tracePath: string,
+    predicate: (line: Record<string, unknown>) => boolean,
+    timeoutMs = SUPERVISED_WAIT_MS,
+  ) => {
+    const start = Date.now();
+    while (Date.now() - start < timeoutMs) {
+      try {
+        const lines = (await readFile(tracePath, "utf8"))
+          .trim()
+          .split("\n")
+          .filter(Boolean)
+          .map((line) => JSON.parse(line) as Record<string, unknown>);
+        if (lines.some(predicate)) return lines;
+      } catch {}
+      await new Promise((r) => setTimeout(r, 20));
+    }
+    throw new Error(`Predicate on ${tracePath} not met after ${timeoutMs}ms`);
+  };
+
+  const waitForExit = (
+    proc: ReturnType<typeof spawn>,
+    timeoutMs = 10_000,
+  ): Promise<number | null> => {
+    return new Promise((resolve, reject) => {
+      if (proc.exitCode !== null) return resolve(proc.exitCode);
+      const onClose = (code: number | null) => {
+        clearTimeout(timer);
+        resolve(code);
+      };
+      // Bounded on purpose: an unbounded wait here surfaces as the suite's own
+      // test timeout, which names the test and nothing about what stalled.
+      const timer = setTimeout(() => {
+        proc.off("close", onClose);
+        const captured = runnerOutput.get(proc);
+        const tail = captured?.stderr.trim().slice(-2000);
+        reject(
+          new Error(
+            `runner ${String(proc.pid)} did not exit within ${timeoutMs}ms${tail ? `; stderr tail:\n${tail}` : "; it wrote nothing to stderr"}`,
+          ),
+        );
+      }, timeoutMs);
+      proc.on("close", onClose);
+    });
+  };
+
+  const runPublicSend = (
+    runner: string,
+    root: string,
+    argv: string[],
+    label: string,
+  ) =>
+    new Promise<{ code: number | null; stdout: string; stderr: string }>(
+      (resolve, reject) => {
+        const child = spawn("bash", [runner, root, ...argv], {
+          stdio: ["ignore", "pipe", "pipe"],
+        });
+        let stdout = "";
+        let stderr = "";
+        child.stdout.setEncoding("utf8");
+        child.stderr.setEncoding("utf8");
+        child.stdout.on("data", (chunk) => {
+          stdout += chunk;
+        });
+        child.stderr.on("data", (chunk) => {
+          stderr += chunk;
+        });
+        const timer = setTimeout(() => {
+          child.kill();
+          reject(new Error(`${label} timed out`));
+        }, SUPERVISED_WAIT_MS);
+        child.on("close", (code) => {
+          clearTimeout(timer);
+          resolve({ code, stdout, stderr });
+        });
+        child.on("error", (error) => {
+          clearTimeout(timer);
+          reject(error);
+        });
+      },
+    );
+
+  /** A command line for the in-container RPC bridge, as the CLI encodes it. */
+  type BridgeCommand = { type: string } & Record<string, unknown>;
+
+  const runPublicCommand = (
+    runner: string,
+    root: string,
+    command: BridgeCommand,
+  ) =>
+    runPublicSend(
+      runner,
+      root,
+      ["--send", JSON.stringify(command)],
+      "public --send command",
+    );
+
+  it("maintains persistent child process and session across observer disconnect and reconnect", async () => {
+    const { root, sockPath, runnerProc } = await prepareSupervisedRun(
+      "disconnect-reconnect",
+    );
+    try {
+      const statusPath = join(root, "status.json");
+      await waitForStatus(
+        statusPath,
+        (s) =>
+          s["state"] === "idle" && objectValue(s["process"])["alive"] === true,
+      );
+
+      const inspect1 = await sendCommand(sockPath, {
+        id: "obs1-inspect",
+        type: "inspect",
+      });
+      expect(inspect1).toMatchObject({
+        type: "response",
+        command: "inspect",
+        success: true,
+        data: {
+          runId: "disconnect-reconnect",
+          process: { alive: true },
+          childIdle: true,
+          isStreaming: false,
+        },
+      });
+      const inspect1Data = objectValue(inspect1["data"]);
+      const pid1 = objectValue(inspect1Data["process"])["pid"];
+      const sessionId1 = objectValue(inspect1Data["session"])["sessionId"];
+      expect(pid1).toBeGreaterThan(0);
+      expect(sessionId1).toBe("disconnect-reconnect");
+
+      const state2 = await sendCommand(sockPath, {
+        id: "obs2-state",
+        type: "get_state",
+      });
+      expect(state2).toMatchObject({
+        id: "obs2-state",
+        type: "response",
+        command: "get_state",
+        success: true,
+        data: {
+          sessionId: sessionId1,
+        },
+      });
+
+      const inspect2 = await sendCommand(sockPath, {
+        id: "obs2-inspect",
+        type: "inspect",
+      });
+      const inspect2Process = objectValue(
+        objectValue(inspect2["data"])["process"],
+      );
+      expect(inspect2Process["pid"]).toBe(pid1);
+      expect(inspect2Process["alive"]).toBe(true);
+
+      await sendCommand(sockPath, { type: "accept" });
+      await waitForExit(runnerProc);
+    } finally {
+      runnerProc.kill();
+    }
+  });
+
+  it("records exactly one start and end event for an active tool without silent timeout cancellation", async () => {
+    const { root, sockPath, runnerProc } =
+      await prepareSupervisedRun("silent-tool");
+    try {
+      const statusPath = join(root, "status.json");
+      await waitForStatus(statusPath, (s) => s["state"] === "idle");
+
+      const promptRes = await sendCommand(sockPath, {
+        id: "tool-req",
+        type: "prompt",
+        message: "run silent tool",
+      });
+      expect(promptRes).toMatchObject({
+        id: "tool-req",
+        type: "response",
+        command: "prompt",
+        success: true,
+      });
+
+      // The tool's own end first, so the status wait below cannot be satisfied
+      // by the standby turn this run already wrote to its own status file.
+      await waitForTrace(
+        join(root, "trace.jsonl"),
+        (line) => line["type"] === "tool_execution_end",
+      );
+      await waitForStatus(
+        statusPath,
+        (s) => s["state"] === "idle" && s["lastEvent"] === "agent_end",
+      );
+
+      const traceContent = await readFile(join(root, "trace.jsonl"), "utf8");
+      const traceLines = traceContent
+        .trim()
+        .split("\n")
+        .map((l) => JSON.parse(l));
+
+      const starts = traceLines.filter(
+        (l) => l.type === "tool_execution_start",
+      );
+      const ends = traceLines.filter((l) => l.type === "tool_execution_end");
+
+      expect(starts).toHaveLength(1);
+      expect(ends).toHaveLength(1);
+      expect(starts[0]).toMatchObject({
+        type: "tool_execution_start",
+        toolCallId: "call_tool_1",
+        toolName: "bash",
+      });
+      expect(ends[0]).toMatchObject({
+        type: "tool_execution_end",
+        toolCallId: "call_tool_1",
+        toolName: "bash",
+        isError: false,
+      });
+
+      await sendCommand(sockPath, { type: "accept" });
+      await waitForExit(runnerProc);
+    } finally {
+      runnerProc.kill();
+    }
+  });
+
+  it("forwards commands with exact native wire shape and correlated acknowledgements", async () => {
+    const { root, sockPath, runnerProc } =
+      await prepareSupervisedRun("wire-shapes");
+    try {
+      const statusPath = join(root, "status.json");
+      await waitForStatus(statusPath, (s) => s["state"] === "idle");
+
+      const stateRes = await sendCommand(sockPath, {
+        id: "req-state",
+        type: "get_state",
+      });
+      expect(stateRes).toMatchObject({
+        id: "req-state",
+        type: "response",
+        command: "get_state",
+        success: true,
+        data: { sessionId: "wire-shapes" },
+      });
+
+      const steerRes = await sendCommand(sockPath, {
+        id: "req-steer",
+        type: "steer",
+        message: "steer direction",
+      });
+      expect(steerRes).toMatchObject({
+        id: "req-steer",
+        type: "response",
+        command: "steer",
+        success: true,
+      });
+
+      const abortRes = await sendCommand(sockPath, {
+        id: "req-abort",
+        type: "abort",
+      });
+      expect(abortRes).toMatchObject({
+        id: "req-abort",
+        type: "response",
+        command: "abort",
+        success: true,
+      });
+
+      const badPromptRes = await sendCommand(sockPath, {
+        id: "req-bad",
+        type: "prompt",
+        message: 12345,
+      });
+      expect(badPromptRes["success"]).toBe(false);
+
+      const badImagesRes = await sendCommand(sockPath, {
+        id: "req-bad-images",
+        type: "prompt",
+        message: "invalid images",
+        images: [1],
+      });
+      expect(badImagesRes["success"]).toBe(false);
+
+      await sendCommand(sockPath, { type: "accept" });
+      await waitForExit(runnerProc);
+    } finally {
+      runnerProc.kill();
+    }
+  });
+
+  it("distinguishes explicit cancellation from process failure with distinct terminal reasons", async () => {
+    const cancelSetup = await prepareSupervisedRun("cancel-run");
+    try {
+      const statusPath = join(cancelSetup.root, "status.json");
+      await waitForStatus(statusPath, (s) => s["state"] === "idle");
+
+      const cancelRes = await sendCommand(cancelSetup.sockPath, {
+        id: "cancel-cmd",
+        type: "cancel",
+        reason: "cancelled_by_conductor",
+      });
+      expect(cancelRes).toMatchObject({
+        id: "cancel-cmd",
+        type: "response",
+        command: "cancel",
+        success: true,
+        data: { cancelled: true },
+      });
+
+      await waitForExit(cancelSetup.runnerProc);
+      const cancelStatus = JSON.parse(
+        await readFile(join(cancelSetup.root, "status.json"), "utf8"),
+      );
+      expect(cancelStatus).toMatchObject({
+        state: "cancelled",
+        terminalReason: "cancelled_by_conductor",
+        process: { alive: false },
+      });
+    } finally {
+      cancelSetup.runnerProc.kill();
+    }
+
+    const errorSetup = await prepareSupervisedRun("crash-run", "crash now");
+    try {
+      await waitForExit(errorSetup.runnerProc);
+      const errorStatus = JSON.parse(
+        await readFile(join(errorSetup.root, "status.json"), "utf8"),
+      );
+      expect(errorStatus).toMatchObject({
+        state: "failed",
+        terminalReason: "process_exit",
+        process: { alive: false },
+      });
+
+      const errorEvidence = JSON.parse(
+        await readFile(join(errorSetup.root, "review-error.json"), "utf8"),
+      );
+      expect(errorEvidence).toMatchObject({
+        reason: "process_exit",
+      });
+      expect(errorEvidence.stderrTail).toContain("fatal model failure");
+    } finally {
+      errorSetup.runnerProc.kill();
+    }
+  });
+
+  it("allows recovering from an incomplete candidate result via continuation in the same session", async () => {
+    const { root, sockPath, runnerProc } = await prepareSupervisedRun(
+      "recoverable-continuation",
+      "candidate then continue",
+    );
+    try {
+      const statusPath = join(root, "status.json");
+
+      await waitForStatus(
+        statusPath,
+        (s) => s["state"] === "idle" && s["lastEvent"] === "agent_end",
+      );
+      const inspect1 = await sendCommand(sockPath, { type: "inspect" });
+      const inspect1Data = objectValue(inspect1["data"]);
+      expect(inspect1Data["lastCandidateResult"]).toBe(
+        "candidate partial review",
+      );
+      expect(objectValue(inspect1Data["process"])["alive"]).toBe(true);
+
+      const contRes = await sendCommand(sockPath, {
+        id: "cont-1",
+        type: "prompt",
+        message: "provide final conclusion",
+      });
+      expect(contRes).toMatchObject({
+        id: "cont-1",
+        type: "response",
+        command: "prompt",
+        success: true,
+      });
+
+      await waitForStatus(
+        statusPath,
+        (s) =>
+          s["state"] === "idle" &&
+          s["lastEvent"] === "agent_end" &&
+          !s["inFlightTool"],
+      );
+      const inspect2 = await sendCommand(sockPath, { type: "inspect" });
+      expect(objectValue(inspect2["data"])["lastCandidateResult"]).toBe(
+        "ACCEPTED_FINAL_CONCLUSION",
+      );
+
+      const acceptRes = await sendCommand(sockPath, {
+        id: "acc-1",
+        type: "accept",
+      });
+      expect(acceptRes).toMatchObject({
+        id: "acc-1",
+        type: "response",
+        command: "accept",
+        success: true,
+      });
+
+      await waitForExit(runnerProc);
+
+      const runner = fileURLToPath(
+        new URL("../../container/review-run.sh", import.meta.url),
+      );
+      const reportResult = spawnSync(
+        "bash",
+        ["-c", 'source "$1" "$2"; do_report', "runner-test", runner, root],
+        { encoding: "utf8" },
+      );
+      expect(reportResult.status).toBe(0);
+
+      const report = JSON.parse(
+        await readFile(join(root, "report.json"), "utf8"),
+      );
+      expect(report.finalText).toBe("ACCEPTED_FINAL_CONCLUSION");
+      expect(report.usage.turns).toBe(2);
+      expect(report.usage.totalTokens).toBe(35);
+    } finally {
+      runnerProc.kill();
+    }
+  });
+
+  it("supports restarting an idle auth-blocked child process with preserved session while rejecting active tool restart", async () => {
+    const { root, sockPath, runnerProc } = await prepareSupervisedRun(
+      "auth-restart",
+      "simulate auth blocked",
+    );
+    try {
+      const statusPath = join(root, "status.json");
+      await waitForStatus(
+        statusPath,
+        (s) =>
+          s["state"] === "blocked" &&
+          s["terminalReason"] === "auth_blocked" &&
+          s["childIdle"] === true &&
+          objectValue(s["process"])["alive"] === false,
+      );
+
+      const inspectBlocked = await sendCommand(sockPath, { type: "inspect" });
+      const blockedData = objectValue(inspectBlocked["data"]);
+      const oldPid = objectValue(blockedData["process"])["pid"];
+      expect(blockedData["terminalReason"]).toBe("auth_blocked");
+      expect(blockedData["childIdle"]).toBe(true);
+
+      const restartRes = await sendCommand(sockPath, {
+        id: "restart-1",
+        type: "restart_process",
+      });
+      expect(restartRes).toMatchObject({
+        id: "restart-1",
+        type: "response",
+        command: "restart_process",
+        success: true,
+      });
+      const newPid = objectValue(restartRes["data"])["pid"];
+      expect(newPid).toBeDefined();
+      expect(newPid).not.toBe(oldPid);
+
+      const inspectNew = await sendCommand(sockPath, { type: "inspect" });
+      const inspectNewData = objectValue(inspectNew["data"]);
+      expect(objectValue(inspectNewData["process"])["pid"]).toBe(newPid);
+      expect(objectValue(inspectNewData["process"])["alive"]).toBe(true);
+      expect(objectValue(inspectNewData["session"])["sessionId"]).toBe(
+        "auth-restart",
+      );
+      expect(inspectNewData["terminalReason"]).toBe(null);
+
+      for (let attempt = 0; attempt < 100; attempt++) {
+        const lines = (await readFile(join(root, "pi-args.jsonl"), "utf8"))
+          .trim()
+          .split("\n");
+        if (lines.length === 2) break;
+        await new Promise((resolve) => setTimeout(resolve, 10));
+      }
+      const invocations = (await readFile(join(root, "pi-args.jsonl"), "utf8"))
+        .trim()
+        .split("\n")
+        .map((line) => JSON.parse(line));
+      expect(invocations).toHaveLength(2);
+      expect(invocations[0]).toContain("--session-id");
+      expect(invocations[0]).not.toContain("--session");
+      expect(invocations[1]).toContain("--session");
+      expect(invocations[1]).not.toContain("--session-id");
+      expect(invocations[1]).not.toContain("--session-dir");
+
+      await sendCommand(sockPath, {
+        type: "prompt",
+        message: "active descendant",
+      });
+      await waitForStatus(
+        statusPath,
+        (status) => status["inFlightTool"] === "call_descendant",
+      );
+      const activeRestart = await sendCommand(sockPath, {
+        type: "restart_process",
+      });
+      expect(activeRestart).toMatchObject({
+        command: "restart_process",
+        success: false,
+      });
+
+      await sendCommand(sockPath, { type: "cancel" });
+      await waitForExit(runnerProc);
+    } finally {
+      runnerProc.kill();
+    }
+  });
+
+  it("preserves quota and model errors through agent end and process exit", async () => {
+    const quota = await prepareSupervisedRun(
+      "quota-blocked",
+      "simulate quota blocked",
+    );
+    try {
+      const quotaStatusPath = join(quota.root, "status.json");
+      const quotaStatus = await waitForStatus(
+        quotaStatusPath,
+        (status) =>
+          status["state"] === "blocked" &&
+          status["terminalReason"] === "quota_blocked" &&
+          objectValue(status["process"])["alive"] === false,
+      );
+      expect(quotaStatus).toMatchObject({
+        childIdle: true,
+        isStreaming: false,
+      });
+      const restart = await sendCommand(quota.sockPath, {
+        type: "restart_process",
+      });
+      expect(restart).toMatchObject({ success: false });
+      await sendCommand(quota.sockPath, { type: "cancel" });
+      expect(await waitForExit(quota.runnerProc)).toBe(130);
+    } finally {
+      quota.runnerProc.kill();
+    }
+
+    const modelError = await prepareSupervisedRun(
+      "model-error-exit",
+      "model error then exit",
+    );
+    try {
+      expect(await waitForExit(modelError.runnerProc)).toBe(1);
+      const status = JSON.parse(
+        await readFile(join(modelError.root, "status.json"), "utf8"),
+      );
+      expect(status).toMatchObject({
+        state: "failed",
+        terminalReason: "model_error",
+        process: { alive: false },
+      });
+      const evidence = JSON.parse(
+        await readFile(join(modelError.root, "review-error.json"), "utf8"),
+      );
+      expect(evidence).toMatchObject({
+        reason: "model_error",
+        errorMessage: "provider model error",
+      });
+    } finally {
+      modelError.runnerProc.kill();
+    }
+  });
+
+  const runnerScript = fileURLToPath(
+    new URL("../../container/review-run.sh", import.meta.url),
+  );
+
+  /** Sources the runner without running it, then calls one of its functions. */
+  const callRunnerFunction = async (
+    job: Record<string, unknown>,
+    script: string,
+  ) => {
+    const root = await mkdtemp(join(tmpdir(), "review-pi-fn-"));
+    temporaryDirectories.push(root);
+    await mkdir(join(root, "work/repo"), { recursive: true });
+    await writeFile(join(root, "job.json"), JSON.stringify(job));
+    const output = execFileSync(
+      "bash",
+      ["-c", `source ${runnerScript} ${root} >/dev/null 2>&1; ${script}`],
+      { encoding: "utf8" },
+    );
+    return { root, output };
+  };
+
+  it("gives the reviewer a role-appropriate context file instead of the contributor guide", async () => {
+    // Pi loads the first context file in the checkout root, and the repo's own
+    // AGENTS.md tells a contributor to run the repository-wide baseline.
+    const { root } = await callRunnerFunction(
+      {
+        runId: "context-override",
+        supervised: true,
+        reviewerContext:
+          "# Repository context for a review lane\nYou do not commit.",
+      },
+      "write_reviewer_context",
+    );
+
+    const override = await readFile(
+      join(root, "work/repo/AGENTS.override.md"),
+      "utf8",
+    );
+    expect(override).toContain("Repository context for a review lane");
+    expect(override).not.toContain("bun typecheck && bun format");
+  });
+
+  it("writes no override when the job carries no reviewer context", async () => {
+    const { root } = await callRunnerFunction(
+      { runId: "no-context", supervised: true },
+      "write_reviewer_context",
+    );
+
+    await expect(
+      readFile(join(root, "work/repo/AGENTS.override.md"), "utf8"),
+    ).rejects.toThrow();
+  });
+
+  it("leaves its own context override out of what the reviewer introduced", async () => {
+    // The counter answers "what did the reviewer add". Counting the file the
+    // runner wrote would read 1 on every clean run until nobody looked at it.
+    const { root } = await callRunnerFunction(
+      {
+        runId: "override-count",
+        supervised: true,
+        reviewerContext: "# context\nno commits",
+      },
+      "write_reviewer_context",
+    );
+    const repo = join(root, "work/repo");
+    execFileSync("git", ["init", "-q", repo]);
+    await writeFile(join(repo, "tracked.txt"), "a\n");
+    execFileSync("git", ["-C", repo, "add", "tracked.txt"]);
+    execFileSync("git", [
+      "-C",
+      repo,
+      "-c",
+      "user.name=t",
+      "-c",
+      "user.email=t@invalid",
+      "commit",
+      "-q",
+      "-m",
+      "base",
+    ]);
+    const delta = `source ${runnerScript} ${root} >/dev/null 2>&1; do_checkout_delta`;
+
+    execFileSync("bash", ["-c", delta]);
+    expect(
+      (await readFile(join(root, "checkout-untracked.txt"), "utf8")).trim(),
+    ).toBe("");
+    expect(
+      (await readFile(join(root, "checkout-status.txt"), "utf8")).trim(),
+    ).toBe("");
+
+    await writeFile(join(repo, "reproduction.test.ts"), "// repro\n");
+    execFileSync("bash", ["-c", delta]);
+    expect(await readFile(join(root, "checkout-untracked.txt"), "utf8")).toBe(
+      "reproduction.test.ts\n",
+    );
+
+    // A reviewer that writes its own file at that path is counted again.
+    await writeFile(join(repo, "AGENTS.override.md"), "reviewer wrote this\n");
+    execFileSync("bash", ["-c", delta]);
+    expect(
+      await readFile(join(root, "checkout-untracked.txt"), "utf8"),
+    ).toContain("AGENTS.override.md");
+  });
+
+  it("writes steps.jsonl as one JSON object per line", async () => {
+    const { root } = await callRunnerFunction(
+      { runId: "steps-shape", supervised: true },
+      "record clone 0 1; record install 1 2",
+    );
+
+    const lines = (await readFile(join(root, "steps.jsonl"), "utf8"))
+      .split("\n")
+      .filter(Boolean);
+    expect(lines).toHaveLength(2);
+    expect(lines.map((line) => JSON.parse(line))).toMatchObject([
+      { step: "clone", exit: 0 },
+      { step: "install", exit: 1 },
+    ]);
+  });
+
+  it("records a failing scoped check without ending the run", async () => {
+    // The check runs before Pi. Aborting on its exit would kill the reviewer at
+    // the moment the regression it was sent to find had just been shown.
+    const { root, output } = await callRunnerFunction(
+      { runId: "soft-check", supervised: true },
+      'step_soft check false; echo "continued=$?"',
+    );
+
+    expect(output).toContain("continued=0");
+    expect((await readFile(join(root, "check.exit"), "utf8")).trim()).toBe("1");
+    const steps = (await readFile(join(root, "steps.jsonl"), "utf8"))
+      .split("\n")
+      .filter(Boolean)
+      .map((line) => JSON.parse(line) as Record<string, unknown>);
+    expect(steps.at(-1)).toMatchObject({ step: "check", exit: 1 });
+  });
+
+  it("records what the reviewer changed in its own checkout", async () => {
+    const root = await mkdtemp(join(tmpdir(), "review-pi-fn-"));
+    temporaryDirectories.push(root);
+    const repo = join(root, "work/repo");
+    await mkdir(repo, { recursive: true });
+    await writeFile(join(root, "job.json"), JSON.stringify({ runId: "delta" }));
+    execFileSync("git", ["init", "-q", repo]);
+    await writeFile(join(repo, "source.ts"), "export const a = 1;\n");
+    execFileSync("git", ["-C", repo, "add", "source.ts"]);
+    execFileSync("git", [
+      "-C",
+      repo,
+      "-c",
+      "user.name=t",
+      "-c",
+      "user.email=t@invalid",
+      "commit",
+      "-q",
+      "-m",
+      "base",
+    ]);
+    await writeFile(join(repo, "reproduction.test.ts"), "// repro\n");
+    await writeFile(join(repo, "source.ts"), "export const a = 2;\n");
+
+    execFileSync("bash", [
+      "-c",
+      `source ${runnerScript} ${root} >/dev/null 2>&1; do_checkout_delta`,
+    ]);
+
+    expect(
+      await readFile(join(root, "checkout-delta.patch"), "utf8"),
+    ).toContain("export const a = 2;");
+    expect(
+      await readFile(join(root, "checkout-untracked.txt"), "utf8"),
+    ).toContain("reproduction.test.ts");
+  });
+
+  it("classifies an OAuth 403 as auth blocked so the renewal path can run", async () => {
+    // The real failure: a 403 whose body names OAuth, matched by no pattern in
+    // the old alternation, so it fell through to model_error and the renewal
+    // built for exactly this case never ran.
+    const { root, runnerProc } = await prepareSupervisedRun(
+      "oauth-403",
+      "simulate oauth 403",
+    );
+    try {
+      const status = await waitForStatus(
+        join(root, "status.json"),
+        (current) => current["state"] === "blocked",
+      );
+      expect(status["terminalReason"]).toBe("auth_blocked");
+      const evidence = JSON.parse(
+        await readFile(join(root, "review-error.json"), "utf8"),
+      );
+      expect(evidence["reason"]).toBe("auth_blocked");
+    } finally {
+      runnerProc.kill();
+    }
+  });
+
+  it("restores idle candidate state when native Pi rejects a continuation", async () => {
+    const { root, sockPath, runnerProc } = await prepareSupervisedRun(
+      "rejected-continuation",
+    );
+    try {
+      const statusPath = join(root, "status.json");
+      await waitForStatus(statusPath, (status) => status["state"] === "idle");
+      const rejected = await sendCommand(sockPath, {
+        type: "prompt",
+        message: "reject prompt",
+      });
+      expect(rejected).toMatchObject({
+        command: "prompt",
+        success: false,
+        error: "native_prompt_rejected",
+      });
+      const inspect = await sendCommand(sockPath, { type: "inspect" });
+      expect(inspect).toMatchObject({
+        data: {
+          state: "idle",
+          childIdle: true,
+          isStreaming: false,
+          lastCandidateResult: "standby ready",
+        },
+      });
+      await sendCommand(sockPath, { type: "accept" });
+      expect(await waitForExit(runnerProc)).toBe(0);
+    } finally {
+      runnerProc.kill();
+    }
+  });
+
+  it("keeps the final state when a response and terminal events share one stdout chunk", async () => {
+    const { root, sockPath, runnerProc } =
+      await prepareSupervisedRun("rapid-events");
+    try {
+      const statusPath = join(root, "status.json");
+      await waitForStatus(statusPath, (s) => s["state"] === "idle");
+
+      const response = await sendCommand(sockPath, {
+        id: "rapid-1",
+        type: "prompt",
+        message: "rapid final",
+      });
+      expect(response).toMatchObject({ success: true, command: "prompt" });
+      const status = await waitForStatus(
+        statusPath,
+        (s) =>
+          s["state"] === "idle" && s["lastCandidateResult"] === "RAPID_FINAL",
+      );
+      expect(status).toMatchObject({
+        state: "idle",
+        childIdle: true,
+        isStreaming: false,
+        terminalReason: null,
+      });
+
+      await sendCommand(sockPath, { type: "accept" });
+      expect(await waitForExit(runnerProc)).toBe(0);
+    } finally {
+      runnerProc.kill();
+    }
+  });
+
+  it("uses a valid persistent native session id for accepted run ids", async () => {
+    const { root, sockPath, runnerProc } = await prepareSupervisedRun("run.");
+    try {
+      const statusPath = join(root, "status.json");
+      await waitForStatus(statusPath, (s) => s["state"] === "idle");
+      const stateResponse = await sendCommand(sockPath, { type: "get_state" });
+      expect(objectValue(stateResponse["data"])["sessionId"]).toBe("run");
+      await sendCommand(sockPath, { type: "accept" });
+      expect(await waitForExit(runnerProc)).toBe(0);
+    } finally {
+      runnerProc.kill();
+    }
+  });
+
+  it("reports the native child idle before the first prompt", async () => {
+    const { root, sockPath, runnerProc } = await prepareSupervisedRun(
+      "idle-before-prompt",
+      null,
+    );
+    try {
+      const status = await waitForStatus(
+        join(root, "status.json"),
+        (candidate) =>
+          candidate["state"] === "idle" &&
+          candidate["childIdle"] === true &&
+          candidate["isStreaming"] === false,
+      );
+      expect(status).toMatchObject({
+        process: { alive: true },
+      });
+      const response = await sendCommand(sockPath, { type: "inspect" });
+      expect(response).toMatchObject({
+        data: {
+          state: "idle",
+          childIdle: true,
+          isStreaming: false,
+          process: { alive: true },
+        },
+      });
+      await sendCommand(sockPath, { type: "cancel" });
+      expect(await waitForExit(runnerProc)).toBe(130);
+    } finally {
+      runnerProc.kill();
+    }
+  });
+
+  it("accepts native lifecycle events and preserves split UTF-8 framing", async () => {
+    const { root, sockPath, runnerProc } =
+      await prepareSupervisedRun("native-events");
+    try {
+      const statusPath = join(root, "status.json");
+      await waitForStatus(statusPath, (s) => s["state"] === "idle");
+      const initial = await sendCommand(sockPath, { type: "inspect" });
+      expect(objectValue(initial["data"])["detail"]).toBe("");
+
+      await sendCommand(
+        sockPath,
+        {
+          type: "prompt",
+          message: "split unicode 🧪",
+        },
+        5000,
+        "🧪",
+      );
+      await waitForStatus(
+        statusPath,
+        (s) =>
+          s["state"] === "idle" && s["lastCandidateResult"] === "UNICODE_FINAL",
+      );
+      const raw = await readFile(join(root, "pi-raw.jsonl"), "utf8");
+      expect(raw).toContain("café 🧪");
+      expect(await readFile(join(root, "pi.stderr"), "utf8")).not.toContain(
+        "malformed event JSON",
+      );
+
+      await sendCommand(sockPath, { type: "accept" });
+      expect(await waitForExit(runnerProc)).toBe(0);
+    } finally {
+      runnerProc.kill();
+    }
+  });
+
+  it("waits for the exact process group to stop on explicit cancellation", async () => {
+    const { root, sockPath, runnerProc } = await prepareSupervisedRun(
+      "cancel-descendant",
+      "active descendant",
+    );
+    try {
+      const statusPath = join(root, "status.json");
+      await waitForStatus(
+        statusPath,
+        (s) =>
+          s["inFlightTool"] === "call_descendant" &&
+          objectValue(s["process"])["alive"] === true,
+      );
+      const descendantPid = Number(
+        await readFile(join(root, "descendant.pid"), "utf8"),
+      );
+      await sendCommand(sockPath, { type: "cancel" });
+      expect(await waitForExit(runnerProc)).toBe(130);
+      expect(() => process.kill(descendantPid, 0)).toThrow();
+      const status = JSON.parse(await readFile(statusPath, "utf8"));
+      expect(status).toMatchObject({
+        state: "cancelled",
+        process: { alive: false },
+      });
+    } finally {
+      runnerProc.kill();
+    }
+  });
+
+  it("preserves step evidence when controls use the public send entrypoint", async () => {
+    const { root, runnerProc } = await prepareSupervisedRun("public-send");
+    const runner = fileURLToPath(
+      new URL("../../container/review-run.sh", import.meta.url),
+    );
+    try {
+      await waitForStatus(
+        join(root, "status.json"),
+        (status) => status["state"] === "idle",
+      );
+      const stepsPath = join(root, "steps.jsonl");
+      await writeFile(stepsPath, '{"step":"check","exit":0}\n');
+      const result = await runPublicCommand(runner, root, {
+        type: "inspect",
+      });
+      expect(result).toMatchObject({ code: 0, stderr: "" });
+      expect(JSON.parse(result.stdout)).toMatchObject({
+        command: "inspect",
+        success: true,
+      });
+      expect(await readFile(stepsPath, "utf8")).toBe(
+        '{"step":"check","exit":0}\n',
+      );
+
+      const accept = await sendCommand(join(root, "rpc.sock"), {
+        type: "accept",
+      });
+      expect(accept).toMatchObject({ command: "accept", success: true });
+      await waitForStatus(
+        join(root, "status.json"),
+        (status) =>
+          status["state"] === "done" &&
+          objectValue(status["process"])["alive"] === false,
+      );
+      expect(await waitForExit(runnerProc)).toBe(0);
+    } finally {
+      runnerProc.kill();
+    }
+  });
+
+  it("carries a file command to the socket and removes the file", async () => {
+    const { root, runnerProc } = await prepareSupervisedRun("public-send-file");
+    const runner = fileURLToPath(
+      new URL("../../container/review-run.sh", import.meta.url),
+    );
+    try {
+      await waitForStatus(
+        join(root, "status.json"),
+        (status) => status["state"] === "idle",
+      );
+      const commandPath = join(root, "command-1.json");
+      const command = { type: "inspect" };
+      await writeFile(commandPath, JSON.stringify(command));
+      const result = await runPublicSend(
+        runner,
+        root,
+        ["--send-file", commandPath],
+        "public --send-file command",
+      );
+      expect(result).toMatchObject({ code: 0, stderr: "" });
+      expect(JSON.parse(result.stdout)).toMatchObject({
+        command: "inspect",
+        success: true,
+      });
+      await expect(readFile(commandPath, "utf8")).rejects.toThrow();
+
+      await sendCommand(join(root, "rpc.sock"), { type: "accept" });
+      await waitForStatus(
+        join(root, "status.json"),
+        (status) => status["state"] === "done",
+      );
+      expect(await waitForExit(runnerProc)).toBe(0);
+    } finally {
+      runnerProc.kill();
+    }
+  });
+});

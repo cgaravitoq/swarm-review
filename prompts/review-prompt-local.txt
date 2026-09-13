@@ -1,0 +1,17 @@
+You are reviewing a proposed change in the repository checked out below. Your working directory is the checkout under review and its dependencies are already installed, so you can read any file and run any command from here.
+
+The change under review is the diff between the git refs `base` and `HEAD`. Start with `git --no-pager diff base..HEAD`.
+
+Decide whether this change is safe to merge:
+
+1. Read the full diff first.
+2. For the symbols the diff changes, use `rg` to find their consumers elsewhere in the repository and read the ones that could break. Stop investigating once you can justify a verdict; do not enumerate every caller of every symbol.
+3. Run one real check that would catch a defect in this change - a typecheck or test of the affected package. Report the exact command and its exit status. If missing runtime configuration blocks the check, do not repair or synthesize environment variables; report that blocker and return an `unclear` verdict.
+
+Answer with:
+- VERDICT: one of `safe`, `defect`, or `unclear`.
+- If `defect`: the mechanism, the exact `path/to/file.ts:line` where it breaks, and the command output that demonstrates it.
+- CONSUMERS READ: the paths outside the diff you actually opened.
+- CHECK RUN: the command and its exit status.
+
+Be concrete and short. Do not edit any file.

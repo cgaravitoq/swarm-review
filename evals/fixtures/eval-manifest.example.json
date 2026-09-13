@@ -1,0 +1,26 @@
+{
+  "version": 1,
+  "defaults": {
+    "image": "swarm-review-local",
+    "provider": "cloudflare-workers-ai",
+    "model": "@cf/deepseek-ai/deepseek-v4-flash-0731",
+    "thinking": "high",
+    "prompt": "prompts/review-prompt-local.txt",
+    "installTimeoutSeconds": 300,
+    "piTimeoutSeconds": 420,
+    "totalTimeoutSeconds": 600
+  },
+  "cases": [
+    {
+      "id": "example-head",
+      "head": "<full head sha of the case>",
+      "base": "<full base sha of the case>"
+    },
+    {
+      "id": "outside-diff-fixture",
+      "head": "<full head sha of the case>",
+      "base": "<full base sha of the case>",
+      "fixture": "fixtures/duplicate-name-length.patch"
+    }
+  ]
+}

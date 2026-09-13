@@ -1,0 +1,56 @@
+# Git hooks. `bun install` installs the shims; run any hook by hand with
+# `lefthook run <hook>`, and `LEFTHOOK=0 git commit …` bypasses them.
+assert_lefthook_installed: true
+glob_matcher: doublestar
+min_version: 2.1.10
+skip_lfs: true
+
+output:
+  - failure
+  - summary
+  - skips
+
+pre-commit:
+  piped: true
+  jobs:
+    - name: gates
+      env:
+        PATH: "node_modules/.bin:$PATH"
+      group:
+        parallel: true
+        jobs:
+          - name: secretlint
+            run: secretlint --maskSecrets --no-glob {staged_files}
+
+          # Check-only, never `--write`: lefthook hides the unstaged hunks of partially
+          # staged files while the hook runs, and a job that rewrites those files can
+          # make the re-apply fail, which discards the hidden work
+          # (evilmartians/lefthook#1480).
+          - name: biome
+            glob: "**/*.{js,ts,jsx,tsx,json,jsonc}"
+            exclude:
+              - "**/*.config.*"
+              - "**/*.d.*"
+            run: biome check --no-errors-on-unmatched {staged_files}
+            fail_text: "rerun: 'bunx biome check --write' on the staged files"
+
+    - name: typecheck
+      # A merge or rebase replays commits that already passed this.
+      skip:
+        - merge
+        - rebase
+      env:
+        PATH: "node_modules/.bin:$PATH"
+      run: tsgo --noEmit
+
+    # Whole-repo on purpose: the anti-slop rules judge a declaration against the
+    # file around it, and the pass costs a quarter second either way.
+    - name: lint
+      env:
+        PATH: "node_modules/.bin:$PATH"
+      run: oxlint .
+
+commit-msg:
+  jobs:
+    - name: commitlint
+      run: bunx --no -- commitlint --edit {1}

@@ -1,0 +1,39 @@
+{
+  "$schema": "./node_modules/wrangler/config-schema.json",
+  // Deployed with `bun run deploy --target <checkout>`, deliberately outside
+  // the Alchemy stack: this Worker is a disposable proof of concept and must
+  // never be able to touch a shared stage's state.
+  "name": "swarm-review",
+  "main": "worker.ts",
+  "compatibility_date": "2026-08-30",
+  // The repository every lane clones, as a clone URL. It is deliberately not
+  // set here: a Worker deployed without it refuses every run that needs an
+  // upstream with `target_repository_unset`, rather than silently reviewing the
+  // wrong repository. Set it with `wrangler deploy --var TARGET_REPOSITORY:<url>`
+  // or in the deployment's own configuration.
+  "compatibility_flags": ["nodejs_compat"],
+  "observability": { "enabled": true },
+  "durable_objects": {
+    "bindings": [{ "name": "REVIEW_SANDBOX", "class_name": "ReviewSandbox" }]
+  },
+  "migrations": [{ "tag": "v1", "new_sqlite_classes": ["ReviewSandbox"] }],
+  "containers": [
+    {
+      "class_name": "ReviewSandbox",
+      "image": "./container/Dockerfile",
+      // This directory, whose `context/` subdirectory the deploy script fills
+      // with the target checkout's manifests; the image bakes the Bun cache for
+      // their lockfile from there.
+      "image_build_context": "container",
+      // A monorepo checkout plus its node_modules plus a build cache does not
+      // fit anything smaller, and the install is the long pole of a cold run.
+      "instance_type": "standard-4",
+      // A swarm holds one container per concurrent reviewer lane plus the
+      // verifier idling beside them, and a lane's container outlives its own
+      // teardown for long enough to overlap the next. At the exact lane count
+      // the surplus lane's sandbox dies mid-review with a 500, so the ceiling
+      // is the concurrent lanes plus room for that overlap.
+      "max_instances": 5
+    }
+  ]
+}

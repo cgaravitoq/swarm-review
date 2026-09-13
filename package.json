@@ -1,0 +1,40 @@
+{
+  "name": "swarm-review",
+  "version": "0.0.0",
+  "description": "Disposable Cloudflare Sandbox proof of concept: one throwaway container clones the whole monorepo at pinned PR SHAs, installs it, and lets one Pi model review the diff while running real checks.",
+  "private": true,
+  "type": "module",
+  "license": "MIT",
+  "scripts": {
+    "clean": "git clean -xdf .cache dist node_modules",
+    "test": "vitest run",
+    "typecheck": "tsgo --noEmit",
+    "biome": "biome check .",
+    "lint": "oxlint .",
+    "deploy": "bun run scripts/deploy.ts",
+    "poc:teardown": "wrangler delete --force",
+    "review:local": "bun run src/local.ts",
+    "review:eval": "bun run evals/run.ts",
+    "review:swarm": "bun run src/swarm.ts",
+    "review:publish": "bun run src/publish.ts"
+  },
+  "dependencies": {
+    "@cloudflare/sandbox": "0.12.9"
+  },
+  "devDependencies": {
+    "@biomejs/biome": "2.5.11",
+    "@cloudflare/workers-types": "5.20260830.1",
+    "@commitlint/cli": "^21.2.2",
+    "@commitlint/config-conventional": "^21.2.2",
+    "@secretlint/secretlint-rule-preset-recommend": "^13.0.5",
+    "@types/node": "^26.4.0",
+    "@typescript/native-preview": "7.0.0-dev.20260707.2",
+    "lefthook": "^2.1.12",
+    "oxlint": "1.78.0",
+    "secretlint": "^13.0.5",
+    "typescript": "^6.0.3",
+    "ultracite": "7.10.5",
+    "vitest": "^4.1.11",
+    "wrangler": "4.127.1"
+  }
+}

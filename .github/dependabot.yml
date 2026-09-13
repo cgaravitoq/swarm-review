@@ -1,0 +1,20 @@
+version: 2
+updates:
+  - package-ecosystem: npm
+    directory: /
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 5
+    groups:
+      # One pull request for the toolchain, so a lint or type change arrives
+      # with everything it could conflict with instead of one at a time.
+      dev-toolchain:
+        dependency-type: development
+  - package-ecosystem: docker
+    directory: /container
+    schedule:
+      interval: weekly
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly

@@ -1,0 +1,43 @@
+{
+  "$schema": "https://json.schemastore.org/tsconfig",
+  "compilerOptions": {
+    "esModuleInterop": true,
+    "skipLibCheck": true,
+    "target": "ES2022",
+    "lib": ["ES2022"],
+    "allowJs": true,
+    "resolveJsonModule": true,
+    "moduleDetection": "force",
+    "verbatimModuleSyntax": true,
+
+    "incremental": true,
+    "tsBuildInfoFile": ".cache/tsbuildinfo.json",
+
+    "strict": true,
+    "noUncheckedIndexedAccess": true,
+    "exactOptionalPropertyTypes": true,
+    "noImplicitOverride": true,
+    "noFallthroughCasesInSwitch": true,
+    "noImplicitReturns": true,
+    "forceConsistentCasingInFileNames": true,
+    "noPropertyAccessFromIndexSignature": true,
+    "checkJs": true,
+    "allowUnreachableCode": false,
+    "allowUnusedLabels": false,
+
+    "module": "Preserve",
+    "moduleResolution": "Bundler",
+    "noEmit": true,
+    "isolatedModules": true,
+
+    "types": ["@cloudflare/workers-types", "node"]
+  },
+  "include": [
+    "src/**/*.ts",
+    "evals/**/*.ts",
+    "scripts/**/*.ts",
+    "container/**/*.ts",
+    "worker.ts"
+  ],
+  "exclude": ["node_modules"]
+}

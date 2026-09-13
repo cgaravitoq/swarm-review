@@ -1,0 +1,21 @@
+diff --git a/packages/utils/src/lib/string.ts b/packages/utils/src/lib/string.ts
+index 6e548fc95e..6ca4b34bbe 100644
+--- a/packages/utils/src/lib/string.ts
++++ b/packages/utils/src/lib/string.ts
+@@ -22,14 +22,14 @@ export function truncateNormalizedText(text: string, maxLength: number) {
+   return `${normalized.slice(0, maxLength - 3)}...`;
+ }
+ 
+-/** Create the next duplicate name without exceeding the database name limit. */
++/** Create the next duplicate name. */
+ export function getDuplicateName(name: string) {
+   const match = name.match(COPY_NAME_PATTERN);
+   const number = match ? Number(match.groups?.["number"] ?? 1) + 1 : null;
+   const prefix = number === null ? "Copy" : `Copy ${number}`;
+   const sourceName = match?.groups?.["name"] ?? name;
+ 
+-  return `${prefix}${sourceName ? ` ${sourceName}` : ""}`.slice(0, 255);
++  return `${prefix}${sourceName ? ` ${sourceName}` : ""}`;
+ }
+ 
+ /** Return the first non-empty string after whitespace normalization. */
