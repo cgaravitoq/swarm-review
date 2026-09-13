@@ -11,14 +11,44 @@ import {
 import { createConnection } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { setTimeout as sleep } from "node:timers/promises";
 import { fileURLToPath, URL } from "node:url";
 import { afterEach, describe, expect, it } from "vitest";
 
 const temporaryDirectories: string[] = [];
 
+/** Supervised runners this file started, stopped before their scratch goes. */
+const supervisedRunners: ReturnType<typeof spawn>[] = [];
+
+const STOP_GRACE_MS = 5_000;
+
+/**
+ * Kill a runner and everything it spawned, and wait for it to be gone.
+ *
+ * The runner is spawned as its own process group so its descendants - the node
+ * bridge and the Pi it drives - go with it. Without that, a survivor keeps
+ * writing into the run directory while `rm` walks it, which fails the cleanup
+ * with ENOTEMPTY and outlives the test that started it.
+ */
+const stopSupervisedRunner = async (proc: ReturnType<typeof spawn>) => {
+  if (proc.exitCode !== null || proc.pid === undefined) return;
+  const closed = new Promise<void>((resolve) =>
+    proc.once("close", () => resolve()),
+  );
+  try {
+    process.kill(-proc.pid, "SIGKILL");
+  } catch {
+    proc.kill("SIGKILL");
+  }
+  await Promise.race([closed, sleep(STOP_GRACE_MS)]);
+};
+
 afterEach(async () => {
+  await Promise.all(supervisedRunners.splice(0).map(stopSupervisedRunner));
   await Promise.all(
-    temporaryDirectories.splice(0).map((path) => rm(path, { recursive: true })),
+    temporaryDirectories
+      .splice(0)
+      .map((path) => rm(path, { recursive: true, force: true })),
   );
 });
 
@@ -989,7 +1019,11 @@ process.stdin.on("data", (chunk) => {
         PI_DESCENDANT_PID: join(root, "descendant.pid"),
       },
       stdio: ["ignore", "pipe", "pipe"],
+      // Its own process group, so the bridge and the Pi it drives are reaped
+      // with it instead of outliving the test that started them.
+      detached: true,
     });
+    supervisedRunners.push(runnerProc);
 
     // A piped child nobody reads blocks on write the moment the pipe buffer
     // fills, and then never exits. The wait for its exit would hang until the
@@ -1089,6 +1123,26 @@ process.stdin.on("data", (chunk) => {
     }
     throw new Error(`Predicate on ${statusPath} not met after ${timeoutMs}ms`);
   };
+
+  /**
+   * The runner settled after its standby prompt.
+   *
+   * `state === "idle"` alone is ambiguous: the bridge writes it once when the
+   * child reports idle before any prompt, and again when the standby prompt
+   * finishes. A wait that accepts the first write returns while the standby
+   * turn is still streaming, and the inspect that follows reads `running` with
+   * `isStreaming: true` - which is how this suite failed one run in ten.
+   */
+  const waitForStandbySettled = (statusPath: string) =>
+    waitForStatus(
+      statusPath,
+      (s) =>
+        s["state"] === "idle" &&
+        s["childIdle"] === true &&
+        s["isStreaming"] === false &&
+        s["lastCandidateResult"] === "standby ready" &&
+        objectValue(s["process"])["alive"] === true,
+    );
 
   /**
    * The trace line a test is waiting for.
@@ -1201,11 +1255,7 @@ process.stdin.on("data", (chunk) => {
     );
     try {
       const statusPath = join(root, "status.json");
-      await waitForStatus(
-        statusPath,
-        (s) =>
-          s["state"] === "idle" && objectValue(s["process"])["alive"] === true,
-      );
+      await waitForStandbySettled(statusPath);
 
       const inspect1 = await sendCommand(sockPath, {
         id: "obs1-inspect",
@@ -1264,7 +1314,7 @@ process.stdin.on("data", (chunk) => {
       await prepareSupervisedRun("silent-tool");
     try {
       const statusPath = join(root, "status.json");
-      await waitForStatus(statusPath, (s) => s["state"] === "idle");
+      await waitForStandbySettled(statusPath);
 
       const promptRes = await sendCommand(sockPath, {
         id: "tool-req",
@@ -1326,7 +1376,7 @@ process.stdin.on("data", (chunk) => {
       await prepareSupervisedRun("wire-shapes");
     try {
       const statusPath = join(root, "status.json");
-      await waitForStatus(statusPath, (s) => s["state"] === "idle");
+      await waitForStandbySettled(statusPath);
 
       const stateRes = await sendCommand(sockPath, {
         id: "req-state",
@@ -1389,7 +1439,7 @@ process.stdin.on("data", (chunk) => {
     const cancelSetup = await prepareSupervisedRun("cancel-run");
     try {
       const statusPath = join(cancelSetup.root, "status.json");
-      await waitForStatus(statusPath, (s) => s["state"] === "idle");
+      await waitForStandbySettled(statusPath);
 
       const cancelRes = await sendCommand(cancelSetup.sockPath, {
         id: "cancel-cmd",
@@ -1861,7 +1911,7 @@ process.stdin.on("data", (chunk) => {
     );
     try {
       const statusPath = join(root, "status.json");
-      await waitForStatus(statusPath, (status) => status["state"] === "idle");
+      await waitForStandbySettled(statusPath);
       const rejected = await sendCommand(sockPath, {
         type: "prompt",
         message: "reject prompt",
@@ -1892,7 +1942,7 @@ process.stdin.on("data", (chunk) => {
       await prepareSupervisedRun("rapid-events");
     try {
       const statusPath = join(root, "status.json");
-      await waitForStatus(statusPath, (s) => s["state"] === "idle");
+      await waitForStandbySettled(statusPath);
 
       const response = await sendCommand(sockPath, {
         id: "rapid-1",
@@ -1923,7 +1973,7 @@ process.stdin.on("data", (chunk) => {
     const { root, sockPath, runnerProc } = await prepareSupervisedRun("run.");
     try {
       const statusPath = join(root, "status.json");
-      await waitForStatus(statusPath, (s) => s["state"] === "idle");
+      await waitForStandbySettled(statusPath);
       const stateResponse = await sendCommand(sockPath, { type: "get_state" });
       expect(objectValue(stateResponse["data"])["sessionId"]).toBe("run");
       await sendCommand(sockPath, { type: "accept" });
@@ -1970,7 +2020,7 @@ process.stdin.on("data", (chunk) => {
       await prepareSupervisedRun("native-events");
     try {
       const statusPath = join(root, "status.json");
-      await waitForStatus(statusPath, (s) => s["state"] === "idle");
+      await waitForStandbySettled(statusPath);
       const initial = await sendCommand(sockPath, { type: "inspect" });
       expect(objectValue(initial["data"])["detail"]).toBe("");
 
@@ -2036,10 +2086,7 @@ process.stdin.on("data", (chunk) => {
       new URL("../../container/review-run.sh", import.meta.url),
     );
     try {
-      await waitForStatus(
-        join(root, "status.json"),
-        (status) => status["state"] === "idle",
-      );
+      await waitForStandbySettled(join(root, "status.json"));
       const stepsPath = join(root, "steps.jsonl");
       await writeFile(stepsPath, '{"step":"check","exit":0}\n');
       const result = await runPublicCommand(runner, root, {
@@ -2076,10 +2123,7 @@ process.stdin.on("data", (chunk) => {
       new URL("../../container/review-run.sh", import.meta.url),
     );
     try {
-      await waitForStatus(
-        join(root, "status.json"),
-        (status) => status["state"] === "idle",
-      );
+      await waitForStandbySettled(join(root, "status.json"));
       const commandPath = join(root, "command-1.json");
       const command = { type: "inspect" };
       await writeFile(commandPath, JSON.stringify(command));
