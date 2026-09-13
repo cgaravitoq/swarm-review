@@ -12,6 +12,7 @@ import {
 import { createRequire } from "node:module";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
+import { setTimeout as sleep } from "node:timers/promises";
 import { fileURLToPath, pathToFileURL, URL } from "node:url";
 import { afterAll, afterEach, describe, expect, it } from "vitest";
 import {
@@ -43,9 +44,37 @@ import {
 
 const temporaryDirectories: string[] = [];
 
+/** Every `local.ts` this file started, so none outlives the test that ran it. */
+const cliProcesses: ReturnType<typeof spawn>[] = [];
+
+const STOP_GRACE_MS = 5_000;
+
+/**
+ * Kill a driver and everything it spawned, and wait for it to be gone.
+ *
+ * The driver has no wall deadline of its own by design - the container owns the
+ * clock - so a driver whose scaffolding died with its test polls its fake
+ * container forever. Left unreaped, one held a core for eighteen hours.
+ */
+const stopCliProcess = async (proc: ReturnType<typeof spawn>) => {
+  if (proc.exitCode !== null || proc.pid === undefined) return;
+  const closed = new Promise<void>((resolve) =>
+    proc.once("close", () => resolve()),
+  );
+  try {
+    process.kill(-proc.pid, "SIGKILL");
+  } catch {
+    proc.kill("SIGKILL");
+  }
+  await Promise.race([closed, sleep(STOP_GRACE_MS)]);
+};
+
 afterEach(async () => {
+  await Promise.all(cliProcesses.splice(0).map(stopCliProcess));
   await Promise.all(
-    temporaryDirectories.splice(0).map((path) => rm(path, { recursive: true })),
+    temporaryDirectories
+      .splice(0)
+      .map((path) => rm(path, { recursive: true, force: true })),
   );
 });
 
@@ -182,7 +211,9 @@ const runLocalCli = (args: string[], env: NodeJS.ProcessEnv) =>
       cwd: repoRoot,
       env,
       stdio: ["ignore", "pipe", "pipe"],
+      detached: true,
     });
+    cliProcesses.push(child);
     child.stdout.on("data", (chunk) => {
       output += chunk.toString();
     });
@@ -1740,7 +1771,9 @@ exec /usr/bin/git "$@"
       cwd: repoRoot,
       env: fakeEnvironment(arranged, runId, "setup-hang"),
       stdio: ["ignore", "ignore", "ignore"],
+      detached: true,
     });
+    cliProcesses.push(child);
     let hostPid: number | undefined;
     for (let attempt = 0; attempt < 100; attempt += 1) {
       hostPid = await readFile(join(arranged.state, "host.pid"), "utf8")
