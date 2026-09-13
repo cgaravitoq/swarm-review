@@ -85,7 +85,13 @@ export const targetReviewCommand = (
   runner: string,
   targetEnv: Readonly<Record<string, string>> = {},
 ) => {
-  if (!isPositiveInt(totalTimeoutSeconds, MAX_TIMEOUT_SECONDS)) {
+  // `totalTimeoutSeconds` is already a number here, so this is a range check
+  // rather than a narrowing one; `isPositiveInt` is for parsed payloads.
+  if (
+    !Number.isInteger(totalTimeoutSeconds) ||
+    totalTimeoutSeconds < 1 ||
+    totalTimeoutSeconds > MAX_TIMEOUT_SECONDS
+  ) {
     throw new Error("totalTimeoutSeconds invalid");
   }
   const quotedDir = posixQuote(directory);
@@ -412,13 +418,13 @@ export const targetCanaryCommand = (
   targetUrl: string,
 ) => {
   if (
-    !isNonEmptyString(targetUrl) ||
+    targetUrl === "" ||
     !/^https?:\/\//.test(targetUrl) ||
     /[\s]/.test(targetUrl)
   ) {
     throw new Error("canary target url invalid");
   }
-  if (!isNonEmptyString(handle) || /[\r\n]/.test(handle)) {
+  if (handle === "" || /[\r\n]/.test(handle)) {
     throw new Error("broker handle missing");
   }
   return `setpriv --reuid=${TARGET_UID} --regid=${TARGET_UID} --clear-groups curl -sS --max-time 60 -o ${posixQuote(`${directory}/canary-response.txt`)} -w '%{http_code}' -H ${posixQuote(`authorization: Bearer ${handle}`)} -H ${posixQuote("content-type: application/json")} --data-binary @${posixQuote(`${directory}/canary-request.json`)} ${posixQuote(targetUrl)}`;
