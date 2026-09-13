@@ -1,20 +1,37 @@
 version: 2
 updates:
-  - package-ecosystem: npm
+  # The `bun` ecosystem, not `npm`: Dependabot's npm updater rewrites
+  # `package.json` and leaves `bun.lock` holding the versions it just replaced,
+  # so every pull request it opened failed CI on `--frozen-lockfile`.
+  - package-ecosystem: bun
     directory: /
     schedule:
       interval: weekly
     open-pull-requests-limit: 5
+    labels:
+      - dependencies
+    # Majors arrive as their own pull requests. A group is for the bumps that
+    # can be taken together; a TypeScript or vitest major is not one of them.
+    allow:
+      - dependency-type: all
+        update-types:
+          - version-update:semver-patch
+          - version-update:semver-minor
     groups:
-      # One pull request for the toolchain, so a lint or type change arrives
-      # with everything it could conflict with instead of one at a time.
       dev-toolchain:
         dependency-type: development
+        update-types:
+          - patch
+          - minor
   - package-ecosystem: docker
     directory: /container
     schedule:
       interval: weekly
+    labels:
+      - dependencies
   - package-ecosystem: github-actions
     directory: /
     schedule:
       interval: weekly
+    labels:
+      - dependencies
