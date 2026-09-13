@@ -12,5 +12,10 @@ export default defineConfig({
     reporters: ["default"],
     pool: "threads",
     isolate: true,
+    // The reaper every test file inherits from `setupFiles` has to run before
+    // that file's own `afterEach` removes the scratch a leak would still be
+    // writing into.
+    sequence: { hooks: "list" },
+    setupFiles: ["src/__tests__/setup.ts"],
   },
 });

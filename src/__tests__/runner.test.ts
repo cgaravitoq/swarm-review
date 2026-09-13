@@ -11,40 +11,12 @@ import {
 import { createConnection } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { setTimeout as sleep } from "node:timers/promises";
 import { fileURLToPath, URL } from "node:url";
 import { afterEach, describe, expect, it } from "vitest";
 
 const temporaryDirectories: string[] = [];
 
-/** Supervised runners this file started, stopped before their scratch goes. */
-const supervisedRunners: ReturnType<typeof spawn>[] = [];
-
-const STOP_GRACE_MS = 5_000;
-
-/**
- * Kill a runner and everything it spawned, and wait for it to be gone.
- *
- * The runner is spawned as its own process group so its descendants - the node
- * bridge and the Pi it drives - go with it. Without that, a survivor keeps
- * writing into the run directory while `rm` walks it, which fails the cleanup
- * with ENOTEMPTY and outlives the test that started it.
- */
-const stopSupervisedRunner = async (proc: ReturnType<typeof spawn>) => {
-  if (proc.exitCode !== null || proc.pid === undefined) return;
-  const closed = new Promise<void>((resolve) =>
-    proc.once("close", () => resolve()),
-  );
-  try {
-    process.kill(-proc.pid, "SIGKILL");
-  } catch {
-    proc.kill("SIGKILL");
-  }
-  await Promise.race([closed, sleep(STOP_GRACE_MS)]);
-};
-
 afterEach(async () => {
-  await Promise.all(supervisedRunners.splice(0).map(stopSupervisedRunner));
   await Promise.all(
     temporaryDirectories
       .splice(0)
@@ -1019,11 +991,7 @@ process.stdin.on("data", (chunk) => {
         PI_DESCENDANT_PID: join(root, "descendant.pid"),
       },
       stdio: ["ignore", "pipe", "pipe"],
-      // Its own process group, so the bridge and the Pi it drives are reaped
-      // with it instead of outliving the test that started them.
-      detached: true,
     });
-    supervisedRunners.push(runnerProc);
 
     // A piped child nobody reads blocks on write the moment the pipe buffer
     // fills, and then never exits. The wait for its exit would hang until the
