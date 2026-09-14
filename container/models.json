@@ -1,5 +1,16 @@
 {
   "providers": {
+    "opencode-go": {
+      "models": [
+        {
+          "id": "deepseek-v4.1-flash",
+          "api": "openai-completions",
+          "reasoning": true,
+          "contextWindow": 1000000,
+          "maxTokens": 384000
+        }
+      ]
+    },
     "cloudflare-workers-ai": {
       "modelOverrides": {
         "@cf/deepseek-ai/deepseek-v4-flash-0731": {

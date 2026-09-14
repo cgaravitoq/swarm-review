@@ -890,18 +890,36 @@ describe("credential isolation", () => {
   it("refuses a provider with no single brokered upstream instead of leaking the key", () => {
     expect(() =>
       planBroker(
-        "opencode-go",
+        "mistral",
         {
           authRoute: "api-key",
           accessToken: undefined,
           authJson: null,
-          env: { OPENCODE_API_KEY: "oc-secret" },
-          redactions: ["oc-secret"],
+          env: { MISTRAL_API_KEY: "ms-secret" },
+          redactions: ["ms-secret"],
         },
         caps,
         ledger,
       ),
     ).toThrow(/has no brokered upstream/);
+  });
+
+  it("brokers opencode-go at its Go endpoint with the API key as the bearer", () => {
+    const plan = planBroker(
+      "opencode-go",
+      {
+        authRoute: "api-key",
+        accessToken: undefined,
+        authJson: null,
+        env: { OPENCODE_API_KEY: "oc-secret" },
+        redactions: ["oc-secret"],
+      },
+      caps,
+      ledger,
+    );
+    expect(plan.config.upstreamBaseUrl).toBe("https://opencode.ai/zen/go/v1");
+    expect(plan.config.upstreamAuthorization).toBe("Bearer oc-secret");
+    expect(plan.handle).not.toContain("oc-secret");
   });
 
   it("keeps the bearer out of every docker argument that installs it", () => {

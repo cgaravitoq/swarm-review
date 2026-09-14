@@ -29,6 +29,7 @@ export type ProviderUpstream = {
  */
 export const PROVIDER_UPSTREAM = new Map<string, ProviderUpstream>([
   ["openai-codex", { baseUrl: "https://chatgpt.com/backend-api" }],
+  ["opencode-go", { baseUrl: "https://opencode.ai/zen/go/v1" }],
   ["xai", { baseUrl: "https://api.x.ai/v1" }],
   [
     "cloudflare-workers-ai",
