@@ -599,6 +599,7 @@ describe("supervised native Pi RPC lifecycle", { timeout: 120_000 }, () => {
   const prepareSupervisedRun = async (
     runId: string,
     initialPrompt: string | null = "standby",
+    provider = "openai-codex",
   ) => {
     const root = await mkdtemp(join(tmpdir(), "review-pi-supervised-"));
     temporaryDirectories.push(root);
@@ -965,7 +966,7 @@ process.stdin.on("data", (chunk) => {
         head: { sha },
         base: { sha },
         fixturePatch: "",
-        provider: "openai-codex",
+        provider,
         model: "gpt-5.6-sol",
         ...(initialPrompt === null ? {} : { prompt: initialPrompt }),
         checkCommand: "git --no-pager diff --stat base..HEAD",
@@ -1012,6 +1013,20 @@ process.stdin.on("data", (chunk) => {
     await waitForSocket(sockPath);
 
     return { root, sockPath, runnerProc };
+  };
+
+  /** The arguments of the first Pi this run spawned, as it logged them. */
+  const firstInvocation = async (root: string) => {
+    const path = join(root, "pi-args.jsonl");
+    const start = Date.now();
+    while (Date.now() - start < SUPERVISED_WAIT_MS) {
+      try {
+        const line = (await readFile(path, "utf8")).trim().split("\n")[0];
+        if (line) return JSON.parse(line) as string[];
+      } catch {}
+      await new Promise((resolve) => setTimeout(resolve, 20));
+    }
+    throw new Error("Pi was never invoked");
   };
 
   const waitForSocket = async (
@@ -1274,6 +1289,47 @@ process.stdin.on("data", (chunk) => {
       await waitForExit(runnerProc);
     } finally {
       runnerProc.kill();
+    }
+  });
+
+  it("names the subscription provider's extension for a claude-code lane and no extension for a built-in one", async () => {
+    const subscription = await prepareSupervisedRun(
+      "claude-code-lane",
+      "standby",
+      "claude-code",
+    );
+    try {
+      await waitForStandbySettled(join(subscription.root, "status.json"));
+      const invocation = await firstInvocation(subscription.root);
+      const flag = invocation.indexOf("-e");
+      expect(flag).toBeGreaterThan(-1);
+      expect(invocation[flag + 1]).toBe(
+        "/opt/review/extensions/claude-code-provider.js",
+      );
+      // Named explicitly while discovery stays off: the checkout is untrusted
+      // input, and `--approve` is what would let it contribute an extension of
+      // its own to the process reviewing it.
+      expect(invocation).toContain("--no-extensions");
+      expect(invocation).toContain("--approve");
+      await sendCommand(subscription.sockPath, { type: "accept" });
+      await waitForExit(subscription.runnerProc);
+    } finally {
+      subscription.runnerProc.kill();
+    }
+
+    const builtin = await prepareSupervisedRun("builtin-provider-lane");
+    try {
+      await waitForStandbySettled(join(builtin.root, "status.json"));
+      const invocation = await firstInvocation(builtin.root);
+      expect(invocation).toContain("--provider");
+      expect(invocation[invocation.indexOf("--provider") + 1]).toBe(
+        "openai-codex",
+      );
+      expect(invocation).not.toContain("-e");
+      await sendCommand(builtin.sockPath, { type: "accept" });
+      await waitForExit(builtin.runnerProc);
+    } finally {
+      builtin.runnerProc.kill();
     }
   });
 

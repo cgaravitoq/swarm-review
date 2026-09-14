@@ -61,6 +61,32 @@ RUN apt-get update \
   && rm -rf /var/lib/apt/lists/* \
   && rg --version
 
+# A Claude Code subscription is not an API key, and Anthropic answers one only
+# to requests shaped the way its own CLI sends them. That reshaping lives in a
+# pi extension, pinned because it speaks an unpublished protocol that Anthropic
+# moves: a newer one changes the shape, and this is the version the image was
+# built against. Peer dependencies are skipped on purpose - pi resolves the
+# `@earendil-works/pi-ai` an extension imports through its own loader, so a
+# second copy in here would be a second stream implementation, not a second
+# protocol.
+#
+# The build asserts the module the provider file imports is still published: a
+# version that moves it must fail here, not mid-review.
+ARG CLAUDE_CODE_AUTH_VERSION=2.5.2
+
+RUN mkdir -p /opt/review/extensions \
+  && cd /opt/review/extensions \
+  && npm install --no-audit --no-fund --ignore-scripts --legacy-peer-deps \
+    "@cgaravitoq/pi-claude-code-auth@${CLAUDE_CODE_AUTH_VERSION}" \
+  && test -f node_modules/@cgaravitoq/pi-claude-code-auth/src/anthropic-stream.ts
+
+# The provider seam: registered with the extension's stream and with neither a
+# base URL nor a model list of its own, so the run's own models.json decides
+# where a lane's requests go. Its own registration would send them straight to
+# api.anthropic.com with a handle that is not a credential, which is exactly
+# what the broker exists to prevent.
+COPY claude-code-provider.js /opt/review/extensions/claude-code-provider.js
+
 COPY models.json /opt/review/pi-config/models.json
 COPY review-run.sh /opt/review/review-run.sh
 RUN chmod 0755 /opt/review/review-run.sh
