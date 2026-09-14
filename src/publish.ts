@@ -140,6 +140,7 @@ export function parsePublishOptions(argv: string[]) {
     ...(expectedHead ? { expectedHead } : {}),
     ...(expectedMergeBase ? { expectedMergeBase } : {}),
     publish: argv.includes("--publish"),
+    allowMovedHead: argv.includes("--allow-moved-head"),
     minSeverity: flag(argv, "min-severity") ?? "P2",
   };
 }
@@ -664,6 +665,7 @@ export async function fetchPullRevisions(
   return (await response.json()) as {
     state: string;
     draft: boolean;
+    merged: boolean;
     head: { sha: string };
     base: { sha: string };
   };
@@ -686,6 +688,24 @@ export async function fetchMergeBase(
     merge_base_commit: { sha: string };
   };
   return compared.merge_base_commit.sha;
+}
+
+/** Whether `ancestor` is in `head`'s history: compare reports "ahead" or "identical". */
+export async function fetchIsAncestor(
+  repo: string,
+  ancestor: string,
+  head: string,
+  token: string,
+) {
+  const response = await fetch(
+    `https://api.github.com/repos/${repo}/compare/${ancestor}...${head}`,
+    { headers: githubHeaders(token, "application/vnd.github+json") },
+  );
+  if (!response.ok) {
+    throw new Error(`GitHub three-dot compare failed: ${response.status}`);
+  }
+  const compared = (await response.json()) as { status: string };
+  return compared.status === "ahead" || compared.status === "identical";
 }
 
 /** GitHub three-dot diff (merge-base...head), the surface comments attach to. */
@@ -739,16 +759,27 @@ export async function revalidatePullRequest(
   pullRequest: number,
   token: string,
   expected: ExpectedRevisions,
+  allowMovedHead = false,
 ) {
   if (!FULL_SHA.test(expected.head) || !FULL_SHA.test(expected.mergeBase)) {
     throw new Error("expected revisions must be full SHAs");
   }
   const pull = await fetchPullRevisions(repo, pullRequest, token);
-  if (pull.state !== "open") {
+  // A review posted at the commit it read stays true when commits land on
+  // top, or when the change merges: GitHub marks a comment on a line those
+  // commits changed as outdated, and a merged change still has its authors to
+  // read what was found. A head the frozen commit is no longer behind was
+  // force-pushed, and the review would then describe a change nobody can see.
+  if (pull.state !== "open" && !(allowMovedHead && pull.merged)) {
     throw new Error(`pull request is ${pull.state}, not open`);
   }
   if (pull.head.sha !== expected.head) {
-    throw new Error("pull request head moved off the frozen SHA");
+    if (
+      !allowMovedHead ||
+      !(await fetchIsAncestor(repo, expected.head, pull.head.sha, token))
+    ) {
+      throw new Error("pull request head moved off the frozen SHA");
+    }
   }
   // The destination tip is read live and deliberately not frozen: anything
   // landing on the base branch moves it without touching this change. What has
@@ -864,6 +895,7 @@ async function main() {
     pullRequest,
     token,
     expected,
+    options.allowMovedHead,
   );
   if (alreadyPublished(validated.reviews, receipt.swarmId, expected.head)) {
     throw new Error(
