@@ -97,7 +97,7 @@ bun run deploy --target /path/to/checkout --var TARGET_REPOSITORY:https://github
 | `bun run src/publish.ts` | One swarm receipt into one GitHub pull request review |
 | `bun run evals/run.ts` | A manifest of cases, run end to end and recorded |
 | `bun run deploy` | The Worker and its container image |
-| `bun test` | The test suite |
+| `bun run test` | The test suite |
 
 `src/publish.ts` is opt-in and dry by default: it prints the review it would post.
 
@@ -126,7 +126,7 @@ A sealed answer key names the defects a change actually introduced; the harness 
 bun run typecheck   # tsgo --noEmit
 bun run lint        # oxlint, with the anti-slop plugin
 bun run biome       # biome check .
-bun test            # vitest
+bun run test        # vitest
 ```
 
 Git hooks run secretlint, biome, typecheck and the anti-slop lint on every commit, and CI runs the same four plus the tests.
