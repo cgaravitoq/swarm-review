@@ -94,7 +94,17 @@ export type SwarmReceipt = {
   requested: { head: string; base: string; pullRequest: number | null };
   findings: Finding[];
   coverage?: { changedFiles: string[]; uncoveredFiles: string[] };
-  lanes?: { role: string; model: string | null; status: string }[];
+  lanes?: {
+    laneId?: string;
+    role: string;
+    model: string | null;
+    status: string;
+    /** What the lane was pointed at; a reviewer lane names its angle. */
+    focus?: string;
+    blockerReason?: string | null;
+    contractError?: string | null;
+    error?: string | null;
+  }[];
   wallSeconds?: number;
 };
 
@@ -300,10 +310,12 @@ export const findingBody = (finding: Finding, head: string) => {
  * number and a reader can recompute it from the findings table.
  */
 export function reviewScore(receipt: SwarmReceipt) {
+  // A partial review saw less than the change: what it confirmed is real,
+  // but nothing it did not find is evidence of absence, so no number.
   if (receipt.status !== "completed") {
     return {
       available: false as const,
-      reason: "partial_or_failed" as const,
+      reason: `${receipt.status} review`,
       legend: CONFIDENCE_LEGEND,
     };
   }
@@ -356,8 +368,10 @@ export function assertPublishableReceipt(
   if (receipt.requested.base !== expected.mergeBase) {
     throw new Error("receipt base does not match the frozen merge base");
   }
-  if (receipt.status !== "completed") {
-    throw new Error("publication requires a completed review");
+  // A partial review still carries what the verifier confirmed, and the body
+  // says which lane never finished. A failed one confirmed nothing.
+  if (receipt.status !== "completed" && receipt.status !== "partial") {
+    throw new Error("publication requires a completed or partial review");
   }
   for (const [index, finding] of receipt.findings.entries()) {
     if (
@@ -578,6 +592,15 @@ export function buildReview(
   if (receipt.coverage && receipt.coverage.uncoveredFiles.length > 0) {
     summary.push(
       `- not reviewed: ${receipt.coverage.uncoveredFiles.map((file) => `\`${file}\``).join(", ")}`,
+    );
+  }
+  // A lane that did not finish is an angle nobody took, even when another
+  // lane held the same files: the files count as covered, the angle does not.
+  for (const lane of receipt.lanes ?? []) {
+    if (lane.role !== "reviewer" || lane.status === "completed") continue;
+    const reason = lane.blockerReason ?? lane.contractError ?? lane.error;
+    summary.push(
+      `- reviewer lane did not finish: ${lane.focus ?? lane.laneId ?? "unnamed"} (${lane.model ? modelName(lane.model) : "no model"}, ${lane.status}${reason ? `: ${reason}` : ""})`,
     );
   }
   for (const finding of outOfDiff) {

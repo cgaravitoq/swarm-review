@@ -43,6 +43,7 @@ import {
   assertRunId,
   createBudget,
   ensureObjects,
+  mintRunId,
   readLaneReceipt,
   requiredRepo,
   requiredSource,
@@ -111,8 +112,13 @@ export const packedLaneModels = (options: SwarmOptions) => [
 /** Reviewer contexts when `--reviewers` is absent; the verifier runs alone after them. */
 export const REVIEWER_LANES = 2;
 
-/** Concurrent reviewer containers. */
-export const MAX_CONCURRENT_LANES = 2;
+/**
+ * Concurrent reviewer containers: every lane of a three-reviewer swarm at
+ * once, so the third does not queue behind the first to finish. A lane peaks
+ * near 1.5 GiB during its install, which three of them fit on the 8 GiB
+ * Docker VM a laptop gives them.
+ */
+export const MAX_CONCURRENT_LANES = 3;
 
 /**
  * Concurrent cloud reviewer sandboxes: the Worker's max_instances minus the
@@ -189,6 +195,20 @@ export function parseSwarmOptions(argv: string[]) {
       `--reviewers must be a whole number between 1 and ${MAX_REVIEWER_LANES}`,
     );
   }
+  const reasoningLevel = (name: string, fallback?: FastReasoning) => {
+    const level = (flag(argv, name) ?? fallback) as FastReasoning | undefined;
+    if (level !== undefined && !FAST_REASONING_LEVELS.includes(level)) {
+      throw new Error(`--${name} must be off, low, medium or high`);
+    }
+    return level;
+  };
+  const fastReasoning = reasoningLevel(
+    "fast-reasoning",
+    "off",
+  ) as FastReasoning;
+  // One lane may reason at its own level: through the gateway, DeepSeek with
+  // its template's thinking on never reaches an answer (phase 2 arm B, 408 at
+  // 32k), while the other labs do at medium.
   const reviewerOverrides = Object.fromEntries(
     Array.from({ length: MAX_REVIEWER_LANES }, (_, index) => {
       const laneId = reviewerLaneId(index);
@@ -198,6 +218,7 @@ export function parseSwarmOptions(argv: string[]) {
           provider: flag(argv, `${laneId}-provider`),
           model: flag(argv, `${laneId}-model`),
           thinking: flag(argv, `${laneId}-thinking`),
+          reasoning: reasoningLevel(`${laneId}-reasoning`),
         },
       ] as const;
     }),
@@ -205,11 +226,6 @@ export function parseSwarmOptions(argv: string[]) {
   const verifierProvider = flag(argv, "verifier-provider");
   const verifierModel = flag(argv, "verifier-model");
   const verifierThinking = flag(argv, "verifier-thinking");
-  const fastReasoning = (flag(argv, "fast-reasoning") ??
-    "off") as FastReasoning;
-  if (!FAST_REASONING_LEVELS.includes(fastReasoning)) {
-    throw new Error("--fast-reasoning must be off, low, medium or high");
-  }
   const orca = argv.includes("--orca");
   const sandbox = argv.includes("--sandbox");
   const fastFlag = argv.includes("--fast");
@@ -238,9 +254,7 @@ export function parseSwarmOptions(argv: string[]) {
   }
 
   return {
-    swarmId: assertRunId(
-      flag(argv, "swarm-id") ?? `swarm-${Date.now().toString(36)}`,
-    ),
+    swarmId: assertRunId(flag(argv, "swarm-id") ?? mintRunId("swarm")),
     outDir: required(argv, "out"),
     repo: flag(argv, "repo"),
     source: flag(argv, "source"),
@@ -316,6 +330,10 @@ export function resolveLaneConfig(options: SwarmOptions, laneId: string) {
     ...(thinking ? { thinking } : {}),
   };
 }
+
+/** The level one packed reviewer reasons at: its own, else the swarm's. */
+export const packedLaneReasoning = (options: SwarmOptions, laneId: string) =>
+  options.reviewerOverrides[laneId]?.reasoning ?? options.fastReasoning;
 
 /**
  * Names the workspace packages a set of changed files belongs to.
@@ -462,6 +480,23 @@ const lastJsonBlock = (finalText: string) => {
   if (bare.startsWith("{")) return parseJson(bare);
   return { value: undefined, error: "no fenced json block" };
 };
+
+/**
+ * A cut answer that never left its thinking.
+ *
+ * With thinking disabled in the request, `anthropic/claude-sonnet-5` still
+ * opened a `<think>` in plain text and spent the whole 16k ceiling inside it
+ * (run swarm-mu14gmts, 45k characters, no report). That is not a report the
+ * ceiling cut, which the same ceiling would cut again: the report never began,
+ * so a fresh sample can still be one. A closed `<think>` is the other case.
+ */
+export const cutWhileThinking = (
+  finalText: string,
+  finishReason: string | null,
+) =>
+  (finishReason === "length" || finishReason === "max_tokens") &&
+  /^\s*<think>/.test(finalText) &&
+  !finalText.includes("</think>");
 
 const failedCandidates = (error: string) => ({
   completion: null,
@@ -2096,6 +2131,15 @@ async function main() {
       // Named by every lane, or refused here: a packed swarm reaches one
       // upstream, and only the default one answers to a model nobody named.
       const laneModels = packedLaneModels(options);
+      // The request shape a Claude Code subscription is answered to is built by
+      // the provider inside the lane's container. A packed lane calls the
+      // provider from this process instead, where the token would arrive as an
+      // API key that Anthropic rejects without saying why.
+      if (fastProvider === "claude-code") {
+        throw new Error(
+          "the packed path cannot build the request shape a claude-code subscription is answered to: run those lanes in containers",
+        );
+      }
       // Refused by name before the credential is looked up: an unreachable
       // provider is not a missing key, and saying so would send the reader
       // after the wrong problem.
@@ -2299,7 +2343,7 @@ async function main() {
                     prompt: promptBody,
                     timeoutMs: laneDeadlineMs("reviewer"),
                     signal: controller.signal,
-                    reasoning: options.fastReasoning,
+                    reasoning: packedLaneReasoning(options, laneId),
                   });
                 let answer = await ask();
                 let usage: Record<string, number> = answer.usage;
@@ -2308,11 +2352,14 @@ async function main() {
                 // and one more request is cheaper than a lane the run must do
                 // without. The receipt prices both answers. An answer the
                 // ceiling cut is not asked again: the same ceiling cuts the
-                // same report.
+                // same report. Unless the ceiling fell before the report began.
+                const cut =
+                  answer.finishReason === "length" ||
+                  answer.finishReason === "max_tokens";
                 if (
                   parseCandidates(answer.content, laneId).error &&
-                  answer.finishReason !== "length" &&
-                  answer.finishReason !== "max_tokens" &&
+                  (!cut ||
+                    cutWhileThinking(answer.content, answer.finishReason)) &&
                   !controller.signal.aborted
                 ) {
                   relaunchAttempts += 1;
@@ -2509,6 +2556,7 @@ async function main() {
           laneConfig.thinking ??
           options.thinking ??
           (options.fast ? "low" : "high"),
+        reasoning: fastUpstream ? packedLaneReasoning(options, laneId) : null,
         usage: receipt?.usage ?? null,
         wallSeconds: receipt?.wallSeconds ?? null,
         teardownSeconds: receipt?.teardownSeconds ?? null,

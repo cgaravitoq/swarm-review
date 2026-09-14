@@ -23,6 +23,7 @@ RAW="$RUN_DIR/pi-raw.jsonl"
 REVIEW_ERROR="$RUN_DIR/review-error.json"
 WORK="$RUN_DIR/work"
 REPO="$WORK/repo"
+CLAUDE_CODE_PROVIDER=/opt/review/extensions/claude-code-provider.js
 
 START=$(date +%s)
 
@@ -175,6 +176,9 @@ const { spawn } = require("node:child_process");
 const runDir = process.env.RUN_DIR;
 const jobPath = path.join(runDir, "job.json");
 const job = JSON.parse(fs.readFileSync(jobPath, "utf8"));
+// The same path the shell runner passes for an unsupervised run. This bridge is
+// a quoted heredoc, so it cannot read that variable.
+const CLAUDE_CODE_PROVIDER = "/opt/review/extensions/claude-code-provider.js";
 const runId = job.runId;
 const nativeSessionId = runId
   .replace(/[^A-Za-z0-9._-]/g, "-")
@@ -356,6 +360,14 @@ function spawnPiChild(isContinue = false) {
     "--no-prompt-templates",
     "--approve",
   ];
+
+  // A subscription provider is an extension and every other provider is built
+  // into pi, so this lane names the one extension it needs. Discovery stays
+  // off: the checkout is untrusted input and `--approve` would otherwise let it
+  // contribute an extension of its own to the process that reviews it.
+  if (provider === "claude-code") {
+    args.push("-e", CLAUDE_CODE_PROVIDER);
+  }
 
   if (isContinue && sessionInfo.sessionFile && fs.existsSync(sessionInfo.sessionFile)) {
     args.push("--session", sessionInfo.sessionFile);
@@ -967,9 +979,17 @@ EOF_RPC_BRIDGE
 do_review_legacy() {
   cd "$REPO" || return 1
   job .prompt > "$RUN_DIR/prompt.txt"
+  # A subscription provider is an extension and every other provider is built
+  # into pi, so this lane names the one extension it needs. Discovery stays off
+  # for the same reason it does in the supervised path.
+  local extension=""
+  if [ "$(job .provider)" = "claude-code" ]; then
+    extension="-e $CLAUDE_CODE_PROVIDER"
+  fi
   timeout -k 15 "$(job .piTimeoutSeconds)" \
     pi --provider "$(job .provider)" --model "$(job .model)" --thinking "$(job .thinking)" \
       --mode json --print --no-session --no-extensions --no-skills --no-prompt-templates --approve \
+      $extension \
       -- "$(cat "$RUN_DIR/prompt.txt")" > "$RAW" 2>"$RUN_DIR/pi.stderr"
   local pi_exit=$?
   if ! validate_review_events "$pi_exit"; then

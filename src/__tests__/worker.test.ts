@@ -503,6 +503,10 @@ describe("deployed container image", () => {
       .map((line) => line.split(/\s+/).slice(1));
     expect(copies).toEqual([
       ["context", "/opt/review/lockfile"],
+      [
+        "claude-code-provider.js",
+        "/opt/review/extensions/claude-code-provider.js",
+      ],
       ["models.json", "/opt/review/pi-config/models.json"],
       ["review-run.sh", REVIEW_RUNNER],
       ["model-broker.ts", MODEL_BROKER],

@@ -28,12 +28,14 @@
       // A monorepo checkout plus its node_modules plus a build cache does not
       // fit anything smaller, and the install is the long pole of a cold run.
       "instance_type": "standard-4",
-      // A swarm holds one container per concurrent reviewer lane plus the
-      // verifier idling beside them, and a lane's container outlives its own
-      // teardown for long enough to overlap the next. At the exact lane count
-      // the surplus lane's sandbox dies mid-review with a 500, so the ceiling
-      // is the concurrent lanes plus room for that overlap.
-      "max_instances": 5
+      // A swarm holds one container per concurrent sandbox lane, and a lane's
+      // container outlives its own teardown for long enough to overlap the
+      // next. At the exact lane count the surplus lane's sandbox dies
+      // mid-review with a 500, so the ceiling is the lanes of every swarm that
+      // may run at once plus room for that overlap: ten hybrid swarms of three
+      // verifiers each, which is what an eval wave runs in parallel. The
+      // account allows 1500 vCPU; this is 120.
+      "max_instances": 30
     }
   ]
 }

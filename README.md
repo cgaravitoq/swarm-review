@@ -18,7 +18,6 @@ A finding the change's own description declares as intended is published as an a
 ## Running it
 
 You need Docker, [Bun](https://bun.sh), and a model credential for at least one provider.
-
 ```sh
 bun install
 
@@ -44,6 +43,33 @@ bun run src/swarm.ts \
   --reviewers 3 \
   --out /tmp/swarm-1234
 ```
+
+## A Claude Code subscription lane
+
+A lane can review on a Claude Code subscription instead of a provider API key, which is the only route to the Opus models here.
+It is opt-in per run, and it needs two things on this host: `claude` logged in at least once, and Pi's own store holding the subscription - run `pi`, then `/login claude-code`.
+
+```sh
+bun run src/swarm.ts \
+  --repo owner/name \
+  --source /path/to/your/checkout \
+  --pr 1234 \
+  --provider claude-code \
+  --model claude-opus-5 \
+  --rates rates.json \
+  --out /tmp/swarm-1234
+```
+
+The subscription bills a seat rather than a token, so `--rates` carries the plan's own numbers: `{"billing":"subscription","monthlySeatUsd":200,"monthlyCapacityTokens":100000000}`.
+Without it nothing is priced and the receipt says so.
+
+The lane reads the token from Pi's store, replaces it in place when it is within five minutes of expiring, and hands it to the broker; the container sees a handle, never the token.
+A run that outlives the remaining token fails that lane with an auth error, so a long swarm is worth starting on a fresh one.
+
+What makes a subscription token usable is the request shape Claude Code sends, which `@cgaravitoq/pi-claude-code-auth` builds inside the lane's container.
+It is pinned in `container/Dockerfile` because Anthropic moves that shape without notice, and an upstream change that moves the module the provider imports fails the image build rather than a review.
+
+The packed path (`--fast`) calls the provider from this process and cannot build that shape, so it refuses a `claude-code` lane by name.
 
 ## Pointing it at your repository
 

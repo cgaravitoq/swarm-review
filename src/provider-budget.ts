@@ -29,7 +29,11 @@ export type ProviderUpstream = {
  */
 export const PROVIDER_UPSTREAM = new Map<string, ProviderUpstream>([
   ["openai-codex", { baseUrl: "https://chatgpt.com/backend-api" }],
+  ["opencode-go", { baseUrl: "https://opencode.ai/zen/go/v1" }],
   ["xai", { baseUrl: "https://api.x.ai/v1" }],
+  // The subscription is Anthropic's own, and the request shape that makes it
+  // usable is built by the image's Claude Code provider, not by the broker.
+  ["claude-code", { baseUrl: "https://api.anthropic.com" }],
   [
     "cloudflare-workers-ai",
     {

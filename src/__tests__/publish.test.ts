@@ -280,24 +280,28 @@ describe("review payload", () => {
     expect(body).toContain("never estimated by a model");
   });
 
-  it("scores only a completed review and refuses a partial one", () => {
+  it("scores only a completed review, publishes a partial one and refuses a failed one", () => {
     const completed = receipt([finding()]);
+    const expected = {
+      head: completed.requested.head,
+      mergeBase: completed.requested.base,
+    };
     expect(reviewScore(completed)).toMatchObject({
       available: true,
       value: 1,
     });
+    // What a partial review confirmed is real; what it did not find is not
+    // evidence of absence, so the finding publishes and the number does not.
     expect(reviewScore({ ...completed, status: "partial" })).toMatchObject({
       available: false,
+      reason: "partial review",
     });
     expect(() =>
-      assertPublishableReceipt(
-        { ...completed, status: "partial" },
-        {
-          head: completed.requested.head,
-          mergeBase: completed.requested.base,
-        },
-      ),
-    ).toThrow(/completed review/);
+      assertPublishableReceipt({ ...completed, status: "partial" }, expected),
+    ).not.toThrow();
+    expect(() =>
+      assertPublishableReceipt({ ...completed, status: "failed" }, expected),
+    ).toThrow(/completed or partial review/);
   });
 
   it("refuses a severity outside the contract instead of scoring around it", () => {
@@ -441,6 +445,45 @@ describe("summary body", () => {
       "<summary>P0 · src/consumer.ts:900 · a subscription bearer stays inside a live container · outside the three-dot diff, so not inline</summary>",
     );
     expect(body).toContain("Fix src/consumer.ts:900 at cf811bc.");
+  });
+
+  it("names the angle a lane never finished, even when its files were covered", () => {
+    const body = build([finding({ id: "c1", severity: "P2" })], {
+      status: "partial",
+      coverage: { changedFiles: ["src/local.ts"], uncoveredFiles: [] },
+      lanes: [
+        {
+          laneId: "reviewer-1",
+          role: "reviewer",
+          model: "anthropic/claude-sonnet-5",
+          status: "blocked",
+          focus: "the changed code itself",
+          blockerReason: "answer cut at 16384 output tokens",
+        },
+        {
+          laneId: "reviewer-2",
+          role: "reviewer",
+          model: "openai/gpt-5.6-luna",
+          status: "completed",
+          focus: "the blast radius of the change",
+        },
+        {
+          laneId: "verifier-1",
+          role: "verifier",
+          model: "workers-ai/@cf/deepseek-ai/deepseek-v4-flash-0731",
+          status: "completed",
+        },
+      ],
+    });
+    const [, headlineLine] = body.split("\n");
+
+    expect(headlineLine).toBe(
+      "**Confidence unavailable (partial review)** · 1 finding to fix · 0 advisories · 1 of 1 changed files with findings",
+    );
+    expect(body).toContain(
+      "- reviewer lane did not finish: the changed code itself (claude-sonnet-5, blocked: answer cut at 16384 output tokens)",
+    );
+    expect(body).not.toContain("the blast radius of the change (");
   });
 
   it("collapses coverage, lanes and out-of-diff findings under one block", () => {

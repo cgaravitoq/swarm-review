@@ -1,5 +1,50 @@
 {
   "providers": {
+    "claude-code": {
+      "api": "anthropic-messages",
+      "baseUrl": "http://127.0.0.1:8317",
+      "models": [
+        {
+          "id": "claude-opus-5",
+          "reasoning": true,
+          "input": ["text", "image"],
+          "contextWindow": 1000000,
+          "maxTokens": 128000,
+          "cost": {
+            "input": 5,
+            "output": 25,
+            "cacheRead": 0.5,
+            "cacheWrite": 6.25
+          }
+        }
+      ]
+    },
+    "opencode-go": {
+      "models": [
+        {
+          "id": "deepseek-v4.1-flash",
+          "name": "DeepSeek V4.1 Flash",
+          "api": "openai-completions",
+          "reasoning": true,
+          "input": ["text", "image"],
+          "cost": {
+            "input": 0.15,
+            "output": 0.6,
+            "cacheRead": 0.003,
+            "cacheWrite": 0
+          },
+          "compat": {
+            "supportsStore": false,
+            "supportsDeveloperRole": false,
+            "maxTokensField": "max_tokens",
+            "requiresReasoningContentOnAssistantMessages": true,
+            "thinkingFormat": "deepseek"
+          },
+          "contextWindow": 1000000,
+          "maxTokens": 384000
+        }
+      ]
+    },
     "cloudflare-workers-ai": {
       "modelOverrides": {
         "@cf/deepseek-ai/deepseek-v4-flash-0731": {
