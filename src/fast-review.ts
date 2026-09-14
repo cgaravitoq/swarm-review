@@ -58,10 +58,11 @@ const modelLab = (model: string) => {
   return separator === -1 ? "" : model.slice(0, separator);
 };
 
-// A Sonnet report on a 6795-sized pack runs past 8k tokens at about 100 tokens a
-// second, so 16k still lands inside the lane timeout and stops the cut.
+// A Sonnet report on a 6795-sized pack runs past 8k tokens, and Opus 5 at low
+// on the same pack was cut at 18k with its report unfinished (2026-09-14). At
+// about 100 tokens a second 32k still lands inside a 600 s reviewer window.
 const fastMaxTokens = (model: string) =>
-  modelLab(model) === "anthropic" ? 16_384 : FAST_MAX_TOKENS;
+  modelLab(model) === "anthropic" ? 32_768 : FAST_MAX_TOKENS;
 
 /**
  * The body one lab's chat/completions endpoint accepts, measured on 2026-09-10.

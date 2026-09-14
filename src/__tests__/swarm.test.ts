@@ -3930,7 +3930,7 @@ await writeFile(
       // reader never has to infer it from the run's.
       expect(result.code, result.output).toBe(0);
       expect(reviewBody("anthropic/claude-opus-5")).toMatchObject({
-        max_tokens: 16_384 + 8192,
+        max_tokens: 32_768 + 8192,
         thinking: { type: "enabled", budget_tokens: 8192 },
       });
       expect(reviewBody("openai/gpt-5.6-sol")).toMatchObject({
@@ -4040,7 +4040,7 @@ await writeFile(
       expect(reviewBody("anthropic/claude-sonnet-5")).toEqual({
         model: "anthropic/claude-sonnet-5",
         messages: [expect.objectContaining({ role: "user" })],
-        max_tokens: 16_384,
+        max_tokens: 32_768,
         thinking: { type: "disabled" },
       });
       expect(reviewBody("openai/gpt-5.6-luna")).toMatchObject({

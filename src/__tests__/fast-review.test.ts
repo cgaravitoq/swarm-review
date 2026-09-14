@@ -394,7 +394,7 @@ describe("completeOnce", () => {
       { max_completion_tokens: 8192 },
     );
     expect(JSON.parse(String(upstream.mock.calls[1]?.[1]?.body))).toMatchObject(
-      { max_tokens: 16_384 },
+      { max_tokens: 32_768 },
     );
   });
 });
