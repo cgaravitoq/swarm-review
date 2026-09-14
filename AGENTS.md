@@ -16,7 +16,7 @@ Everything runs through Bun.
 bun run typecheck   # tsgo --noEmit
 bun run lint        # oxlint, with the anti-slop plugin
 bun run biome       # biome check .
-bun test            # vitest run
+bun run test        # vitest run
 ```
 
 `lefthook` gates every commit on secretlint, biome, typecheck and the anti-slop lint; CI runs the same four plus the tests.
