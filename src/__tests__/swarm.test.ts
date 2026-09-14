@@ -334,7 +334,7 @@ describe("deterministic lane coverage", () => {
       exhausted: false,
     });
     expect(laneBudgets(options, 500).exhausted).toBe(true);
-    expect(MAX_CONCURRENT_LANES).toBe(2);
+    expect(MAX_CONCURRENT_LANES).toBe(3);
     expect(CLOUD_CONCURRENT_LANES).toBe(3);
     expect(LANE_KILL_GRACE_MS).toBeGreaterThan(0);
     expect(() =>
@@ -2776,7 +2776,7 @@ exec /usr/bin/git "$@"
     const receipt = await readReceipt(arranged.out, swarmId);
     expect(receipt["quota"]).toBe("unknown");
     expect(receipt["billing"]).toBe("unknown");
-    expect(receipt["concurrencyCap"]).toBe(2);
+    expect(receipt["concurrencyCap"]).toBe(3);
 
     const lanes = receipt["lanes"] as Record<string, unknown>[];
     const r1 = lanes.find((l) => l["laneId"] === "reviewer-1");
@@ -2919,7 +2919,7 @@ exec /usr/bin/git "$@"
     const receipt = await readReceipt(arranged.out, swarmId);
     expect(receipt["reviewers"]).toBe(3);
     expect(receipt["fastReasoning"]).toBe("off");
-    expect(receipt["concurrencyCap"]).toBe(2);
+    expect(receipt["concurrencyCap"]).toBe(3);
 
     const lanes = receipt["lanes"] as Record<string, unknown>[];
     expect(lanes.map((lane) => lane["laneId"])).toEqual([

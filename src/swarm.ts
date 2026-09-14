@@ -112,8 +112,13 @@ export const packedLaneModels = (options: SwarmOptions) => [
 /** Reviewer contexts when `--reviewers` is absent; the verifier runs alone after them. */
 export const REVIEWER_LANES = 2;
 
-/** Concurrent reviewer containers. */
-export const MAX_CONCURRENT_LANES = 2;
+/**
+ * Concurrent reviewer containers: every lane of a three-reviewer swarm at
+ * once, so the third does not queue behind the first to finish. A lane peaks
+ * near 1.5 GiB during its install, which three of them fit on the 8 GiB
+ * Docker VM a laptop gives them.
+ */
+export const MAX_CONCURRENT_LANES = 3;
 
 /**
  * Concurrent cloud reviewer sandboxes: the Worker's max_instances minus the
