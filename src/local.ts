@@ -149,7 +149,7 @@ export const requiredSource = (source: string | undefined) => {
  * every lane id on the Worker and answered each other's control calls.
  */
 export const mintRunId = (prefix: string) =>
-  `${prefix}-${Date.now().toString(36)}${randomUUID().slice(0, 4)}`;
+  `${prefix}-${Date.now().toString(36)}${randomUUID().slice(0, 8)}`;
 
 export const assertRunId = (runId: string) => {
   if (!RUN_ID_PATTERN.test(runId)) {
