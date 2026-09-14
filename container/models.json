@@ -4,8 +4,23 @@
       "models": [
         {
           "id": "deepseek-v4.1-flash",
+          "name": "DeepSeek V4.1 Flash",
           "api": "openai-completions",
           "reasoning": true,
+          "input": ["text", "image"],
+          "cost": {
+            "input": 0.15,
+            "output": 0.6,
+            "cacheRead": 0.003,
+            "cacheWrite": 0
+          },
+          "compat": {
+            "supportsStore": false,
+            "supportsDeveloperRole": false,
+            "maxTokensField": "max_tokens",
+            "requiresReasoningContentOnAssistantMessages": true,
+            "thinkingFormat": "deepseek"
+          },
           "contextWindow": 1000000,
           "maxTokens": 384000
         }
