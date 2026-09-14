@@ -8,6 +8,22 @@ import { readUsage } from "./model-proxy";
 
 const FAST_MAX_TOKENS = 8192;
 const FAST_TIMEOUT_MS = 180_000;
+const RATE_LIMIT_RETRIES = 3;
+const RATE_LIMIT_BACKOFF_MS = 20_000;
+
+const pause = (ms: number, signal: AbortSignal) =>
+  new Promise<void>((resolve, reject) => {
+    if (signal.aborted) return reject(signal.reason);
+    const timer = setTimeout(() => {
+      signal.removeEventListener("abort", abort);
+      resolve();
+    }, ms);
+    const abort = () => {
+      clearTimeout(timer);
+      reject(signal.reason);
+    };
+    signal.addEventListener("abort", abort, { once: true });
+  });
 
 export type FastReasoning = "off" | "low" | "medium" | "high";
 
@@ -187,26 +203,46 @@ export async function completeOnce(input: {
   const signal = input.signal
     ? AbortSignal.any([input.signal, deadline])
     : deadline;
-  const response = await fetch(`${input.baseUrl}/chat/completions`, {
-    method: "POST",
-    headers: {
-      authorization: `Bearer ${input.bearer}`,
-      "content-type": "application/json",
-      // The gateway caches an identical body and replays it, usage and all.
-      // A cached lane is not a lane that answered this pack, and the receipt
-      // would price this run on another run's tokens.
-      "cf-aig-skip-cache": "true",
-    },
-    body: JSON.stringify(
-      packedRequestBody({
-        model: input.model,
-        prompt: input.prompt,
-        maxTokens: input.maxTokens ?? fastMaxTokens(input.model),
-        reasoning: input.reasoning ?? "off",
-      }),
-    ),
-    signal,
-  });
+  const post = () =>
+    fetch(`${input.baseUrl}/chat/completions`, {
+      method: "POST",
+      headers: {
+        authorization: `Bearer ${input.bearer}`,
+        "content-type": "application/json",
+        // The gateway caches an identical body and replays it, usage and all.
+        // A cached lane is not a lane that answered this pack, and the receipt
+        // would price this run on another run's tokens.
+        "cf-aig-skip-cache": "true",
+      },
+      body: JSON.stringify(
+        packedRequestBody({
+          model: input.model,
+          prompt: input.prompt,
+          maxTokens: input.maxTokens ?? fastMaxTokens(input.model),
+          reasoning: input.reasoning ?? "off",
+        }),
+      ),
+      signal,
+    });
+  let response = await post();
+  // Six swarms at once put the gateway over its wholesale rate limit (code
+  // 2018) and a lane that gave up on the first 429 failed in zero seconds. A
+  // rate limit is the lab asking for time, not refusing the call, so the lane
+  // waits what it is told, or a growing default, inside its own window.
+  for (
+    let retry = 1;
+    response.status === 429 && retry <= RATE_LIMIT_RETRIES;
+    retry += 1
+  ) {
+    const retryAfter = response.headers.get("retry-after");
+    await pause(
+      retryAfter === null
+        ? RATE_LIMIT_BACKOFF_MS * retry
+        : Number(retryAfter) * 1000,
+      signal,
+    );
+    response = await post();
+  }
   const body = await response.text();
   if (!response.ok) {
     throw new Error(`fast review ${response.status}: ${body.slice(0, 300)}`);

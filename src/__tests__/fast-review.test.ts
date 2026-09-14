@@ -163,6 +163,65 @@ describe("completeOnce", () => {
     ).rejects.toThrow(/401.*invalid api key/);
   });
 
+  it("waits out a rate limit and asks again, then gives up", async () => {
+    const limited = () =>
+      new Response(JSON.stringify({ error: "Wholesale Rate limited" }), {
+        status: 429,
+        headers: { "retry-after": "0" },
+      });
+    const upstream = vi
+      .fn<typeof fetch>()
+      .mockResolvedValueOnce(limited())
+      .mockResolvedValueOnce(limited())
+      .mockResolvedValueOnce(chatCompletion("```json\n{}\n```"));
+    vi.stubGlobal("fetch", upstream);
+
+    const answer = await completeOnce({
+      baseUrl: "https://provider.invalid/v1",
+      bearer: "token",
+      model: "anthropic/claude-opus-5",
+      prompt: "review",
+    });
+
+    // A 429 is the lab asking for time: the lane waits what it is told and
+    // sends the same body again, and the answer is the one that came back.
+    expect(upstream).toHaveBeenCalledTimes(3);
+    expect(answer.content).toContain("json");
+
+    const exhausted = vi.fn<typeof fetch>(() => Promise.resolve(limited()));
+    vi.stubGlobal("fetch", exhausted);
+    await expect(
+      completeOnce({
+        baseUrl: "https://provider.invalid/v1",
+        bearer: "token",
+        model: "anthropic/claude-opus-5",
+        prompt: "review",
+      }),
+    ).rejects.toThrow(/429.*Wholesale Rate limited/);
+    expect(exhausted).toHaveBeenCalledTimes(4);
+  });
+
+  it("stops waiting on a rate limit when its window closes", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn<typeof fetch>(() =>
+        Promise.resolve(
+          new Response("{}", { status: 429, headers: { "retry-after": "5" } }),
+        ),
+      ),
+    );
+
+    await expect(
+      completeOnce({
+        baseUrl: "https://provider.invalid/v1",
+        bearer: "token",
+        model: "anthropic/claude-opus-5",
+        prompt: "review",
+        timeoutMs: 50,
+      }),
+    ).rejects.toThrow(/timeout|timed out/i);
+  });
+
   it("sends each lab the body its own endpoint accepts", () => {
     const base = {
       prompt: "review",
