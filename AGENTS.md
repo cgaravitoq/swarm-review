@@ -60,6 +60,9 @@ They speak a versioned protocol and a mismatch fails at runtime, not at build ti
 
 **A stale image fails loudly.** The driver hashes `container/review-run.sh` into the job and the container compares its own copy, so an image built from an older runner ends the run with `container runner mismatch`.
 
+**A subscription lane's provider is the one extension a job names.** `claude-code` reaches Anthropic through `container/claude-code-provider.js`, which registers the provider with neither a base URL nor a model list so the run's own `models.json` points it at the broker.
+Extension discovery stays off, and the provider's own registration would send the request straight to Anthropic with a handle instead of a bearer, which is what the broker exists to prevent.
+
 **A receipt is evidence.** Status, stop reason, usage, lane identities and the runner hash are what a run is judged by.
 A field that cannot be observed is recorded as such: never as a passing zero, and never as a lane that found nothing wrong.
 
