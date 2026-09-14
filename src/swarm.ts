@@ -43,6 +43,7 @@ import {
   assertRunId,
   createBudget,
   ensureObjects,
+  mintRunId,
   readLaneReceipt,
   requiredRepo,
   requiredSource,
@@ -248,9 +249,7 @@ export function parseSwarmOptions(argv: string[]) {
   }
 
   return {
-    swarmId: assertRunId(
-      flag(argv, "swarm-id") ?? `swarm-${Date.now().toString(36)}`,
-    ),
+    swarmId: assertRunId(flag(argv, "swarm-id") ?? mintRunId("swarm")),
     outDir: required(argv, "out"),
     repo: flag(argv, "repo"),
     source: flag(argv, "source"),

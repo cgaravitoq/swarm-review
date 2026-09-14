@@ -133,6 +133,16 @@ export const requiredSource = (source: string | undefined) => {
 };
 
 /** Run ids name a container, a directory and a path inside it. */
+/**
+ * A fresh id for a run nobody named.
+ *
+ * The clock alone is not one: two swarms launched in the same millisecond
+ * (S/R1/K1 and S/R2/K1 of the 2026-09-14 wave, both `swarm-mu1am1st`) shared
+ * every lane id on the Worker and answered each other's control calls.
+ */
+export const mintRunId = (prefix: string) =>
+  `${prefix}-${Date.now().toString(36)}${randomUUID().slice(0, 4)}`;
+
 export const assertRunId = (runId: string) => {
   if (!RUN_ID_PATTERN.test(runId)) {
     throw new Error(
@@ -183,9 +193,7 @@ export function parseOptions(argv: string[]) {
   const laneId = flag(argv, "lane-id") ?? "lane-1";
 
   return {
-    runId: assertRunId(
-      flag(argv, "run-id") ?? `local-${Date.now().toString(36)}`,
-    ),
+    runId: assertRunId(flag(argv, "run-id") ?? mintRunId("local")),
     attemptId: assertRunId(flag(argv, "attempt-id") ?? randomUUID()),
     outDir: required(argv, "out"),
     repo: flag(argv, "repo"),

@@ -19,6 +19,7 @@ import {
   CLOUD_MODEL,
   CLOUD_PROVIDER,
   MAX_FORMAT_CORRECTIONS,
+  mintRunId,
   parseCandidateIds,
   parseSingleVerdict,
   planBroker,
@@ -630,9 +631,7 @@ export const brokerCaps = (
 async function main() {
   const token = githubToken();
   const secret = process.env.REVIEW_PI_CONTROL_SECRET ?? required("secret");
-  const runId = assertRunId(
-    argument("run-id") ?? `run-${Date.now().toString(36)}`,
-  );
+  const runId = assertRunId(argument("run-id") ?? mintRunId("run"));
   const outDir = join(required("out"), runId);
   const worker = required("worker");
   const repo = required("repo");

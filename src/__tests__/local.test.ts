@@ -13,7 +13,7 @@ import { createRequire } from "node:module";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath, pathToFileURL, URL } from "node:url";
-import { afterAll, afterEach, describe, expect, it } from "vitest";
+import { afterAll, afterEach, describe, expect, it, vi } from "vitest";
 import {
   adaptModelsConfig,
   assertRunId,
@@ -26,6 +26,7 @@ import {
   containerRunArgs,
   createBudget,
   defaultContextPath,
+  mintRunId,
   modelCredentials,
   openaiCodexBrokerHandle,
   parseCandidateIds,
@@ -1876,5 +1877,20 @@ describe("commit transport", () => {
         createBudget(Date.now(), 600),
       ),
     ).rejects.toThrow();
+  });
+});
+
+describe("mintRunId", () => {
+  it("mints ids two launches in the same millisecond do not share", () => {
+    const now = vi.spyOn(Date, "now").mockReturnValue(1_757_856_171_000);
+    try {
+      const ids = new Set(Array.from({ length: 50 }, () => mintRunId("swarm")));
+      // Two swarms launched in the same millisecond once shared every lane
+      // id on the Worker; the clock alone does not name a run.
+      expect(ids.size).toBe(50);
+      for (const id of ids) expect(() => assertRunId(id)).not.toThrow();
+    } finally {
+      now.mockRestore();
+    }
   });
 });
