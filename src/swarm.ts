@@ -189,6 +189,20 @@ export function parseSwarmOptions(argv: string[]) {
       `--reviewers must be a whole number between 1 and ${MAX_REVIEWER_LANES}`,
     );
   }
+  const reasoningLevel = (name: string, fallback?: FastReasoning) => {
+    const level = (flag(argv, name) ?? fallback) as FastReasoning | undefined;
+    if (level !== undefined && !FAST_REASONING_LEVELS.includes(level)) {
+      throw new Error(`--${name} must be off, low, medium or high`);
+    }
+    return level;
+  };
+  const fastReasoning = reasoningLevel(
+    "fast-reasoning",
+    "off",
+  ) as FastReasoning;
+  // One lane may reason at its own level: through the gateway, DeepSeek with
+  // its template's thinking on never reaches an answer (phase 2 arm B, 408 at
+  // 32k), while the other labs do at medium.
   const reviewerOverrides = Object.fromEntries(
     Array.from({ length: MAX_REVIEWER_LANES }, (_, index) => {
       const laneId = reviewerLaneId(index);
@@ -198,6 +212,7 @@ export function parseSwarmOptions(argv: string[]) {
           provider: flag(argv, `${laneId}-provider`),
           model: flag(argv, `${laneId}-model`),
           thinking: flag(argv, `${laneId}-thinking`),
+          reasoning: reasoningLevel(`${laneId}-reasoning`),
         },
       ] as const;
     }),
@@ -205,11 +220,6 @@ export function parseSwarmOptions(argv: string[]) {
   const verifierProvider = flag(argv, "verifier-provider");
   const verifierModel = flag(argv, "verifier-model");
   const verifierThinking = flag(argv, "verifier-thinking");
-  const fastReasoning = (flag(argv, "fast-reasoning") ??
-    "off") as FastReasoning;
-  if (!FAST_REASONING_LEVELS.includes(fastReasoning)) {
-    throw new Error("--fast-reasoning must be off, low, medium or high");
-  }
   const orca = argv.includes("--orca");
   const sandbox = argv.includes("--sandbox");
   const fastFlag = argv.includes("--fast");
@@ -316,6 +326,10 @@ export function resolveLaneConfig(options: SwarmOptions, laneId: string) {
     ...(thinking ? { thinking } : {}),
   };
 }
+
+/** The level one packed reviewer reasons at: its own, else the swarm's. */
+export const packedLaneReasoning = (options: SwarmOptions, laneId: string) =>
+  options.reviewerOverrides[laneId]?.reasoning ?? options.fastReasoning;
 
 /**
  * Names the workspace packages a set of changed files belongs to.
@@ -2316,7 +2330,7 @@ async function main() {
                     prompt: promptBody,
                     timeoutMs: laneDeadlineMs("reviewer"),
                     signal: controller.signal,
-                    reasoning: options.fastReasoning,
+                    reasoning: packedLaneReasoning(options, laneId),
                   });
                 let answer = await ask();
                 let usage: Record<string, number> = answer.usage;
@@ -2529,6 +2543,7 @@ async function main() {
           laneConfig.thinking ??
           options.thinking ??
           (options.fast ? "low" : "high"),
+        reasoning: fastUpstream ? packedLaneReasoning(options, laneId) : null,
         usage: receipt?.usage ?? null,
         wallSeconds: receipt?.wallSeconds ?? null,
         teardownSeconds: receipt?.teardownSeconds ?? null,

@@ -41,6 +41,7 @@ import {
   POOL_VERIFIER_MAX_REQUESTS,
   packagesForFiles,
   packedLaneModels,
+  packedLaneReasoning,
   parseCandidates,
   parseSwarmOptions,
   parseVerdicts,
@@ -365,6 +366,23 @@ describe("deterministic lane coverage", () => {
     expect(() =>
       parseSwarmOptions([...base, "--fast-reasoning", "on"]),
     ).toThrow("--fast-reasoning must be off, low, medium or high");
+  });
+
+  it("lets one lane reason at its own level under the swarm's", () => {
+    const base = ["--pr", "123", "--out", "/tmp/out"];
+    const options = parseSwarmOptions([
+      ...base,
+      "--fast-reasoning",
+      "medium",
+      "--reviewer-3-reasoning",
+      "off",
+    ]);
+
+    expect(packedLaneReasoning(options, "reviewer-1")).toBe("medium");
+    expect(packedLaneReasoning(options, "reviewer-3")).toBe("off");
+    expect(() =>
+      parseSwarmOptions([...base, "--reviewer-2-reasoning", "on"]),
+    ).toThrow("--reviewer-2-reasoning must be off, low, medium or high");
   });
 
   it("hands every lane its own role's window, never the run's", () => {
@@ -3831,6 +3849,69 @@ await writeFile(
       );
       expect(receipt["status"]).toBe("failed");
       expect(result.code).toBe(1);
+    }, 180_000);
+
+    it("reasons one lane at its own level and records each lane's level", async () => {
+      const arranged = await arrange("success");
+      const swarmId = "swarm-packed-lane-reasoning";
+      const provider = await fakeProvider((prompt) =>
+        isVerifierPrompt(prompt)
+          ? completion(fenced({ verdicts: [] }))
+          : completion(answer([])),
+      );
+      await pointUpstream(arranged, {
+        "https://gateway.ai.cloudflare.com/v1/{CLOUDFLARE_ACCOUNT_ID}/{CLOUDFLARE_GATEWAY_ID}/compat": `${provider.baseUrl}/gw/{CLOUDFLARE_ACCOUNT_ID}/{CLOUDFLARE_GATEWAY_ID}/compat`,
+      });
+
+      const result = await runSwarm(
+        packedArguments(arranged, swarmId, [
+          "--provider",
+          "cloudflare-ai-gateway",
+          "--reviewers",
+          "3",
+          "--reviewer-1-model",
+          "anthropic/claude-opus-5",
+          "--reviewer-2-model",
+          "openai/gpt-5.6-sol",
+          "--reviewer-3-model",
+          "workers-ai/@cf/deepseek-ai/deepseek-v4-flash-0731",
+          "--verifier-model",
+          "workers-ai/@cf/deepseek-ai/deepseek-v4-flash-0731",
+          "--fast-reasoning",
+          "medium",
+          "--reviewer-3-reasoning",
+          "off",
+        ]),
+        arranged,
+      );
+      const receipt = await readReceipt(arranged.out, swarmId);
+      const reviewBody = (model: string) =>
+        provider.requests.find(
+          (request) =>
+            request.body["model"] === model &&
+            !JSON.stringify(request.body).includes(CANARY_PROMPT),
+        )?.body;
+
+      // The swarm reasons at medium and the DeepSeek lane at off, each on its
+      // own lab's wire shape, and the receipt records the level per lane so a
+      // reader never has to infer it from the run's.
+      expect(result.code, result.output).toBe(0);
+      expect(reviewBody("anthropic/claude-opus-5")).toMatchObject({
+        max_tokens: 16_384 + 8192,
+        thinking: { type: "enabled", budget_tokens: 8192 },
+      });
+      expect(reviewBody("openai/gpt-5.6-sol")).toMatchObject({
+        reasoning_effort: "medium",
+      });
+      expect(
+        reviewBody("workers-ai/@cf/deepseek-ai/deepseek-v4-flash-0731"),
+      ).toMatchObject({ chat_template_kwargs: { thinking: false } });
+      expect(receipt["fastReasoning"]).toBe("medium");
+      expect(reviewerRows(receipt).map((lane) => lane["reasoning"])).toEqual([
+        "medium",
+        "medium",
+        "off",
+      ]);
     }, 180_000);
 
     it("serves three labs from one gateway, one model per lane", async () => {
