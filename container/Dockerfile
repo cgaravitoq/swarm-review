@@ -46,7 +46,7 @@ RUN cd /opt/review/lockfile \
 
 FROM bun
 
-ARG PI_VERSION=0.85.0
+ARG PI_VERSION=0.85.1
 
 ENV PI_CODING_AGENT_DIR=/opt/review/pi-config
 
