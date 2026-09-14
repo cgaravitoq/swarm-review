@@ -12,6 +12,7 @@ import {
   publicationDisposition,
   REVIEW_EVENT,
   REVIEW_SIDE,
+  revalidatePullRequest,
   reviewScore,
   type SwarmReceipt,
   supersededBody,
@@ -744,6 +745,82 @@ describe("publish options", () => {
     expect(() => parsePublishOptions(["--receipt", "/tmp/r.json"])).toThrow(
       "--repo is required",
     );
+  });
+});
+
+describe("moved head", () => {
+  const head = "a".repeat(40);
+  const later = "b".repeat(40);
+  const base = "c".repeat(40);
+  const expected = { head, mergeBase: base };
+  const github = (status: "ahead" | "diverged", state = "open") =>
+    vi.fn(async (url: string, init?: RequestInit) => {
+      const accept = String(
+        (init?.headers as Record<string, string> | undefined)?.["accept"],
+      );
+      if (url.endsWith("/pulls/7")) {
+        return Response.json({
+          state,
+          draft: false,
+          merged: state === "merged",
+          head: { sha: later },
+          base: { sha: base },
+        });
+      }
+      if (url.includes(`/compare/${head}...${later}`)) {
+        return Response.json({ status });
+      }
+      if (url.includes(`/compare/${base}...${head}`)) {
+        return accept.includes("diff")
+          ? new Response("")
+          : Response.json({ merge_base_commit: { sha: base } });
+      }
+      return Response.json([]);
+    });
+
+  afterEach(() => vi.unstubAllGlobals());
+
+  it("refuses a head that moved unless told the review may sit behind it", async () => {
+    vi.stubGlobal("fetch", github("ahead"));
+    await expect(
+      revalidatePullRequest("acme/demo", 7, "t", expected),
+    ).rejects.toThrow("pull request head moved off the frozen SHA");
+  });
+
+  it("publishes behind a head the reviewed commit is still under", async () => {
+    const fetchMock = github("ahead");
+    vi.stubGlobal("fetch", fetchMock);
+    const validated = await revalidatePullRequest(
+      "acme/demo",
+      7,
+      "t",
+      expected,
+      true,
+    );
+    expect(validated.pull.head.sha).toBe(later);
+    expect(
+      fetchMock.mock.calls.some(([url]) =>
+        String(url).includes(`/compare/${head}...${later}`),
+      ),
+    ).toBe(true);
+  });
+
+  it("publishes on a change that merged with the reviewed commit in it, never on one closed unmerged", async () => {
+    vi.stubGlobal("fetch", github("ahead", "merged"));
+    await expect(
+      revalidatePullRequest("acme/demo", 7, "t", expected, true),
+    ).resolves.toMatchObject({ pull: { merged: true } });
+    vi.stubGlobal("fetch", github("ahead", "closed"));
+    await expect(
+      revalidatePullRequest("acme/demo", 7, "t", expected, true),
+    ).rejects.toThrow("pull request is closed, not open");
+  });
+
+  it("still refuses a head the reviewed commit was force-pushed out of", async () => {
+    vi.stubGlobal("fetch", github("diverged"));
+    await expect(
+      revalidatePullRequest("acme/demo", 7, "t", expected, true),
+    ).rejects.toThrow("pull request head moved off the frozen SHA");
   });
 });
 
