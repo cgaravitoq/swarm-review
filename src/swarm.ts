@@ -2126,6 +2126,15 @@ async function main() {
       // Named by every lane, or refused here: a packed swarm reaches one
       // upstream, and only the default one answers to a model nobody named.
       const laneModels = packedLaneModels(options);
+      // The request shape a Claude Code subscription is answered to is built by
+      // the provider inside the lane's container. A packed lane calls the
+      // provider from this process instead, where the token would arrive as an
+      // API key that Anthropic rejects without saying why.
+      if (fastProvider === "claude-code") {
+        throw new Error(
+          "the packed path cannot build the request shape a claude-code subscription is answered to: run those lanes in containers",
+        );
+      }
       // Refused by name before the credential is looked up: an unreachable
       // provider is not a missing key, and saying so would send the reader
       // after the wrong problem.

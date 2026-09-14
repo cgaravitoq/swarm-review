@@ -7,6 +7,7 @@ import {
   mkdtemp,
   readFile,
   rm,
+  stat,
   writeFile,
 } from "node:fs/promises";
 import { createRequire } from "node:module";
@@ -21,6 +22,7 @@ import {
   brokerInstallCommands,
   CLOUD_MODEL,
   CLOUD_PROVIDER,
+  type ClaudeCodeTokens,
   CONTROL_DIR,
   CONTROL_UID,
   containerRunArgs,
@@ -36,6 +38,7 @@ import {
   readLaneReceipt,
   redactArgs,
   redactValues,
+  resolveClaudeCodeTokens,
   resolveRunCredentials,
   resolveUpstream,
   TARGET_UID,
@@ -701,6 +704,168 @@ describe("credential boundary", () => {
     ).rejects.toThrow(/expired model credential for xai/);
   });
 
+  it("serves a Claude Code subscription token that can still outlive the next request", async () => {
+    const root = await mkdtemp(join(tmpdir(), "review-pi-auth-"));
+    temporaryDirectories.push(root);
+    const piDir = join(root, "pi");
+    const expires = Date.now() + 3_600_000;
+    const stored = {
+      "claude-code": {
+        type: "oauth",
+        access: "cc-access",
+        refresh: "cc-refresh",
+        expires,
+      },
+    };
+    await writeCredentialStore(piDir, stored);
+    let refreshed = 0;
+
+    const tokens = await resolveClaudeCodeTokens(
+      { PI_CODING_AGENT_DIR: piDir },
+      async (current) => {
+        refreshed += 1;
+        return current;
+      },
+    );
+
+    expect(tokens).toEqual({
+      access: "cc-access",
+      refresh: "cc-refresh",
+      expires,
+    });
+    expect(refreshed).toBe(0);
+    expect(
+      JSON.parse(await readFile(join(piDir, "auth.json"), "utf8")),
+    ).toEqual(stored);
+  });
+
+  it("replaces an expiring Claude Code token and persists the rotated pair", async () => {
+    const root = await mkdtemp(join(tmpdir(), "review-pi-auth-"));
+    temporaryDirectories.push(root);
+    const piDir = join(root, "pi");
+    const stored = {
+      "claude-code": {
+        type: "oauth",
+        access: "stale-access",
+        refresh: "stale-refresh",
+        expires: Date.now() + 60_000,
+      },
+      "openai-codex": {
+        type: "oauth",
+        access: "other-access",
+        refresh: "other-refresh",
+        expires: Date.now() + 3_600_000,
+      },
+    };
+    await writeCredentialStore(piDir, stored);
+    const rotated = {
+      access: "fresh-access",
+      refresh: "fresh-refresh",
+      expires: Date.now() + 3_600_000,
+    };
+    const seen: ClaudeCodeTokens[] = [];
+
+    const tokens = await resolveClaudeCodeTokens(
+      { PI_CODING_AGENT_DIR: piDir },
+      async (current) => {
+        seen.push(current);
+        return rotated;
+      },
+    );
+
+    expect(seen).toEqual([
+      {
+        access: "stale-access",
+        refresh: "stale-refresh",
+        expires: stored["claude-code"].expires,
+      },
+    ]);
+    expect(tokens).toEqual(rotated);
+    const written = JSON.parse(
+      await readFile(join(piDir, "auth.json"), "utf8"),
+    ) as Record<string, unknown>;
+    expect(written["claude-code"]).toEqual({ type: "oauth", ...rotated });
+    expect(written["openai-codex"]).toEqual(stored["openai-codex"]);
+    expect((await stat(join(piDir, "auth.json"))).mode & 0o777).toBe(0o600);
+  });
+
+  it("leaves the store untouched when the subscription refresh fails", async () => {
+    const root = await mkdtemp(join(tmpdir(), "review-pi-auth-"));
+    temporaryDirectories.push(root);
+    const piDir = join(root, "pi");
+    const stored = {
+      "claude-code": {
+        type: "oauth",
+        access: "stale-access",
+        refresh: "stale-refresh",
+        expires: Date.now() + 60_000,
+      },
+    };
+    await writeCredentialStore(piDir, stored);
+
+    await expect(
+      resolveClaudeCodeTokens({ PI_CODING_AGENT_DIR: piDir }, async () => {
+        throw new Error("invalid_grant");
+      }),
+    ).rejects.toThrow(/invalid_grant/);
+    expect(
+      JSON.parse(await readFile(join(piDir, "auth.json"), "utf8")),
+    ).toEqual(stored);
+  });
+
+  it("reads the Claude Code subscription from Pi's store and never from an API key", async () => {
+    const root = await mkdtemp(join(tmpdir(), "review-pi-auth-"));
+    temporaryDirectories.push(root);
+    const piDir = join(root, "pi");
+    await writeCredentialStore(piDir, {
+      "claude-code": {
+        type: "oauth",
+        access: "cc-access",
+        refresh: "cc-refresh",
+        expires: Date.now() + 3_600_000,
+        identity: "must-not-cross",
+      },
+      anthropic: { type: "oauth", access: "other-provider-secret" },
+    });
+
+    const resolved = await resolveRunCredentials("claude-code", 600, {
+      PI_CODING_AGENT_DIR: piDir,
+      ANTHROPIC_API_KEY: "ambient-api-key",
+    });
+
+    expect(resolved).toMatchObject({
+      authRoute: "subscription-oauth",
+      accessToken: "cc-access",
+      authJson: null,
+      env: {},
+    });
+    expect(resolved.redactions).toEqual(["cc-access", "cc-refresh"]);
+    expect(JSON.stringify(resolved)).not.toContain("must-not-cross");
+    expect(JSON.stringify(resolved)).not.toContain("other-provider-secret");
+    expect((resolved as Record<string, unknown>)["refresh"]).toBeUndefined();
+  });
+
+  it("refuses a Claude Code lane with no subscription credential", async () => {
+    const root = await mkdtemp(join(tmpdir(), "review-pi-auth-"));
+    temporaryDirectories.push(root);
+    const piDir = join(root, "pi");
+    await writeCredentialStore(piDir, {
+      anthropic: { type: "oauth", access: "other-provider-secret" },
+    });
+
+    await expect(
+      resolveRunCredentials("claude-code", 600, {
+        PI_CODING_AGENT_DIR: piDir,
+        ANTHROPIC_API_KEY: "ambient-api-key",
+      }),
+    ).rejects.toThrow(/no Claude Code subscription credential/);
+    await expect(
+      resolveRunCredentials("claude-code", 600, {
+        PI_CODING_AGENT_DIR: join(root, "missing-pi"),
+      }),
+    ).rejects.toThrow(/login claude-code/);
+  });
+
   it("adapts models.json to add provider apiKey command while preserving unrelated config", () => {
     const existing = JSON.stringify({
       providers: {
@@ -920,6 +1085,27 @@ describe("credential isolation", () => {
     expect(plan.config.upstreamBaseUrl).toBe("https://opencode.ai/zen/go/v1");
     expect(plan.config.upstreamAuthorization).toBe("Bearer oc-secret");
     expect(plan.handle).not.toContain("oc-secret");
+  });
+
+  it("brokers the Claude Code subscription at Anthropic with its OAuth token as the bearer", () => {
+    const plan = planBroker(
+      "claude-code",
+      {
+        authRoute: "subscription-oauth",
+        accessToken: "cc-access",
+        expires: Date.now() + 600_000,
+        authJson: null,
+        env: {},
+        redactions: ["cc-access", "cc-refresh"],
+      },
+      caps,
+      ledger,
+    );
+
+    expect(plan.baseUrl).toBe(`http://127.0.0.1:${BROKER_PORT}`);
+    expect(plan.config.upstreamBaseUrl).toBe("https://api.anthropic.com");
+    expect(plan.config.upstreamAuthorization).toBe("Bearer cc-access");
+    expect(plan.handle).not.toContain("cc-access");
   });
 
   it("keeps the bearer out of every docker argument that installs it", () => {

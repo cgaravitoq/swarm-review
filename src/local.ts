@@ -15,11 +15,19 @@
 
 import { spawn } from "node:child_process";
 import { createHash, randomUUID } from "node:crypto";
-import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import {
+  mkdir,
+  mkdtemp,
+  readFile,
+  rename,
+  rm,
+  writeFile,
+} from "node:fs/promises";
 import { homedir, tmpdir } from "node:os";
 import { basename, dirname, join } from "node:path";
 import { setTimeout as sleep } from "node:timers/promises";
 import { fileURLToPath } from "node:url";
+import { forceRefreshClaudeCodeCreds } from "@cgaravitoq/claude-code-core";
 import {
   ENVIRONMENT_PROBE_SCRIPT,
   evaluateAdmission,
@@ -458,6 +466,98 @@ const selectPiOAuthCredential = (
   };
 };
 
+const CLAUDE_CODE_PROVIDER = "claude-code";
+
+/**
+ * How close to its own expiry a subscription token has to be before it is
+ * replaced.
+ *
+ * Pi refreshes an OAuth credential inside the same window, and a bearer that
+ * lapses between two of a lane's requests fails a review with an auth error
+ * that says nothing about what actually happened. The window stays short on
+ * purpose: a refresh rotates the pair, and one that runs per lane rather than
+ * once per run would invalidate the token the lanes before it are still using.
+ */
+const CLAUDE_CODE_REFRESH_MARGIN_MS = 5 * 60 * 1000;
+
+export type ClaudeCodeTokens = {
+  access: string;
+  refresh: string;
+  expires: number;
+};
+
+const piAuthPath = (env: Readonly<Record<string, string | undefined>>) =>
+  env["PI_CODING_AGENT_DIR"]
+    ? join(env["PI_CODING_AGENT_DIR"], "auth.json")
+    : join(homedir(), ".pi", "agent", "auth.json");
+
+/** The refresh the Claude Code plugin performs: the OAuth endpoint, then its CLI. */
+const refreshClaudeCodeTokens = async (current: ClaudeCodeTokens) => {
+  const refreshed = await forceRefreshClaudeCodeCreds({
+    accessToken: current.access,
+    refreshToken: current.refresh,
+    expiresAt: current.expires,
+  });
+  return {
+    access: refreshed.accessToken,
+    refresh: refreshed.refreshToken,
+    expires: refreshed.expiresAt,
+  };
+};
+
+/**
+ * The Claude Code subscription's bearer, replaced when it is about to expire.
+ *
+ * `/login claude-code` in Pi writes this entry and Pi refreshes it under the
+ * same rules, so a review run reads the store Pi owns rather than a second copy
+ * of the same subscription. The refreshed pair is written back because a
+ * refresh rotates it: a rotated token nobody persists leaves the next run - and
+ * the next lane - holding a dead one.
+ *
+ * Only the access token leaves this function, and only as far as the broker.
+ */
+export async function resolveClaudeCodeTokens(
+  env: Readonly<Record<string, string | undefined>>,
+  refresh: (
+    current: ClaudeCodeTokens,
+  ) => Promise<ClaudeCodeTokens> = refreshClaudeCodeTokens,
+) {
+  const path = piAuthPath(env);
+  const store = await readCredentialStore(path);
+  const stored = objectRecord(store[CLAUDE_CODE_PROVIDER]);
+  const access = stored?.["access"];
+  const refreshToken = stored?.["refresh"];
+  const expires = stored?.["expires"];
+  if (
+    !isNonEmptyString(access) ||
+    !isNonEmptyString(refreshToken) ||
+    typeof expires !== "number"
+  ) {
+    throw new Error(
+      "no Claude Code subscription credential: run pi, then /login claude-code",
+    );
+  }
+  const current = { access, refresh: refreshToken, expires };
+  if (expires - Date.now() > CLAUDE_CODE_REFRESH_MARGIN_MS) return current;
+  const refreshed = await refresh(current);
+  const written = `${path}.${process.pid}.tmp`;
+  await writeFile(
+    written,
+    JSON.stringify({
+      ...store,
+      [CLAUDE_CODE_PROVIDER]: {
+        type: "oauth",
+        access: refreshed.access,
+        refresh: refreshed.refresh,
+        expires: refreshed.expires,
+      },
+    }),
+    { mode: 0o600 },
+  );
+  await rename(written, path);
+  return refreshed;
+}
+
 export async function resolveRunCredentials(
   provider: string,
   totalTimeoutSeconds: number,
@@ -475,6 +575,18 @@ export async function resolveRunCredentials(
       authJson: null,
       env: apiCredentials,
       redactions: Object.values(apiCredentials),
+    };
+  }
+
+  if (provider === CLAUDE_CODE_PROVIDER) {
+    const tokens = await resolveClaudeCodeTokens(env);
+    return {
+      authRoute: "subscription-oauth" as const,
+      accessToken: tokens.access,
+      expires: tokens.expires,
+      authJson: null,
+      env: {},
+      redactions: [tokens.access, tokens.refresh],
     };
   }
 

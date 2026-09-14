@@ -3565,6 +3565,39 @@ await writeFile(
       );
     }, 180_000);
 
+    it("refuses a Claude Code subscription lane the packed path cannot speak for", async () => {
+      const arranged = await arrange("success");
+      const swarmId = "swarm-packed-subscription";
+      const provider = await fakeProvider(() => completion(answer([])));
+      await pointUpstream(arranged, {
+        "https://api.x.ai/v1": provider.baseUrl,
+      });
+
+      const result = await runSwarm(
+        packedArguments(arranged, swarmId, [
+          "--fast",
+          "--provider",
+          "claude-code",
+          "--model",
+          "claude-opus-5",
+        ]),
+        arranged,
+      );
+      const receipt = await readReceipt(arranged.out, swarmId);
+
+      expect(result.code).toBe(1);
+      expect(result.output).toContain(
+        "cannot build the request shape a claude-code subscription is answered to",
+      );
+      // Refused before the call, not by the call: the token never leaves for an
+      // endpoint that would read it as an API key.
+      expect(provider.requests).toHaveLength(0);
+      expect(receipt["status"]).toBe("failed");
+      expect((receipt["failure"] as Record<string, unknown>)["stage"]).toBe(
+        "lane-preparation",
+      );
+    }, 180_000);
+
     it("blocks a lane whose answer was cut at the token ceiling", async () => {
       const arranged = await arrange("success");
       const swarmId = "swarm-packed-cut";
