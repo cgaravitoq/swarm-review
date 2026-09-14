@@ -6,6 +6,7 @@ import {
   modelsJsonForProxy,
   proxyModelFetch,
   publicModelUsage,
+  readUsage,
   reserveAttempt,
 } from "../model-proxy";
 
@@ -14,6 +15,24 @@ afterEach(() => {
 });
 
 describe("model proxy", () => {
+  it("counts the cached halves of an Anthropic prompt as input, not as nothing", () => {
+    // Anthropic opens with the input and closes with the output, and reports the
+    // cached halves of the prompt beside `input_tokens` rather than inside it.
+    // Replacing one reading with the other, or counting only `input_tokens`,
+    // would let a cached review run against the token caps for free.
+    const claudeCode = [
+      'event: message_start\ndata: {"type":"message_start","message":{"usage":{"input_tokens":2,"cache_read_input_tokens":100,"cache_creation_input_tokens":3894,"output_tokens":1}}}',
+      'event: message_delta\ndata: {"type":"message_delta","usage":{"output_tokens":7}}',
+    ].join("\n");
+
+    expect(readUsage(claudeCode)).toEqual({ input: 3996, output: 7 });
+    // OpenAI-style usage already folds cache reads into `prompt_tokens`, so the
+    // same body must not be counted twice.
+    expect(
+      readUsage('data: {"usage":{"prompt_tokens":30,"completion_tokens":4}}'),
+    ).toEqual({ input: 30, output: 4 });
+  });
+
   it("rejects a capability that does not match the run", async () => {
     const upstream = vi.fn<typeof fetch>(() =>
       Promise.resolve(new Response("unexpected")),

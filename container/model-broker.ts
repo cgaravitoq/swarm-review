@@ -118,26 +118,49 @@ export function resolveUpstreamTarget(requestUrl: string, baseUrl: string) {
  * stream. Only the last usage object in a stream is authoritative, so the scan
  * keeps overwriting rather than summing.
  */
+/**
+ * Provider-reported usage, whether the response was one JSON body or an SSE
+ * stream. A frame updates the fields it carries and the last value of each one
+ * wins, rather than the last frame replacing the whole reading: Anthropic opens
+ * with the input and closes with the output, so replacing would keep one and
+ * lose the other.
+ *
+ * Anthropic also reports the cached halves of a prompt apart from
+ * `input_tokens`, and a review that caches its context spends most of its input
+ * there. Counting only `input_tokens` would show a lane sitting against its
+ * token ceiling as having spent almost nothing. OpenAI-style usage already folds
+ * cache reads into `prompt_tokens`, so the cache fields are added only where a
+ * provider reports them on their own.
+ */
 export const readUsage = (
   body: string,
 ): { input: number; output: number } | null => {
-  let usage: { input: number; output: number } | null = null;
+  const totals = { input: 0, output: 0 };
+  let seen = false;
+  const numberAt = (record: Record<string, unknown>, key: string) => {
+    const value = record[key];
+    return typeof value === "number" ? value : 0;
+  };
   const consider = (candidate: Record<string, unknown> | undefined) => {
     if (!candidate || typeof candidate !== "object") return;
+    const anthropicInput = candidate["input_tokens"];
     const input =
-      candidate["input_tokens"] ??
-      candidate["prompt_tokens"] ??
-      candidate["inputTokens"];
+      anthropicInput ?? candidate["prompt_tokens"] ?? candidate["inputTokens"];
     const output =
       candidate["output_tokens"] ??
       candidate["completion_tokens"] ??
       candidate["outputTokens"];
-    if (typeof input === "number" || typeof output === "number") {
-      usage = {
-        input: typeof input === "number" ? input : 0,
-        output: typeof output === "number" ? output : 0,
-      };
+    if (typeof input !== "number" && typeof output !== "number") return;
+    seen = true;
+    if (typeof input === "number") {
+      totals.input =
+        input +
+        (typeof anthropicInput === "number"
+          ? numberAt(candidate, "cache_read_input_tokens") +
+            numberAt(candidate, "cache_creation_input_tokens")
+          : 0);
     }
+    if (typeof output === "number") totals.output = output;
   };
   for (const line of body.split("\n")) {
     const payload = line.startsWith("data:")
@@ -146,15 +169,23 @@ export const readUsage = (
     if (!payload || payload === "[DONE]") continue;
     try {
       const parsed = JSON.parse(payload) as Record<string, unknown>;
-      const nested = parsed["response"] as Record<string, unknown> | undefined;
+      const nestedUsage = (key: string) => {
+        const container = parsed[key];
+        return typeof container === "object" && container !== null
+          ? (container as Record<string, unknown>)["usage"]
+          : undefined;
+      };
       consider(
         (parsed["usage"] as Record<string, unknown> | undefined) ??
-          (nested?.["usage"] as Record<string, unknown> | undefined) ??
+          // OpenAI's Responses API nests it under the response, Anthropic's
+          // Messages API under the message it opens with.
+          (nestedUsage("response") as Record<string, unknown> | undefined) ??
+          (nestedUsage("message") as Record<string, unknown> | undefined) ??
           parsed,
       );
     } catch {}
   }
-  return usage;
+  return seen ? totals : null;
 };
 
 /** Enough tail to hold a provider's final usage frame, never the transcript. */
