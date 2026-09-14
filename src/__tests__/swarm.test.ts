@@ -4039,6 +4039,71 @@ await writeFile(
       expect(receipt["status"]).toBe("completed");
     }, 180_000);
 
+    it("asks a lane once more when the ceiling cut it while still thinking in text", async () => {
+      const arranged = await arrange("success");
+      const swarmId = "swarm-packed-retry-thinking";
+      let sonnetAnswers = 0;
+      const provider = await fakeProvider((prompt, _path, body) => {
+        if (isVerifierPrompt(prompt)) {
+          return completion(
+            fenced({
+              verdicts: [
+                {
+                  id: "c1",
+                  status: "confirmed",
+                  evidenceStrength: "static",
+                  reason: "the packed source shows it",
+                },
+              ],
+            }),
+          );
+        }
+        if (
+          body["model"] === "anthropic/claude-sonnet-5" &&
+          !JSON.stringify(body).includes(CANARY_PROMPT)
+        ) {
+          sonnetAnswers += 1;
+          if (sonnetAnswers === 1) {
+            return completion(
+              "<think>\nLet me carefully analyze the diff for correctness issues.\n\nKey areas",
+              { finishReason: "length" },
+            );
+          }
+        }
+        return completion(answer([finding({ file: "changed-a.ts", line: 1 })]));
+      });
+      await pointUpstream(arranged, {
+        "https://gateway.ai.cloudflare.com/v1/{CLOUDFLARE_ACCOUNT_ID}/{CLOUDFLARE_GATEWAY_ID}/compat": `${provider.baseUrl}/gw/{CLOUDFLARE_ACCOUNT_ID}/{CLOUDFLARE_GATEWAY_ID}/compat`,
+      });
+
+      const result = await runSwarm(
+        packedArguments(arranged, swarmId, [
+          "--provider",
+          "cloudflare-ai-gateway",
+          "--reviewers",
+          "1",
+          "--reviewer-1-model",
+          "anthropic/claude-sonnet-5",
+          "--verifier-model",
+          "workers-ai/@cf/deepseek-ai/deepseek-v4-flash-0731",
+        ]),
+        arranged,
+      );
+      const receipt = await readReceipt(arranged.out, swarmId);
+      const lane = reviewerRows(receipt)[0];
+
+      // The ceiling fell inside an unclosed <think>, before any report began,
+      // so the cut is not the report's size and a second sample can still be
+      // a report. A cut report stays blocked without a second request above.
+      expect(result.code, result.output).toBe(0);
+      expect(sonnetAnswers).toBe(2);
+      expect(lane?.["status"]).toBe("completed");
+      expect(lane?.["finishReason"]).toBe("stop");
+      expect(lane?.["relaunch"]).toMatchObject({ attempts: 1 });
+      expect(lane?.["usage"]).toEqual({ inputTokens: 22, outputTokens: 44 });
+      expect(receipt["status"]).toBe("completed");
+    }, 180_000);
+
     it("blocks the lane whose lab the gateway refuses and reviews with the others", async () => {
       const arranged = await arrange("success");
       const swarmId = "swarm-packed-lab-refused";

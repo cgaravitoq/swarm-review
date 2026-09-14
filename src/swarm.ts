@@ -463,6 +463,23 @@ const lastJsonBlock = (finalText: string) => {
   return { value: undefined, error: "no fenced json block" };
 };
 
+/**
+ * A cut answer that never left its thinking.
+ *
+ * With thinking disabled in the request, `anthropic/claude-sonnet-5` still
+ * opened a `<think>` in plain text and spent the whole 16k ceiling inside it
+ * (run swarm-mu14gmts, 45k characters, no report). That is not a report the
+ * ceiling cut, which the same ceiling would cut again: the report never began,
+ * so a fresh sample can still be one. A closed `<think>` is the other case.
+ */
+export const cutWhileThinking = (
+  finalText: string,
+  finishReason: string | null,
+) =>
+  (finishReason === "length" || finishReason === "max_tokens") &&
+  /^\s*<think>/.test(finalText) &&
+  !finalText.includes("</think>");
+
 const failedCandidates = (error: string) => ({
   completion: null,
   blockerReason: null,
@@ -2308,11 +2325,14 @@ async function main() {
                 // and one more request is cheaper than a lane the run must do
                 // without. The receipt prices both answers. An answer the
                 // ceiling cut is not asked again: the same ceiling cuts the
-                // same report.
+                // same report. Unless the ceiling fell before the report began.
+                const cut =
+                  answer.finishReason === "length" ||
+                  answer.finishReason === "max_tokens";
                 if (
                   parseCandidates(answer.content, laneId).error &&
-                  answer.finishReason !== "length" &&
-                  answer.finishReason !== "max_tokens" &&
+                  (!cut ||
+                    cutWhileThinking(answer.content, answer.finishReason)) &&
                   !controller.signal.aborted
                 ) {
                   relaunchAttempts += 1;
