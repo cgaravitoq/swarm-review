@@ -533,6 +533,25 @@ describe("runAacrCase", () => {
     );
   });
 
+  it("names a slashed instance id's result files with __", async () => {
+    const out = await scratch();
+    const { runGit } = gitRecorder();
+    const { runSwarm } = writingSwarm(receipt());
+    const instanceId = "acme/demo-7@abc1234";
+    await runAacrCase(
+      { ...ENTRY, instanceId },
+      { out, runId: "run-1", maxCostUsd: 25, targeted: false },
+      { runGit, runSwarm },
+    );
+
+    for (const dir of ["candidates", "confirmed", "cases"]) {
+      const written = JSON.parse(
+        await readFile(join(out, dir, "acme__demo-7@abc1234.json"), "utf8"),
+      );
+      expect(written.instance_id ?? written.instanceId).toBe(instanceId);
+    }
+  });
+
   it("records a skipped install the receipt carries", async () => {
     const out = await scratch();
     const { runGit } = gitRecorder();
