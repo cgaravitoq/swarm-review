@@ -335,6 +335,11 @@ describe("deterministic lane coverage", () => {
       exhausted: false,
     });
     expect(laneBudgets(options, 500).exhausted).toBe(true);
+    // Past the point where the reservation fits, the verifier gets what the
+    // run has left before teardown, never the reservation itself.
+    expect(laneBudgets(options, 500).verifierSeconds).toBe(
+      600 - 500 - TEARDOWN_BUDGET_SECONDS,
+    );
     expect(MAX_CONCURRENT_LANES).toBe(3);
     expect(CLOUD_CONCURRENT_LANES).toBe(3);
     expect(LANE_KILL_GRACE_MS).toBeGreaterThan(0);
@@ -474,6 +479,22 @@ describe("deterministic lane coverage", () => {
     // A cold verifier's window is its own reservation, which is smaller than
     // the shortest lane that ever produced a review.
     expect(relaunchRefusal(options, 10, "verifier")).toMatch(/200s/);
+    // A reservation large enough for a relaunch is still refused once the
+    // run cannot honour it: the 2026-09-15 sandbox run relaunched a cold
+    // verifier under a 300 s reservation with 23 s of run left.
+    const deep = parseSwarmOptions([
+      "--head",
+      "a".repeat(40),
+      "--base",
+      "b".repeat(40),
+      "--out",
+      "/out",
+      "--sandbox",
+    ]);
+    expect(relaunchRefusal(deep, 10, "verifier")).toBeNull();
+    expect(relaunchRefusal(deep, 877, "verifier")).toMatch(
+      /only -67s of verifier window left/,
+    );
     expect(RELAUNCH_MINIMUM_SECONDS).toBe(
       RELAUNCH_PLATFORM_SECONDS + RELAUNCH_REVIEW_SECONDS,
     );

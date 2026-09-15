@@ -1426,12 +1426,15 @@ export function swarmStatus(
 
 /** Reviewer time is what is left after the verifier's reservation is set aside. */
 export const laneBudgets = (options: SwarmOptions, elapsedSeconds: number) => {
-  const remaining = options.totalTimeoutSeconds - elapsedSeconds;
-  const reviewerSeconds =
-    remaining - options.verifierReserveSeconds - TEARDOWN_BUDGET_SECONDS;
+  const remaining =
+    options.totalTimeoutSeconds - elapsedSeconds - TEARDOWN_BUDGET_SECONDS;
+  const reviewerSeconds = remaining - options.verifierReserveSeconds;
   return {
     reviewerSeconds,
-    verifierSeconds: options.verifierReserveSeconds,
+    // The reservation, until the run itself has less than that left: a
+    // verifier launched late, as a relaunch is, runs under the run's own
+    // deadline and not under a reservation the run can no longer honour.
+    verifierSeconds: Math.min(options.verifierReserveSeconds, remaining),
     exhausted: reviewerSeconds <= 0,
   };
 };
@@ -1459,7 +1462,7 @@ export const laneWindowSeconds = (
   const budgets = laneBudgets(options, elapsedSeconds);
   if (role === "reviewer") return budgets.reviewerSeconds;
   return warmVerifier
-    ? budgets.verifierSeconds + budgets.reviewerSeconds
+    ? budgets.verifierSeconds + Math.max(0, budgets.reviewerSeconds)
     : budgets.verifierSeconds;
 };
 
