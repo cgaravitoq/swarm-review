@@ -1880,7 +1880,20 @@ state="\${FAKE_STATE:?}"
 root="\${FAKE_CONTAINER_ROOT:?}"
 joined=" $* "
 echo "$*" >> "$state/docker.log"
-if [[ "$1" == "ps" ]]; then exit 0; fi
+# Live containers, by ownership label and by name, so a lookup answers only
+# for a container that was created and not yet removed.
+mkdir -p "$state/live"
+if [[ "$1" == "ps" ]]; then
+  filter=$(printf '%s' "$joined" | /usr/bin/sed -n 's/.*--filter \\([^ ]*\\).*/\\1/p')
+  if [[ "$filter" == label=review-pi.ownership=* ]]; then
+    owner="\${filter#label=review-pi.ownership=}"
+    [[ -f "$state/live/$owner" ]] && echo "cid-$(cat "$state/live/$owner")"
+  elif [[ "$filter" == name=* ]]; then
+    name="\${filter#name=}"; name="\${name#^}"; name="\${name%$}"
+    grep -lx "$name" "$state/live"/* >/dev/null 2>&1 && echo "cid-$name"
+  fi
+  exit 0
+fi
 if [[ "$1 $2" == "image inspect" ]]; then echo sha256:fake-image; exit 0; fi
 if [[ "$1" == "run" && "$joined" == *" --rm "* ]]; then
   echo "Filesystem 1024-blocks Used Available Capacity Mounted on"
@@ -1888,16 +1901,28 @@ if [[ "$1" == "run" && "$joined" == *" --rm "* ]]; then
   for tool in bun git jq node rg cargo setpriv; do echo "tool $tool 1.0.0"; done
   exit 0
 fi
-if [[ "$1" == "run" ]]; then echo fake-container-id; exit 0; fi
-if [[ "$1" == "rm" ]]; then echo fake-container-id; exit 0; fi
+if [[ "$1" == "run" ]]; then
+  name=$(printf '%s' "$joined" | /usr/bin/sed -n 's/.*--name \\([^ ]*\\).*/\\1/p')
+  owner=$(printf '%s' "$joined" | /usr/bin/sed -n 's/.*--label review-pi.ownership=\\([^ ]*\\).*/\\1/p')
+  [[ -n "$owner" ]] && printf '%s' "$name" > "$state/live/$owner"
+  echo fake-container-id
+  exit 0
+fi
+if [[ "$1" == "rm" ]]; then
+  name="\${@: -1}"
+  grep -lx "$name" "$state/live"/* 2>/dev/null | xargs /bin/rm -f
+  echo fake-container-id
+  exit 0
+fi
 if [[ "$1" == "cp" ]]; then
   src="$2"
   dest="$3"
   if [[ "$src" == *"job.json" && "$dest" == *"/workspace/runs/"* ]]; then
     runid=$(printf '%s' "$dest" | grep -o '/workspace/runs/[A-Za-z0-9._-]*' | head -1)
     runid="\${runid##*/}"
-    mkdir -p "$state/jobs"
+    mkdir -p "$state/jobs" "$root/$runid"
     cp "$src" "$state/jobs/$runid.json"
+    cp "$src" "$root/$runid/job.json"
   fi
   if [[ "$src" == *"auth.json" && "$dest" == *"/workspace/runs/"* ]]; then
     runid=$(printf '%s' "$dest" | grep -o '/workspace/runs/[A-Za-z0-9._-]*' | head -1)
@@ -2558,18 +2583,25 @@ exec /usr/bin/git "$@"
     expect(receipt["outcome"]).toBe("cancelled");
     const lanes = receipt["lanes"] as Record<string, unknown>[];
     expect(lanes.every((lane) => lane["status"] === "cancelled")).toBe(true);
+    const dockerLog = await readFile(
+      join(arranged.state, "docker.log"),
+      "utf8",
+    );
     for (const lane of lanes) {
       const artifactDir = lane["artifactDir"];
       if (typeof artifactDir !== "string") continue;
-      // The host is an observer. An interrupted lane keeps its container and
-      // its evidence; only an accepted completion or an explicit cancel tears
-      // one down.
+      // The interrupted driver kept the container it lost sight of; the
+      // conductor, which knows nobody will resume it, then cancelled it
+      // explicitly, and that cancel is what the lane's receipt records.
       const laneReceipt = await readFile(
         join(artifactDir, "local-receipt.json"),
         "utf8",
       );
-      expect(laneReceipt).toContain('"outcome": "interrupted"');
-      expect(laneReceipt).toContain('"containerRemoved": false');
+      expect(laneReceipt).toContain('"outcome": "cancelled"');
+      expect(laneReceipt).toContain('"containerRemoved": true');
+      expect(dockerLog).toContain(
+        `rm --force --volumes review-pi-local-${String(lane["runId"])}`,
+      );
     }
   }, 180_000);
 

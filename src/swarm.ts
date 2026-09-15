@@ -1574,15 +1574,58 @@ export type LaneRunner = (
   signal: AbortSignal,
 ) => Promise<number>;
 
+/**
+ * Whether a lane's container outlived its driver, as the driver's own receipt
+ * says: an interrupted driver keeps the container it lost sight of.
+ */
+const laneContainerRetained = async (outDir: string) => {
+  try {
+    const receipt = JSON.parse(
+      await readFile(join(outDir, "local-receipt.json"), "utf8"),
+    ) as { shutdown?: { containerRemoved?: boolean } };
+    return receipt.shutdown?.containerRemoved === false;
+  } catch {
+    return false;
+  }
+};
+
+/**
+ * The conductor's explicit cancel for a lane it abandoned: the driver exports
+ * what the lane left and removes the container nobody is going to resume.
+ */
+const cancelDetachedLane = (runId: string, outDir: string) =>
+  new Promise<void>((resolvePromise) => {
+    const child = spawn(
+      process.execPath,
+      [localScript, "--cancel", "--run-id", runId, "--out", outDir],
+      { stdio: ["ignore", "inherit", "inherit"] },
+    );
+    child.once("error", () => resolvePromise());
+    child.once("exit", () => resolvePromise());
+  });
+
 /** The default lane: a detached child nobody can look at while it runs. */
-const detachedRunner: LaneRunner = (_lane, args, signal) =>
-  superviseLane(
+const detachedRunner: LaneRunner = async (lane, args, signal) => {
+  const code = await superviseLane(
     spawn(process.execPath, [localScript, ...args], {
       detached: true,
       stdio: ["ignore", "inherit", "inherit"],
     }),
     signal,
   );
+  // A lane the swarm abandoned, at its wall or on a signal, is one nobody
+  // resumes: a container its interrupted driver kept is cancelled here, with
+  // its evidence exported, rather than left running at 2 GiB.
+  const outDir = args[args.indexOf("--out") + 1];
+  if (
+    signal.aborted &&
+    outDir &&
+    (await laneContainerRetained(join(outDir, lane.runId)))
+  ) {
+    await cancelDetachedLane(lane.runId, outDir);
+  }
+  return code;
+};
 
 const cloudRunner: LaneRunner = (_lane, args, signal) =>
   superviseLane(

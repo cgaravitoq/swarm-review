@@ -2314,6 +2314,10 @@ async function main() {
         }
         const teardownBeganAt = Date.now();
         const shutdown = await teardown(teardownBeganAt);
+        const cancelUsage =
+          shutdown.providerUsage === null
+            ? null
+            : readLedgerUsage(shutdown.providerUsage);
         const receipt = {
           runId: metadata.runId,
           attemptId: metadata.attemptId,
@@ -2331,6 +2335,7 @@ async function main() {
           promptSha: metadata.promptSha,
           piVersion: null,
           usage: null,
+          modelRequests: cancelUsage?.requests ?? null,
           fixture: metadata.fixturePath ?? null,
           checkCommand: metadata.checkCommand,
           failStep: null,
@@ -2365,6 +2370,7 @@ async function main() {
             exportErrors: shutdown.exportErrors,
             authRemoved: shutdown.authRemoved,
             authRemoveError: shutdown.authRemoveError,
+            providerUsage: cancelUsage,
             transportRemoved: shutdown.transportError === null,
             transportError: shutdown.transportError,
           },
