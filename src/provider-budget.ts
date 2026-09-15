@@ -81,12 +81,16 @@ export const SESSION_CAPS = {
   // one long answer: measured lanes land between 22 and 32. A ceiling at 32 is
   // not a guard against a runaway lane, it is a coin flip that throws away ten
   // minutes of finished work, so every cumulative cap here is doubled with it.
+  // The input cap counts the whole context of every call, cached or not, so
+  // it is sized for the request cap at a 200k window: a lane that spends its
+  // 64 requests is stopped by the request cap, not by the token cap two
+  // requests earlier.
   t1b: {
     maxRequests: 64,
     maxRetriesPerRequest: 1,
     maxInputTokensPerRequest: 1048576,
     maxOutputTokensPerRequest: 16384,
-    maxCumulativeInputTokens: 5000000,
+    maxCumulativeInputTokens: 12000000,
     maxCumulativeOutputTokens: 128000,
     maxRequestBytes: 32 * 1024 * 1024,
   },
