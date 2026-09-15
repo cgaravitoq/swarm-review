@@ -67,6 +67,18 @@ record() {
     --arg detail "${4:-}" '{step:$step, exit:$exit, seconds:$seconds, at:$at, detail:$detail}' >> "$STEPS"
 }
 
+# A step's own words for steps.jsonl, when it has any. The install step is the
+# one whose exit code cannot say what happened: zero means both "installed" and
+# "this checkout is not installable by this image", and the difference is what a
+# lane that never reached the model has to be readable as.
+step_detail() {
+  if [ "$1" != "install" ] || [ ! -s "$RUN_DIR/install.json" ]; then
+    return 0
+  fi
+  jq -r 'if .status == "skipped" then "skipped: " + .reason else "installed with " + (.manifest // "bun") end' \
+    "$RUN_DIR/install.json" 2>/dev/null || true
+}
+
 # Runs one named step, records its exit and stops the run on failure. A step
 # named by `failStep` is replaced by a failing command on purpose: the lifecycle
 # has to be provable on the unhappy path too.
@@ -94,7 +106,7 @@ step() {
     ( "$@" )
   fi
   local code=$?
-  record "$name" "$code" "$(($(date +%s) - began))"
+  record "$name" "$code" "$(($(date +%s) - began))" "$(step_detail "$name")"
   if [ "$code" -ne 0 ]; then
     local cur_state
     cur_state=$(jq -r '.state // "failed"' "$STATUS" 2>/dev/null || echo "failed")
@@ -141,13 +153,74 @@ do_clone() {
   git -C "$REPO" --no-pager diff --stat base..HEAD > "$RUN_DIR/diff.stat"
 }
 
+# Whether this image can install the checkout, and under which manifest.
+#
+# The image carries one toolchain, so Bun's lockfile is the only manifest it can
+# honour: another resolver's lockfile names a dependency tree this run cannot
+# reproduce, and `--frozen-lockfile` against a tree with no lockfile has nothing
+# pinned to install. Both are reviewed as they were cloned rather than ending the
+# lane before the reviewer has seen a prompt.
+install_manifest() {
+  [ -f "$REPO/package.json" ] || return 1
+  if [ -f "$REPO/bun.lock" ]; then
+    printf 'bun.lock'
+    return 0
+  fi
+  if [ -f "$REPO/bun.lockb" ]; then
+    printf 'bun.lockb'
+    return 0
+  fi
+  return 1
+}
+
+# Why the install was skipped, in terms a reader can check against the checkout.
+install_skip_reason() {
+  if [ ! -f "$REPO/package.json" ]; then
+    printf 'the checkout root has no package.json'
+    return
+  fi
+  local foreign="" name
+  for name in package-lock.json yarn.lock pnpm-lock.yaml; do
+    if [ -f "$REPO/$name" ]; then
+      foreign="${foreign:+$foreign, }$name"
+    fi
+  done
+  if [ -n "$foreign" ]; then
+    printf 'the checkout root has a package.json and no bun lockfile (found %s)' "$foreign"
+  else
+    printf 'the checkout root has a package.json and no bun lockfile'
+  fi
+}
+
+# What the install step did, for the report a verifier or a human reads. A lane
+# that never reached the step says `unknown`, which is not an install that ran.
+install_evidence() {
+  if [ -s "$RUN_DIR/install.json" ]; then
+    jq -c . "$RUN_DIR/install.json" 2>/dev/null && return 0
+  fi
+  printf '{"status":"unknown","manifest":null,"reason":null}'
+}
+
 do_install() {
   cd "$REPO" || return 1
+  local manifest
+  manifest=$(install_manifest)
+  if [ -z "$manifest" ]; then
+    jq -cn --arg reason "$(install_skip_reason)" \
+      '{status:"skipped", manifest:null, reason:$reason}' > "$RUN_DIR/install.json"
+    return 0
+  fi
+  local code
   if is_supervised; then
     bun install --frozen-lockfile
+    code=$?
   else
     timeout -k 15 "$(job .installTimeoutSeconds)" bun install --frozen-lockfile
+    code=$?
   fi
+  [ "$code" -eq 0 ] || return "$code"
+  jq -cn --arg manifest "$manifest" \
+    '{status:"installed", manifest:$manifest, reason:null}' > "$RUN_DIR/install.json"
 }
 
 do_check() {
@@ -1265,6 +1338,7 @@ write_report() {
     --arg checkoutDelta "$(wc -c < "$RUN_DIR/checkout-delta.patch" 2>/dev/null | tr -d ' ' || echo 0)" \
     --arg checkoutUntracked "$(wc -l < "$RUN_DIR/checkout-untracked.txt" 2>/dev/null | tr -d ' ' || echo 0)" \
     --arg checkTail "$(tail -c 4000 "$RUN_DIR/check.log" 2>/dev/null || true)" \
+    --argjson install "$(install_evidence)" \
     --arg completion "$completion" --arg partialReason "$reason" \
     --argjson finalText "$final" --argjson usage "$usage" --argjson toolCalls "$tools" \
     --argjson elapsedSeconds "$(elapsed)" \
@@ -1278,6 +1352,7 @@ write_report() {
                 reviewerContextOverride:$reviewerContextOverride,
                 reviewerDeltaBytes:$checkoutDelta,
                 reviewerUntrackedFiles:$checkoutUntracked},
+      install:$install,
       provider:$provider, model:$model,
       piVersion:$piVersion, bunVersion:$bunVersion, diffStat:$diffStat, checkTail:$checkTail,
       elapsedSeconds:$elapsedSeconds, usage:$usage, toolCalls:$toolCalls, finalText:$finalText}' \
