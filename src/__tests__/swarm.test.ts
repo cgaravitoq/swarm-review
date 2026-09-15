@@ -2680,6 +2680,12 @@ exec /usr/bin/git "$@"
       );
       expect(laneReceipt).toContain('"outcome": "cancelled"');
       expect(laneReceipt).toContain('"containerRemoved": true');
+      // The lane died before the runner reported, so its install is
+      // unobserved on both the lane receipt and the swarm's row for it.
+      expect(JSON.parse(laneReceipt)["installSkipped"]).toBeNull();
+      expect(JSON.parse(laneReceipt)["installSkipReason"]).toBeNull();
+      expect(lane["installSkipped"]).toBeNull();
+      expect(lane["installSkipReason"]).toBeNull();
       // The window the lane ran under, not the cancelling invocation's own
       // default: the conductor's cancel knows nothing about the lane's clock.
       expect(JSON.parse(laneReceipt)["deadlineSeconds"]).toBe(

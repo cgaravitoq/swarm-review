@@ -1300,6 +1300,28 @@ describe("deadline and redaction", () => {
       installSkipReason: "the checkout root has no package.json",
     });
   });
+
+  it("leaves the install unobserved when the cloud lane wrote no report", async () => {
+    const directory = join(tmpdir(), `review-pi-no-report-${Date.now()}`);
+    await mkdir(directory);
+    temporaryDirectories.push(directory);
+    await writeFile(
+      join(directory, "receipt.json"),
+      JSON.stringify({
+        runId: "lane-1",
+        provider: "xai",
+        model: "grok-4.6",
+        wallSeconds: 12,
+        runError: "killed at clone",
+      }),
+    );
+    const receipt = await readLaneReceipt(directory);
+
+    // A lane that never reported is not a lane that installed: false would
+    // read as an install that ran, and true as a skip nobody recorded.
+    expect(receipt.installSkipped).toBeNull();
+    expect(receipt.installSkipReason).toBeNull();
+  });
 });
 
 describe("public local CLI lifecycle", () => {
@@ -1405,6 +1427,25 @@ describe("public local CLI lifecycle", () => {
     expect(receipt.installSkipReason).toBe(
       "the checkout root has no package.json",
     );
+  });
+
+  it("leaves the install unobserved when the runner never reported", async () => {
+    const root = await mkdtemp(join(tmpdir(), "review-pi-cli-"));
+    temporaryDirectories.push(root);
+    const arranged = await arrangeFakeDocker(root);
+    const runId = "install-unobserved";
+    const out = join(root, "out");
+
+    const result = await runLocalCli(
+      localArguments(out, runId),
+      fakeEnvironment(arranged, runId, "review-failure"),
+    );
+    const receipt = await readLocalReceipt(join(out, runId));
+
+    expect(result.code).toBe(1);
+    expect(receipt.outcome).toBe("failed");
+    expect(receipt.installSkipped).toBeNull();
+    expect(receipt.installSkipReason).toBeNull();
   });
 
   it("refuses a run that names no target repository or checkout", async () => {
