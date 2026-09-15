@@ -1416,7 +1416,14 @@ const stringList = (container: unknown, key: string) => {
     : [];
 };
 
-const OUTCOMES = ["completed", "failed", "interrupted"] as const;
+const OUTCOMES = [
+  "completed",
+  "failed",
+  "interrupted",
+  "cancelled",
+  "blocked",
+  "unverified",
+] as const;
 
 const readOutcome = (value: string) => {
   const outcome = OUTCOMES.find((known) => known === value);
@@ -3036,6 +3043,10 @@ async function main() {
     runError = "completed run is missing valid report.json or trace.jsonl";
   }
 
+  const providerUsage =
+    shutdown.providerUsage === null
+      ? null
+      : readLedgerUsage(shutdown.providerUsage);
   const receipt = {
     runId: options.runId,
     attemptId: options.attemptId,
@@ -3056,6 +3067,9 @@ async function main() {
     promptSha,
     piVersion: parsedReport?.piVersion ?? null,
     usage: parsedReport?.usage ?? null,
+    // The broker's own count: a lane cut after it spent requests is finished
+    // work, not a lane that never reached the model and can be relaunched.
+    modelRequests: providerUsage?.requests ?? null,
     fixture: options.fixturePath ?? null,
     checkCommand: options.checkCommand,
     failStep: options.failStep ?? null,
@@ -3089,10 +3103,7 @@ async function main() {
       exportErrors: shutdown.exportErrors,
       authRemoved: shutdown.authRemoved,
       authRemoveError: shutdown.authRemoveError,
-      providerUsage:
-        shutdown.providerUsage === null
-          ? null
-          : readLedgerUsage(shutdown.providerUsage),
+      providerUsage,
       transportRemoved: shutdown.transportError === null,
       transportError: shutdown.transportError,
     },

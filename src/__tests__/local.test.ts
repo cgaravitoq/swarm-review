@@ -36,6 +36,7 @@ import {
   planBroker,
   prepareTransport,
   readLaneReceipt,
+  readLocalReceipt,
   redactArgs,
   redactValues,
   resolveClaudeCodeTokens,
@@ -44,6 +45,7 @@ import {
   TARGET_UID,
   targetProviderEnv,
 } from "../local";
+import { neverReachedModel } from "../swarm";
 
 const temporaryDirectories: string[] = [];
 
@@ -1701,6 +1703,42 @@ describe("public local CLI lifecycle", () => {
     expect(receipt).toContain("resume");
     expect(receipt).not.toContain("blocked-access");
     expect(receipt).not.toContain("blocked-refresh");
+  });
+
+  it("counts the requests a blocked lane spent so the swarm does not buy them twice", async () => {
+    // The real loss: a lane the broker cut at its cumulative cap had made 62
+    // requests, but its receipt carried no count, so the swarm relaunched it
+    // twice as a lane that never reached the model.
+    const root = await mkdtemp(join(tmpdir(), "review-pi-cli-"));
+    temporaryDirectories.push(root);
+    const arranged = await arrangeFakeDocker(root);
+    await writeFile(
+      join(arranged.container, "provider-usage.jsonl"),
+      [
+        JSON.stringify({
+          event: "provider_request",
+          status: 200,
+          totals: { requests: 62, retries: 0, input: 5122797, output: 29802 },
+        }),
+        JSON.stringify({ event: "denied", reason: "max_input_tokens" }),
+        "",
+      ].join("\n"),
+    );
+    const runId = "quota-blocked-lane";
+    const out = join(root, "out");
+
+    const result = await runLocalCli(localArguments(out, runId), {
+      ...fakeEnvironment(arranged, runId, "success"),
+      FAKE_BRIDGE_STATES: "running,blocked",
+      FAKE_TERMINAL_REASON: "quota_blocked",
+    });
+    const receipt = await readLocalReceipt(join(out, runId));
+
+    expect(result.code, result.output).toBe(1);
+    expect(receipt.outcome).toBe("blocked");
+    expect(receipt.error).toContain("quota_blocked");
+    expect(receipt.modelRequests).toBe(62);
+    expect(neverReachedModel(receipt)).toBe(false);
   });
 
   it("removes staged OAuth after a review-start failure", async () => {
