@@ -1327,7 +1327,7 @@ describe("public local CLI lifecycle", () => {
     const out = join(root, "out");
 
     const result = await runLocalCli(
-      [...localArguments(out, runId), "--pi-timeout", "600"],
+      localArguments(out, runId),
       fakeEnvironment(arranged, runId, "success"),
     );
     const job = JSON.parse(
@@ -1340,8 +1340,8 @@ describe("public local CLI lifecycle", () => {
     expect(job["budget"]).toEqual({
       requests: SESSION_CAPS.t1b.maxRequests,
       inputTokens: SESSION_CAPS.t1b.maxCumulativeInputTokens,
-      seconds: 600,
     });
+    expect(job["totalTimeoutSeconds"]).toBe(30);
   });
 
   it("accepts a missing optional artifact and requires report plus trace", async () => {

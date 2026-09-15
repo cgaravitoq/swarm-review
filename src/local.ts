@@ -2558,7 +2558,6 @@ async function main() {
         budget: {
           requests: SESSION_CAPS[options.trialKind].maxRequests,
           inputTokens: SESSION_CAPS[options.trialKind].maxCumulativeInputTokens,
-          seconds: options.piTimeoutSeconds,
         },
       };
       stage = await mkdtemp(join(tmpdir(), "review-pi-local-"));

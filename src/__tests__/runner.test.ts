@@ -1469,14 +1469,17 @@ process.stdin.on("data", (chunk) => {
       "budget-requests",
       "standby",
       "openai-codex",
-      { budget: { requests: 4, inputTokens: 1_000_000, seconds: 100_000 } },
+      {
+        budget: { requests: 4, inputTokens: 1_000_000 },
+        totalTimeoutSeconds: 100_000,
+      },
     );
     try {
       const statusPath = join(root, "status.json");
       await waitForStandbySettled(statusPath);
       const firstPrompt = await readFile(join(root, "pi-prompt.log"), "utf8");
-      expect(firstPrompt).toContain(
-        "Budget for this lane: 4 model requests and 100000 seconds.",
+      expect(firstPrompt).toMatch(
+        /Budget for this lane: 4 model requests and (100000|99999) seconds\./,
       );
 
       // The standby turn was request 1. Two tool turns more: the notice fires
@@ -1522,18 +1525,23 @@ process.stdin.on("data", (chunk) => {
   });
 
   it("tells the model to finish when three quarters of its window are gone", async () => {
+    // The runner's own start is a whole second and its own startup is not
+    // free, so the model is told the three seconds or what that left of them.
     const { root, sockPath, runnerProc } = await prepareSupervisedRun(
       "budget-seconds",
       "standby",
       "openai-codex",
-      { budget: { requests: 1_000, inputTokens: 1_000_000, seconds: 1 } },
+      {
+        budget: { requests: 1_000, inputTokens: 1_000_000 },
+        totalTimeoutSeconds: 3,
+      },
     );
     try {
       const statusPath = join(root, "status.json");
       await waitForStandbySettled(statusPath);
-      // Past the whole one-second window before the tool turn, so the
-      // boundary the notice is measured at is on the far side of it.
-      await new Promise((resolve) => setTimeout(resolve, 1_100));
+      // Past the whole window before the tool turn, so the boundary the
+      // notice is measured at is on the far side of it.
+      await new Promise((resolve) => setTimeout(resolve, 3_100));
       await sendCommand(sockPath, {
         id: "tool-1",
         type: "prompt",
@@ -1546,13 +1554,49 @@ process.stdin.on("data", (chunk) => {
       );
       const steers = await readFile(join(root, "pi-steer.log"), "utf8");
       expect(steers).toMatch(
-        /Budget notice from the runner: \d+ of 1 seconds spent\./,
+        /Budget notice from the runner: \d+ of [123] seconds spent\./,
       );
 
       await waitForStatus(
         statusPath,
         (s) => s["state"] === "idle" && s["lastEvent"] === "agent_end",
       );
+      await sendCommand(sockPath, { type: "accept" });
+      await waitForExit(runnerProc);
+    } finally {
+      runnerProc.kill();
+    }
+  });
+
+  it("tells a lane the window it has left, not the one it started with", async () => {
+    // Clone and install come out of the lane's window before the model sees a
+    // prompt, and a briefed lane idles for most of the run before it has one.
+    // The 2026-09-15 sandbox lanes were told 355 s of a 508 s window after a
+    // 308 s install, so the notice keyed to it never came.
+    const { root, sockPath, runnerProc } = await prepareSupervisedRun(
+      "budget-window-left",
+      null,
+      "openai-codex",
+      {
+        budget: { requests: 1_000, inputTokens: 1_000_000 },
+        totalTimeoutSeconds: 5,
+      },
+    );
+    try {
+      const statusPath = join(root, "status.json");
+      await waitForStatus(statusPath, (s) => s["childIdle"] === true);
+      await new Promise((resolve) => setTimeout(resolve, 2_100));
+      await sendCommand(sockPath, {
+        id: "brief",
+        type: "prompt",
+        message: "standby",
+      });
+      await waitForStandbySettled(statusPath);
+      const prompt = await readFile(join(root, "pi-prompt.log"), "utf8");
+      expect(prompt).toMatch(
+        /Budget for this lane: 1000 model requests and [123] seconds\./,
+      );
+
       await sendCommand(sockPath, { type: "accept" });
       await waitForExit(runnerProc);
     } finally {

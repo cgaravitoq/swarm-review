@@ -767,7 +767,6 @@ async function main() {
     budget: {
       requests: broker.config.caps.maxRequests,
       inputTokens: broker.config.caps.maxCumulativeInputTokens,
-      seconds: positiveInt(argument("pi-timeout"), 900, "pi-timeout"),
     },
   };
 

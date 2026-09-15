@@ -34,6 +34,6 @@ export type ReviewJob = {
   /** Selects the brokered RPC runner; the legacy key-in-env path is not used. */
   supervised?: boolean;
   reviewerContext?: string;
-  /** The broker's caps and the lane's window, so the runner can tell the model to finish before one is reached. */
-  budget?: { requests: number; inputTokens: number; seconds: number };
+  /** The broker's caps, so the runner can tell the model to finish before one, or `totalTimeoutSeconds`, is reached. */
+  budget?: { requests: number; inputTokens: number };
 };

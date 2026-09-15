@@ -167,7 +167,7 @@ run_rpc_bridge() {
   fi
   local node_bin
   node_bin=$(command -v node 2>/dev/null || command -v bun 2>/dev/null)
-  RUN_DIR="$run_dir" "$node_bin" - << 'EOF_RPC_BRIDGE'
+  RUN_DIR="$run_dir" RUNNER_STARTED_AT="$START" "$node_bin" - << 'EOF_RPC_BRIDGE'
 const fs = require("node:fs");
 const net = require("node:net");
 const path = require("node:path");
@@ -197,14 +197,21 @@ const promptPath = path.join(runDir, "prompt.txt");
 try { fs.mkdirSync(sessionDir, { recursive: true }); } catch {}
 
 const startTime = Date.now();
-// The broker's caps and the lane's window, as the driver passed them. A lane
-// that reaches a cap is cut without an answer, so the model is told once, at
-// three quarters of whichever cap is nearest, to stop and write what it has.
+// The broker's caps, as the driver passed them. A lane that reaches a cap is
+// cut without an answer, so the model is told once, at three quarters of
+// whichever cap is nearest, to stop and write what it has.
 const budget = job.budget || null;
 let turnsEnded = 0;
 let inputTokensUsed = 0;
 let budgetNoticeSent = false;
 let budgetNoted = false;
+// The lane is cut totalTimeoutSeconds after the runner started, and clone and
+// install come out of that before the model sees a prompt, so its window is
+// whatever is left at the first one and is measured from there: a briefed
+// lane idles in its checkout for most of the run before it has a prompt.
+const runnerStartedAt = Number(process.env.RUNNER_STARTED_AT) * 1000;
+let budgetStartedAt = null;
+let budgetSeconds = null;
 let inFlightTool = null;
 let inFlightToolName = "";
 let lastEvent = null;
@@ -235,15 +242,17 @@ function nowIso() {
 function withBudgetNote(message) {
   if (!budget || budgetNoted) return message;
   budgetNoted = true;
-  return message + "\n\nBudget for this lane: " + budget.requests + " model requests and " + budget.seconds + " seconds. The runner will tell you when three quarters are spent; finish with your final answer before it runs out, because a lane cut at its budget delivers nothing.";
+  budgetStartedAt = Date.now();
+  budgetSeconds = Math.max(0, job.totalTimeoutSeconds - Math.floor((budgetStartedAt - runnerStartedAt) / 1000));
+  return message + "\n\nBudget for this lane: " + budget.requests + " model requests and " + budgetSeconds + " seconds. The runner will tell you when three quarters are spent; finish with your final answer before it runs out, because a lane cut at its budget delivers nothing.";
 }
 
 function budgetPressure() {
-  if (!budget) return null;
+  if (!budget || budgetStartedAt === null) return null;
   const spent = [
     ["requests", turnsEnded + 1, budget.requests],
     ["input tokens", inputTokensUsed, budget.inputTokens],
-    ["seconds", Math.floor((Date.now() - startTime) / 1000), budget.seconds],
+    ["seconds", Math.floor((Date.now() - budgetStartedAt) / 1000), budgetSeconds],
   ];
   for (const [name, used, cap] of spent) {
     if (typeof cap === "number" && cap > 0 && used >= Math.ceil(cap * 0.75)) {
