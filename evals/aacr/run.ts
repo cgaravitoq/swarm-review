@@ -18,6 +18,12 @@ import { spawn } from "node:child_process";
 import { createHash } from "node:crypto";
 import { access, mkdir, readFile, rm, writeFile } from "node:fs/promises";
 import { dirname, join, resolve } from "node:path";
+import { RUN_ID_MAX_LENGTH, RUN_ID_PATTERN } from "../../src/isolation";
+import {
+  LANE_RELAUNCHES,
+  MAX_REVIEWER_LANES,
+  reviewerLaneId,
+} from "../../src/swarm";
 import { swarmScriptPath } from "../swarm";
 import type { AacrCase } from "./dataset";
 import { parseDataset } from "./dataset";
@@ -165,15 +171,21 @@ export type GitInvocation = { args: string[]; cwd?: string };
 export type GitRunner = (invocation: GitInvocation) => Promise<number>;
 export type SwarmRunner = (args: readonly string[]) => Promise<number>;
 
-/** The swarm's own `--swarm-id` contract, so a case can never fail parsing it. */
-const RUN_ID_PATTERN = /^[a-z0-9]([a-z0-9._-]{0,46}[a-z0-9])?$/;
+/**
+ * The swarm derives every lane's run id from the swarm id, and the longest
+ * one is a relaunched reviewer lane, so the swarm id has to leave that
+ * suffix room inside the run-id contract or the swarm throws at startup.
+ */
+const LONGEST_LANE_SUFFIX = `-${reviewerLaneId(MAX_REVIEWER_LANES - 1)}-r${LANE_RELAUNCHES + 1}`;
+export const SWARM_ID_MAX_LENGTH =
+  RUN_ID_MAX_LENGTH - LONGEST_LANE_SUFFIX.length;
 
 export const swarmIdFor = (instanceId: string) => {
   const cleaned = instanceId
     .toLowerCase()
     .replace(/[^a-z0-9]+/g, "-")
     .replace(/^-+|-+$/g, "")
-    .slice(0, 49)
+    .slice(0, SWARM_ID_MAX_LENGTH)
     .replace(/-+$/g, "");
   if (RUN_ID_PATTERN.test(cleaned)) return cleaned;
   return `aacr-${createHash("sha256").update(instanceId).digest("hex").slice(0, 16)}`;

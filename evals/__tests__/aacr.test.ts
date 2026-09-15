@@ -2,8 +2,14 @@ import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
+import { assertRunId } from "../../src/local";
 import { buildReview } from "../../src/publish";
-import { parseSwarmOptions } from "../../src/swarm";
+import {
+  LANE_RELAUNCHES,
+  MAX_REVIEWER_LANES,
+  parseSwarmOptions,
+  reviewerLaneId,
+} from "../../src/swarm";
 import { parseDataset } from "../aacr/dataset";
 import {
   commentFrom,
@@ -18,6 +24,7 @@ import {
   prepareCheckout,
   runAacrCase,
   runAacrSuite,
+  SWARM_ID_MAX_LENGTH,
   swarmIdFor,
   swarmRunArguments,
   USAGE,
@@ -316,16 +323,25 @@ describe("swarmRunArguments", () => {
     expect(parsed.outDir).toBe("/out/swarms/run-1");
   });
 
-  it("names a swarm id the production parser accepts", () => {
+  it("names a swarm id every lane id the swarm derives from it still fits", () => {
     for (const instanceId of [
       ENTRY.instanceId,
       "kubernetes/kubernetes@ABCDEF1",
       "a/b",
+      "kubernetes__kubernetes-123456@abcdef1234567",
+      "x".repeat(48),
       "x".repeat(120),
     ]) {
       const swarmId = swarmIdFor(instanceId);
-      expect(swarmId.length).toBeLessThanOrEqual(49);
-      expect(swarmId).toMatch(/^[a-z0-9]([a-z0-9._-]{0,46}[a-z0-9])?$/);
+      expect(swarmId.length).toBeLessThanOrEqual(SWARM_ID_MAX_LENGTH);
+      expect(assertRunId(swarmId)).toBe(swarmId);
+      expect(assertRunId(`${swarmId}-reviewer-1`)).toBeDefined();
+      expect(assertRunId(`${swarmId}-verifier`)).toBeDefined();
+      expect(
+        assertRunId(
+          `${swarmId}-${reviewerLaneId(MAX_REVIEWER_LANES - 1)}-r${LANE_RELAUNCHES + 1}`,
+        ),
+      ).toBeDefined();
     }
   });
 
