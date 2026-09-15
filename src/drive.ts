@@ -763,6 +763,11 @@ async function main() {
       "total-timeout",
     ),
     ...(failStep ? { failStep } : {}),
+    budget: {
+      requests: broker.config.caps.maxRequests,
+      inputTokens: broker.config.caps.maxCumulativeInputTokens,
+      seconds: positiveInt(argument("pi-timeout"), 900, "pi-timeout"),
+    },
   };
 
   const startBody = buildCloudStartPayload({

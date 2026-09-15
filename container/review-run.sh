@@ -197,6 +197,14 @@ const promptPath = path.join(runDir, "prompt.txt");
 try { fs.mkdirSync(sessionDir, { recursive: true }); } catch {}
 
 const startTime = Date.now();
+// The broker's caps and the lane's window, as the driver passed them. A lane
+// that reaches a cap is cut without an answer, so the model is told once, at
+// three quarters of whichever cap is nearest, to stop and write what it has.
+const budget = job.budget || null;
+let turnsEnded = 0;
+let inputTokensUsed = 0;
+let budgetNoticeSent = false;
+let budgetNoted = false;
 let inFlightTool = null;
 let inFlightToolName = "";
 let lastEvent = null;
@@ -220,6 +228,43 @@ let requestSeq = 0;
 
 function nowIso() {
   return new Date().toISOString();
+}
+
+// The one line the model reads before it plans: the same numbers the notice
+// below is measured against, appended to the first prompt this lane is given.
+function withBudgetNote(message) {
+  if (!budget || budgetNoted) return message;
+  budgetNoted = true;
+  return message + "\n\nBudget for this lane: " + budget.requests + " model requests and " + budget.seconds + " seconds. The runner will tell you when three quarters are spent; finish with your final answer before it runs out, because a lane cut at its budget delivers nothing.";
+}
+
+function budgetPressure() {
+  if (!budget) return null;
+  const spent = [
+    ["requests", turnsEnded + 1, budget.requests],
+    ["input tokens", inputTokensUsed, budget.inputTokens],
+    ["seconds", Math.floor((Date.now() - startTime) / 1000), budget.seconds],
+  ];
+  for (const [name, used, cap] of spent) {
+    if (typeof cap === "number" && cap > 0 && used >= Math.ceil(cap * 0.75)) {
+      return { name, used, cap };
+    }
+  }
+  return null;
+}
+
+// Sent at a tool boundary: the next model call is certain there, so a steer
+// is read before it rather than queued behind an answer already finished.
+function noticeBudget() {
+  if (budgetNoticeSent) return;
+  const pressure = budgetPressure();
+  if (!pressure) return;
+  budgetNoticeSent = true;
+  appendTrace({ type: "budget_notice", ...pressure });
+  const message = "Budget notice from the runner: " + pressure.used + " of " + pressure.cap + " " + pressure.name + " spent. Stop investigating now and write your final answer in the required format with what you have; a lane that runs out of budget delivers nothing.";
+  sendCommandToPi({ type: "steer", message }).catch((err) => {
+    appendStderr("budget notice error: " + err.message + "\n");
+  });
 }
 
 function writeStatus() {
@@ -580,6 +625,7 @@ function handlePiEvent(child, rawLine) {
       result: text.slice(0, 400),
       resultTail: text.length > 400 ? text.slice(-400) : "",
     });
+    noticeBudget();
     writeStatus();
     return;
   }
@@ -588,6 +634,12 @@ function handlePiEvent(child, rawLine) {
     terminalAttempt = activeAttempt;
     lastEvent = "turn_end";
     isStreaming = false;
+    turnsEnded += 1;
+    const usage = event.message?.usage;
+    if (usage) {
+      // Whole context per call, cached or not: the broker counts it that way.
+      inputTokensUsed += (usage.input || 0) + (usage.cacheRead || 0) + (usage.cacheWrite || 0);
+    }
     const stopReason = event.message?.stopReason || "";
     const errorMessage = event.message?.errorMessage || "";
     appendTrace({
@@ -716,7 +768,7 @@ const server = net.createServer((socket) => {
         }
 
         const prevStatus = { state, terminalReason, childIdle, isStreaming, detail, lastCandidateResult };
-        const nativePrompt = { id: reqId, type: "prompt", message: req.message };
+        const nativePrompt = { id: reqId, type: "prompt", message: withBudgetNote(req.message) };
         if (req.streamingBehavior) nativePrompt.streamingBehavior = req.streamingBehavior;
         if (req.images) nativePrompt.images = req.images;
         const attempt = beginAttempt();
@@ -966,7 +1018,7 @@ server.listen(sockPath, async () => {
     if (promptText) {
       try {
         beginAttempt();
-        await sendCommandToPi({ id: "init-prompt", type: "prompt", message: promptText }, 0);
+        await sendCommandToPi({ id: "init-prompt", type: "prompt", message: withBudgetNote(promptText) }, 0);
       } catch (err) {
         appendStderr(`initial prompt error: ${err.message}\n`);
       }

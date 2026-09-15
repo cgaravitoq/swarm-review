@@ -600,6 +600,7 @@ describe("supervised native Pi RPC lifecycle", { timeout: 120_000 }, () => {
     runId: string,
     initialPrompt: string | null = "standby",
     provider = "openai-codex",
+    jobExtra: Record<string, unknown> = {},
   ) => {
     const root = await mkdtemp(join(tmpdir(), "review-pi-supervised-"));
     temporaryDirectories.push(root);
@@ -750,6 +751,9 @@ process.stdin.on("data", (chunk) => {
         },
       }) + "\\n");
     } else if (cmd.type === "steer") {
+      if (process.env.PI_STEER_LOG) {
+        fs.appendFileSync(process.env.PI_STEER_LOG, cmd.message + "\\n");
+      }
       process.stdout.write(JSON.stringify({
         id: cmdId,
         type: "response",
@@ -764,6 +768,9 @@ process.stdin.on("data", (chunk) => {
         success: true,
       }) + "\\n");
     } else if (cmd.type === "prompt") {
+      if (process.env.PI_PROMPT_LOG) {
+        fs.appendFileSync(process.env.PI_PROMPT_LOG, cmd.message + "\\n---\\n");
+      }
       if (cmd.message.includes("reject prompt")) {
         process.stdout.write(JSON.stringify({
           id: cmdId,
@@ -970,6 +977,7 @@ process.stdin.on("data", (chunk) => {
         model: "gpt-5.6-sol",
         ...(initialPrompt === null ? {} : { prompt: initialPrompt }),
         checkCommand: "git --no-pager diff --stat base..HEAD",
+        ...jobExtra,
       }),
     );
     if (initialPrompt !== null) {
@@ -989,6 +997,8 @@ process.stdin.on("data", (chunk) => {
         PATH: `${binDir}:${process.env.PATH}`,
         PI_BIN: fakePiPath,
         PI_ARGS_LOG: join(root, "pi-args.jsonl"),
+        PI_STEER_LOG: join(root, "pi-steer.log"),
+        PI_PROMPT_LOG: join(root, "pi-prompt.log"),
         PI_DESCENDANT_PID: join(root, "descendant.pid"),
       },
       stdio: ["ignore", "pipe", "pipe"],
@@ -1388,6 +1398,105 @@ process.stdin.on("data", (chunk) => {
         isError: false,
       });
 
+      await sendCommand(sockPath, { type: "accept" });
+      await waitForExit(runnerProc);
+    } finally {
+      runnerProc.kill();
+    }
+  });
+
+  it("tells the model to finish at three quarters of its request budget, at a tool boundary", async () => {
+    // A lane that reaches a cap is cut without an answer. The notice is what
+    // turns "budget spent" into "answer with what you have", so it must reach
+    // Pi as a steer at a tool boundary before the request that would cross it.
+    const { root, sockPath, runnerProc } = await prepareSupervisedRun(
+      "budget-requests",
+      "standby",
+      "openai-codex",
+      { budget: { requests: 4, inputTokens: 1_000_000, seconds: 100_000 } },
+    );
+    try {
+      const statusPath = join(root, "status.json");
+      await waitForStandbySettled(statusPath);
+      const firstPrompt = await readFile(join(root, "pi-prompt.log"), "utf8");
+      expect(firstPrompt).toContain(
+        "Budget for this lane: 4 model requests and 100000 seconds.",
+      );
+
+      // The standby turn was request 1. Two tool turns more: the notice fires
+      // at the end of the third turn's tool, when 3 of 4 have been spent.
+      for (const id of ["tool-1", "tool-2"]) {
+        await sendCommand(sockPath, {
+          id,
+          type: "prompt",
+          message: `run silent tool ${id}`,
+        });
+        await waitForStatus(
+          statusPath,
+          (s) => s["state"] === "idle" && s["lastEvent"] === "agent_end",
+        );
+      }
+      await waitForTrace(
+        join(root, "trace.jsonl"),
+        (line) => line["type"] === "budget_notice",
+      );
+      const steers = await readFile(join(root, "pi-steer.log"), "utf8");
+      expect(steers.trim().split("\n")).toHaveLength(1);
+      expect(steers).toContain(
+        "Budget notice from the runner: 3 of 4 requests spent.",
+      );
+      expect(steers).toContain("write your final answer");
+      // The line the second prompt carries is the model's, not the runner's:
+      // the note is appended once, to the first prompt only.
+      const prompts = await readFile(join(root, "pi-prompt.log"), "utf8");
+      expect(prompts.split("Budget for this lane").length).toBe(2);
+      const trace = (await readFile(join(root, "trace.jsonl"), "utf8"))
+        .trim()
+        .split("\n")
+        .map((line) => JSON.parse(line) as Record<string, unknown>);
+      expect(trace.filter((line) => line["type"] === "budget_notice")).toEqual([
+        expect.objectContaining({ name: "requests", used: 3, cap: 4 }),
+      ]);
+
+      await sendCommand(sockPath, { type: "accept" });
+      await waitForExit(runnerProc);
+    } finally {
+      runnerProc.kill();
+    }
+  });
+
+  it("tells the model to finish when three quarters of its window are gone", async () => {
+    const { root, sockPath, runnerProc } = await prepareSupervisedRun(
+      "budget-seconds",
+      "standby",
+      "openai-codex",
+      { budget: { requests: 1_000, inputTokens: 1_000_000, seconds: 1 } },
+    );
+    try {
+      const statusPath = join(root, "status.json");
+      await waitForStandbySettled(statusPath);
+      // Past the whole one-second window before the tool turn, so the
+      // boundary the notice is measured at is on the far side of it.
+      await new Promise((resolve) => setTimeout(resolve, 1_100));
+      await sendCommand(sockPath, {
+        id: "tool-1",
+        type: "prompt",
+        message: "run silent tool",
+      });
+      await waitForTrace(
+        join(root, "trace.jsonl"),
+        (line) =>
+          line["type"] === "budget_notice" && line["name"] === "seconds",
+      );
+      const steers = await readFile(join(root, "pi-steer.log"), "utf8");
+      expect(steers).toMatch(
+        /Budget notice from the runner: \d+ of 1 seconds spent\./,
+      );
+
+      await waitForStatus(
+        statusPath,
+        (s) => s["state"] === "idle" && s["lastEvent"] === "agent_end",
+      );
       await sendCommand(sockPath, { type: "accept" });
       await waitForExit(runnerProc);
     } finally {

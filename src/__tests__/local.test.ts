@@ -45,6 +45,7 @@ import {
   TARGET_UID,
   targetProviderEnv,
 } from "../local";
+import { SESSION_CAPS } from "../provider-budget";
 import { neverReachedModel } from "../swarm";
 
 const temporaryDirectories: string[] = [];
@@ -251,6 +252,9 @@ if [[ "$1" == "cp" ]]; then
   if [[ "$3" == *"/models.json" ]]; then
     /bin/cp "$2" "$root/models.json"
     /bin/cp "$2" "$root/copied-models.json"
+  fi
+  if [[ "$3" == *"/job.json" ]]; then
+    /bin/cp "$2" "$root/copied-job.json"
   fi
   exit 0
 fi
@@ -1313,6 +1317,31 @@ describe("public local CLI lifecycle", () => {
     FAKE_BASE_SHA: revision("%H"),
     WORKERS_AI_API_KEY: "public-cli-secret",
     CLOUDFLARE_ACCOUNT_ID: "account",
+  });
+
+  it("hands the runner the caps and window its budget notice is measured against", async () => {
+    const root = await mkdtemp(join(tmpdir(), "review-pi-cli-"));
+    temporaryDirectories.push(root);
+    const arranged = await arrangeFakeDocker(root);
+    const runId = "budget-in-job";
+    const out = join(root, "out");
+
+    const result = await runLocalCli(
+      [...localArguments(out, runId), "--pi-timeout", "600"],
+      fakeEnvironment(arranged, runId, "success"),
+    );
+    const job = JSON.parse(
+      await readFile(join(arranged.container, "copied-job.json"), "utf8"),
+    ) as Record<string, unknown>;
+
+    expect(result.code, result.output).toBe(0);
+    // The same numbers the broker enforces, so the notice fires before the
+    // cap rather than after a denial nothing can recover from.
+    expect(job["budget"]).toEqual({
+      requests: SESSION_CAPS.t1b.maxRequests,
+      inputTokens: SESSION_CAPS.t1b.maxCumulativeInputTokens,
+      seconds: 600,
+    });
   });
 
   it("accepts a missing optional artifact and requires report plus trace", async () => {
