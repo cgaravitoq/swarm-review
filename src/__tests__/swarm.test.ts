@@ -2599,6 +2599,11 @@ exec /usr/bin/git "$@"
       );
       expect(laneReceipt).toContain('"outcome": "cancelled"');
       expect(laneReceipt).toContain('"containerRemoved": true');
+      // The window the lane ran under, not the cancelling invocation's own
+      // default: the conductor's cancel knows nothing about the lane's clock.
+      expect(JSON.parse(laneReceipt)["deadlineSeconds"]).toBe(
+        lane["laneWindowSeconds"],
+      );
       expect(dockerLog).toContain(
         `rm --force --volumes review-pi-local-${String(lane["runId"])}`,
       );

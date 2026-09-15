@@ -283,6 +283,8 @@ export type RunMetadata = {
   fixturePath?: string;
   checkCommand: string;
   startedAt: string;
+  /** The window this run was launched under, for a receipt another invocation writes. */
+  deadlineSeconds: number;
   supervised: boolean;
   pullRequest?: number;
 };
@@ -2341,7 +2343,7 @@ async function main() {
           failStep: null,
           startedAt: metadata.startedAt,
           finishedAt: new Date().toISOString(),
-          deadlineSeconds: options.totalTimeoutSeconds,
+          deadlineSeconds: metadata.deadlineSeconds,
           wallSeconds: Math.round((teardownBeganAt - startedAt) / 1000),
           teardownSeconds: Math.round((Date.now() - teardownBeganAt) / 1000),
           finalStatus: {
@@ -2773,6 +2775,7 @@ async function main() {
         ...(options.fixturePath ? { fixturePath: options.fixturePath } : {}),
         checkCommand: options.checkCommand,
         startedAt: new Date(startedAt).toISOString(),
+        deadlineSeconds: options.totalTimeoutSeconds,
         supervised: true,
         ...(options.pullRequest ? { pullRequest: options.pullRequest } : {}),
       };
