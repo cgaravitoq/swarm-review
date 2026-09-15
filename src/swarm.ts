@@ -175,9 +175,16 @@ export function parseSwarmOptions(argv: string[]) {
     throw new Error("--pr, or both --head and --base, are required");
   }
   const worker = flag(argv, "worker");
-  const totalTimeoutSeconds = Number(flag(argv, "total-timeout") ?? 600);
+  const sandboxFlag = argv.includes("--sandbox");
+  // A sandbox run is the deep one, and fifteen minutes is the ceiling it is
+  // held to, not the time it is expected to take: five for the verifier, the
+  // teardown every lane owes, and the rest for reviewers that clone, install
+  // and run things.
+  const totalTimeoutSeconds = Number(
+    flag(argv, "total-timeout") ?? (sandboxFlag ? 900 : 600),
+  );
   const verifierReserveSeconds = Number(
-    flag(argv, "verifier-reserve") ?? (worker ? 150 : 200),
+    flag(argv, "verifier-reserve") ?? (worker ? 150 : sandboxFlag ? 300 : 200),
   );
   if (verifierReserveSeconds >= totalTimeoutSeconds) {
     throw new Error("--verifier-reserve must be under --total-timeout");
@@ -228,7 +235,7 @@ export function parseSwarmOptions(argv: string[]) {
   const verifierModel = flag(argv, "verifier-model");
   const verifierThinking = flag(argv, "verifier-thinking");
   const orca = argv.includes("--orca");
-  const sandbox = argv.includes("--sandbox");
+  const sandbox = sandboxFlag;
   const fastFlag = argv.includes("--fast");
   if (orca && worker) {
     throw new Error("--orca and --worker cannot be combined");

@@ -18,6 +18,7 @@ import { fileURLToPath, URL } from "node:url";
 import { afterAll, afterEach, describe, expect, it, vi } from "vitest";
 import { FINALIZE_REQUEST_RESERVE } from "../drive";
 import { CANARY_PROMPT } from "../fast-review";
+import { TEARDOWN_BUDGET_SECONDS } from "../local";
 import { wholeChangeFits } from "../pack-context";
 import { SESSION_CAPS } from "../provider-budget";
 import {
@@ -426,6 +427,28 @@ describe("deterministic lane coverage", () => {
     expect(timeoutIn(argsFor("verifier"))).toBe("200");
     expect(timeoutIn(argsFor("verifier", true))).toBe("500");
     expect(options.totalTimeoutSeconds).toBe(600);
+  });
+
+  it("holds a sandbox run to fifteen minutes unless told otherwise", () => {
+    const sandbox = parseSwarmOptions([
+      "--head",
+      "a".repeat(40),
+      "--base",
+      "b".repeat(40),
+      "--out",
+      "/out",
+      "--sandbox",
+    ]);
+    // Five minutes of verifier, the teardown, and the rest for the reviewers:
+    // the deep run's ceiling, which the budget notice keys three quarters of.
+    expect(sandbox.totalTimeoutSeconds).toBe(900);
+    expect(sandbox.verifierReserveSeconds).toBe(300);
+    expect(laneTimeoutSeconds(laneWindowSeconds(sandbox, 0, "reviewer"))).toBe(
+      900 - 300 - TEARDOWN_BUDGET_SECONDS,
+    );
+    expect(laneTimeoutSeconds(laneWindowSeconds(sandbox, 0, "verifier"))).toBe(
+      300,
+    );
   });
 
   it("refuses to relaunch a lane into a window that cannot host a review", () => {
