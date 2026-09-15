@@ -11,6 +11,8 @@ export const CONTROL_DIR = "/opt/review/control";
 export const MODEL_BROKER = "/opt/review/model-broker.ts";
 export const BROKER_LEDGER = `${CONTROL_DIR}/provider-usage.jsonl`;
 export const RUN_ID_PATTERN = /^[a-z0-9](?:[a-z0-9._-]{0,46}[a-z0-9])?$/i;
+/** One leading, up to 46 inner and one trailing character of RUN_ID_PATTERN. */
+export const RUN_ID_MAX_LENGTH = 48;
 export const CANARY_MAX_BYTES = 16_384;
 const SHA_40 = /^[0-9a-f]{40}$/;
 const SHA_64 = /^[0-9a-f]{64}$/;
