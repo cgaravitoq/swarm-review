@@ -789,6 +789,37 @@ exit 0
     });
   });
 
+  it("installs with bun when the checkout root carries the binary lockfile", async () => {
+    const prepared = await prepareRun("bun-lockb-project", {
+      "package.json": '{"name":"demo"}\n',
+      "bun.lockb": "binary lockfile\n",
+      "index.ts": "export const demo = true;\n",
+    });
+
+    const result = spawnSync("bash", [runnerScript, prepared.run], {
+      encoding: "utf8",
+      env: prepared.env,
+    });
+    const steps = await readSteps(prepared.run);
+    const report = JSON.parse(
+      await readFile(join(prepared.run, "report.json"), "utf8"),
+    );
+
+    expect(result.status).toBe(0);
+    expect(await readFile(prepared.bunArgv, "utf8")).toContain(
+      "install --frozen-lockfile",
+    );
+    expect(steps.find((step) => step["step"] === "install")).toMatchObject({
+      exit: 0,
+      detail: "installed with bun.lockb",
+    });
+    expect(report.install).toEqual({
+      status: "installed",
+      manifest: "bun.lockb",
+      reason: null,
+    });
+  });
+
   it("names the resolver it could not follow instead of installing a foreign tree", async () => {
     const prepared = await prepareRun("npm-project", {
       "package.json": '{"name":"demo"}\n',
