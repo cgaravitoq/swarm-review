@@ -1338,6 +1338,14 @@ const optionalNumber = (
   return typeof value === "number" ? value : null;
 };
 
+const optionalBoolean = (
+  object: Readonly<Record<string, unknown>>,
+  key: string,
+) => {
+  const value = object[key];
+  return typeof value === "boolean" ? value : null;
+};
+
 const recordAt = (
   object: Readonly<Record<string, unknown>>,
   key: string,
@@ -1370,6 +1378,30 @@ export const readStatus = (raw: string) => {
     phase: stringAt(status, "phase", "status.json"),
     state: stringAt(status, "state", "status.json"),
     detail: optionalString(status, "detail") ?? "",
+  };
+};
+
+/**
+ * The install the runner recorded in report.json.
+ *
+ * A skipped install is not a completed one, and a report written before the
+ * runner recorded either observed neither: the first reads true, the second
+ * false, and an install nobody observed reads null rather than as one that ran.
+ */
+const readInstallEvidence = (report: Readonly<Record<string, unknown>>) => {
+  const value = report["install"];
+  const install =
+    typeof value === "object" && value !== null && !Array.isArray(value)
+      ? (value as Readonly<Record<string, unknown>>)
+      : null;
+  const status = install?.["status"];
+  return {
+    skipped:
+      status === "skipped" ? true : status === "installed" ? false : null,
+    reason:
+      status === "skipped" && install
+        ? optionalString(install, "reason")
+        : null,
   };
 };
 
@@ -1410,10 +1442,17 @@ const readReport = (raw: string) => {
         "report.json checkout",
       ),
     },
+    install: readInstallEvidence(report),
     usage,
     piVersion: stringAt(report, "piVersion", "report.json"),
   };
 };
+
+/** The lane's own report, when it wrote one before the run ended. */
+const readExportedReport = (outDir: string) =>
+  readFile(join(outDir, "report.json"), "utf8")
+    .then(readReport)
+    .catch(() => undefined);
 
 /** Optional list of strings on an optional object; anything else reads empty. */
 const stringList = (container: unknown, key: string) => {
@@ -1454,6 +1493,8 @@ export async function readLocalReceipt(directory: string) {
     wallSeconds: numberAt(receipt, "wallSeconds", "local-receipt.json"),
     teardownSeconds: numberAt(receipt, "teardownSeconds", "local-receipt.json"),
     usage: numberRecord(receipt, "usage"),
+    installSkipped: optionalBoolean(receipt, "installSkipped"),
+    installSkipReason: optionalString(receipt, "installSkipReason"),
     truncatedArtifacts: stringList(receipt["shutdown"], "truncatedArtifacts"),
     modelRequests: optionalNumber(receipt, "modelRequests"),
     error: optionalString(receipt, "error"),
@@ -1478,12 +1519,14 @@ export async function readLaneReceipt(directory: string) {
     "receipt.json",
   );
   let usage: Record<string, number> = {};
+  let install: ReturnType<typeof readInstallEvidence> | null = null;
   try {
     const report = jsonObject(
       await readFile(join(directory, "report.json"), "utf8"),
       "report.json",
     );
     usage = numberRecord(report, "usage") ?? {};
+    install = readInstallEvidence(report);
   } catch (error) {
     if (!isMissingFile(error)) throw error;
   }
@@ -1499,6 +1542,8 @@ export async function readLaneReceipt(directory: string) {
     wallSeconds: numberAt(receipt, "wallSeconds", "receipt.json"),
     teardownSeconds: 0,
     usage,
+    installSkipped: install?.skipped ?? null,
+    installSkipReason: install?.reason ?? null,
     truncatedArtifacts: [],
     modelRequests: optionalNumber(receipt, "modelRequests"),
     error: runError,
@@ -2320,6 +2365,7 @@ async function main() {
           shutdown.providerUsage === null
             ? null
             : readLedgerUsage(shutdown.providerUsage);
+        const cancelledReport = await readExportedReport(outDir);
         const receipt = {
           runId: metadata.runId,
           attemptId: metadata.attemptId,
@@ -2327,6 +2373,8 @@ async function main() {
           pullRequest: metadata.pullRequest ?? null,
           requested: metadata.revisions,
           checkoutObserved: null,
+          installSkipped: cancelledReport?.install.skipped ?? null,
+          installSkipReason: cancelledReport?.install.reason ?? null,
           image: metadata.image,
           runnerSha: metadata.runnerSha,
           containerRunnerSha: metadata.containerRunnerSha ?? null,
@@ -3075,9 +3123,7 @@ async function main() {
     const teardownError = `teardown failed: ${teardownErrors.join("; ")}`;
     runError = runError ? `${runError}; ${teardownError}` : teardownError;
   }
-  const parsedReport = await readFile(join(outDir, "report.json"), "utf8")
-    .then(readReport)
-    .catch(() => undefined);
+  const parsedReport = await readExportedReport(outDir);
   const traceValid = await readFile(join(outDir, "trace.jsonl"), "utf8")
     .then((raw) => {
       const lines = raw.split("\n").filter(Boolean);
@@ -3138,6 +3184,8 @@ async function main() {
       base: options.base ? { sha: options.base } : null,
     },
     checkoutObserved: parsedReport?.checkout ?? null,
+    installSkipped: parsedReport?.install.skipped ?? null,
+    installSkipReason: parsedReport?.install.reason ?? null,
     image: { reference: options.image, id: imageId },
     runnerSha,
     containerRunnerSha,
