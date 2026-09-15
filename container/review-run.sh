@@ -488,7 +488,7 @@ function spawnPiChild(isContinue = false) {
     rejectPendingRequests(`Pi process exited with code ${code}, signal ${signal}`);
     if (controlledExits.has(child)) {
       writeStatus();
-    } else if (terminalReason === "auth_blocked" || terminalReason === "quota_blocked") {
+    } else if (["auth_blocked", "quota_blocked", "budget_exhausted"].includes(terminalReason)) {
       state = "blocked";
       writeStatus();
     } else if (["model_error", "process_spawn_error", "stdin_error"].includes(terminalReason)) {
@@ -507,12 +507,22 @@ function spawnPiChild(isContinue = false) {
   return child;
 }
 
+// The broker answers a spent cap with a 429 of its own, which reads like a
+// provider's quota to the regex below and is nothing of the kind: the
+// account has credit, the run's budget does not.
+const brokerDenial = (text) => /review_pi_broker/.test(text);
+
 function checkStderrForBlockers(child, text) {
   if (child !== piChild) return;
   if (/401|403|unauthorized|oauth|invalid_token|expired_token|invalid_api_key|token_expired|authentication_error|jwt expired/i.test(text)) {
     state = "blocked";
     terminalReason = "auth_blocked";
     writeReviewError("auth_blocked", "error", text);
+    writeStatus();
+  } else if (brokerDenial(text)) {
+    state = "blocked";
+    terminalReason = "budget_exhausted";
+    writeReviewError("budget_exhausted", "error", text);
     writeStatus();
   } else if (/429|rate_limit|rate limit|insufficient_quota|resource_exhausted|exceeded your current quota/i.test(text)) {
     state = "blocked";
@@ -654,6 +664,10 @@ function handlePiEvent(child, rawLine) {
       state = "blocked";
       terminalReason = "auth_blocked";
       writeReviewError("auth_blocked", stopReason, errorMessage);
+    } else if (brokerDenial(combinedErr)) {
+      state = "blocked";
+      terminalReason = "budget_exhausted";
+      writeReviewError("budget_exhausted", stopReason, errorMessage);
     } else if (/429|rate_limit|rate limit|insufficient_quota|resource_exhausted|exceeded your current quota/i.test(combinedErr)) {
       state = "blocked";
       terminalReason = "quota_blocked";
@@ -1135,6 +1149,10 @@ validate_review_events() {
   local combined_err="$error_message $(cat "$stderr_source" 2>/dev/null || true)"
   if echo "$combined_err" | grep -qiE '401|403|unauthorized|oauth|invalid_token|expired_token|invalid_api_key|token_expired|authentication_error|jwt expired'; then
     write_review_error auth_blocked "$pi_exit" "$stop_reason" "$error_message"
+    return 1
+  fi
+  if echo "$combined_err" | grep -q 'review_pi_broker'; then
+    write_review_error budget_exhausted "$pi_exit" "$stop_reason" "$error_message"
     return 1
   fi
   if echo "$combined_err" | grep -qiE '429|rate_limit|rate limit|insufficient_quota|resource_exhausted|exceeded your current quota'; then

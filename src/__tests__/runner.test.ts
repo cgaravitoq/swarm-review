@@ -570,6 +570,50 @@ describe("Pi event boundary", () => {
       errorMessage: "Rate limit reached: insufficient_quota",
     });
   });
+
+  it("names the broker's own 429 as the run's budget, not the provider's quota", async () => {
+    // The real confusion: a lane cut at its cumulative token cap was reported
+    // as quota_blocked, and read as an account out of credit.
+    const root = await mkdtemp(join(tmpdir(), "review-pi-events-"));
+    temporaryDirectories.push(root);
+    await writeFile(
+      join(root, "job.json"),
+      JSON.stringify({ runId: "budget-exhausted" }),
+    );
+    await writeFile(join(root, "pi.stderr"), "");
+    const errorMessage =
+      '429 {"type":"review_pi_broker","reason":"max_input_tokens"}';
+    await writeFile(
+      join(root, "pi-raw.jsonl"),
+      `${JSON.stringify({
+        type: "turn_end",
+        message: {
+          stopReason: "error",
+          errorMessage,
+          usage: { input: 0, output: 0, totalTokens: 0 },
+        },
+      })}\n`,
+    );
+    const runner = fileURLToPath(
+      new URL("../../container/review-run.sh", import.meta.url),
+    );
+
+    const result = spawnSync(
+      "bash",
+      ["-c", 'source "$1" "$2"; do_report', "runner-test", runner, root],
+      { encoding: "utf8" },
+    );
+    const evidence = JSON.parse(
+      await readFile(join(root, "review-error.json"), "utf8"),
+    );
+
+    expect(result.status).toBe(1);
+    expect(evidence).toMatchObject({
+      reason: "budget_exhausted",
+      stopReason: "error",
+      errorMessage,
+    });
+  });
 });
 
 /**
@@ -875,6 +919,18 @@ process.stdin.on("data", (chunk) => {
           process.stdout.write(JSON.stringify({
             type: "turn_end",
             message: { stopReason: "error", errorMessage: "429 insufficient_quota" },
+          }) + "\\n");
+          process.stdout.write(JSON.stringify({
+            type: "agent_end",
+            messages: [],
+          }) + "\\n");
+          setTimeout(() => process.exit(1), 10);
+        }, 30);
+      } else if (cmd.message.includes("simulate budget exhausted")) {
+        setTimeout(() => {
+          process.stdout.write(JSON.stringify({
+            type: "turn_end",
+            message: { stopReason: "error", errorMessage: '429 {"type":"review_pi_broker","reason":"max_input_tokens"}' },
           }) + "\\n");
           process.stdout.write(JSON.stringify({
             type: "agent_end",
@@ -1784,6 +1840,30 @@ process.stdin.on("data", (chunk) => {
       await waitForExit(runnerProc);
     } finally {
       runnerProc.kill();
+    }
+  });
+
+  it("keeps a lane the broker cut at its cap blocked as budget_exhausted", async () => {
+    const lane = await prepareSupervisedRun(
+      "budget-exhausted",
+      "simulate budget exhausted",
+    );
+    try {
+      const status = await waitForStatus(
+        join(lane.root, "status.json"),
+        (status) =>
+          status["state"] === "blocked" &&
+          objectValue(status["process"])["alive"] === false,
+      );
+      expect(status["terminalReason"]).toBe("budget_exhausted");
+      const evidence = JSON.parse(
+        await readFile(join(lane.root, "review-error.json"), "utf8"),
+      ) as Record<string, unknown>;
+      expect(evidence["reason"]).toBe("budget_exhausted");
+      await sendCommand(lane.sockPath, { type: "cancel" });
+      await waitForExit(lane.runnerProc);
+    } finally {
+      lane.runnerProc.kill();
     }
   });
 

@@ -260,6 +260,7 @@ const isHtml = (value: string) => /^\s*</.test(value);
 const TERMINAL_PROMPT_FAILURES = new Set([
   "auth_blocked",
   "quota_blocked",
+  "budget_exhausted",
   "model_error",
   "process_exit",
   "process_spawn_error",
