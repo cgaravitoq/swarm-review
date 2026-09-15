@@ -3462,6 +3462,57 @@ await writeFile(
       expect(result.code).toBe(1);
     }, 180_000);
 
+    it("reviews the rest of the change around a file no lane could pack", async () => {
+      const arranged = await arrange("success");
+      const swarmId = "swarm-packed-unpackable";
+      // A fixture whose diff alone is over the budget: packing it would block
+      // the lane on a truncated diff, so it is left out and named instead.
+      const fixture = Array.from({ length: 200 }, () => "QUJD".repeat(19)).join(
+        "\n",
+      );
+      await writeFile(join(arranged.repo, "fixture.json"), `${fixture}\n`);
+      execFileSync("git", ["-C", arranged.repo, "add", "fixture.json"]);
+      commit(arranged.repo, "fixture head");
+      const head = execFileSync(
+        "git",
+        ["-C", arranged.repo, "rev-parse", "HEAD"],
+        { encoding: "utf8" },
+      ).trim();
+      const provider = await fakeProvider(() => completion(answer([])));
+      await pointUpstream(arranged, {
+        "https://api.x.ai/v1": provider.baseUrl,
+      });
+
+      const result = await runSwarm(
+        packedArguments(
+          arranged,
+          swarmId,
+          ["--reviewers", "1", "--pack-budget", "4000"],
+          { head },
+        ),
+        arranged,
+      );
+      const receipt = await readReceipt(arranged.out, swarmId);
+      const lane = reviewerRows(receipt)[0];
+      const coverage = receipt["coverage"] as Record<string, unknown>;
+      const prompt = await readFile(
+        join(arranged.out, swarmId, "prompts", "reviewer-1.txt"),
+        "utf8",
+      );
+
+      expect(lane?.["status"]).toBe("completed");
+      expect(lane?.["assignedFiles"]).not.toContain("fixture.json");
+      expect(prompt).not.toContain("QUJD".repeat(19));
+      expect(coverage["changedFiles"]).toContain("fixture.json");
+      expect(coverage["uncoveredFiles"]).toEqual(["fixture.json"]);
+      expect(coverage["unpackableFiles"]).toMatchObject([
+        { file: "fixture.json" },
+      ]);
+      // Not reviewed is not clean: the run says so and exits accordingly.
+      expect(receipt["status"]).toBe("partial");
+      expect(result.code).toBe(1);
+    }, 180_000);
+
     it("fails the run when the provider rejects the credential", async () => {
       const arranged = await arrange("success");
       const swarmId = "swarm-packed-401";

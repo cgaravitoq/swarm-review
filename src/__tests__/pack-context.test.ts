@@ -7,6 +7,7 @@ import {
   packBudgetChars,
   packLaneContext,
   symbolsFromDiff,
+  unpackableFiles,
   wholeChangeFits,
   wholeChangePack,
 } from "../pack-context";
@@ -108,6 +109,44 @@ describe("packLaneContext", () => {
     expect(packed.truncated).toBe(false);
     expect(packed.pack).toContain("# Diff");
     expect(packed.pack).not.toContain(`export const bulk2999 = ${2999};`);
+  });
+
+  it("names the file whose own diff no lane could hold", async () => {
+    const repo = await mkdtemp(join(tmpdir(), "review-pi-pack-fixture-"));
+    temporary.push(repo);
+    git(repo, ["init"]);
+    git(repo, ["config", "user.email", "t@invalid"]);
+    git(repo, ["config", "user.name", "t"]);
+    await writeFile(join(repo, "small.ts"), "export const small = 1;\n");
+    git(repo, ["add", "."]);
+    git(repo, ["commit", "-m", "base"]);
+    const base = git(repo, ["rev-parse", "HEAD"]).trim();
+    // A fixture landing whole in the diff, the shape of a base64 document
+    // checked in beside the code that reads it.
+    const fixture = Array.from({ length: 200 }, () => "QUJD".repeat(19)).join(
+      "\n",
+    );
+    await writeFile(join(repo, "fixture.json"), `${fixture}\n`);
+    await writeFile(join(repo, "small.ts"), "export const small = 2;\n");
+    git(repo, ["add", "."]);
+    git(repo, ["commit", "-m", "head"]);
+    const head = git(repo, ["rev-parse", "HEAD"]).trim();
+
+    const oversized = unpackableFiles({
+      repo,
+      head,
+      base,
+      files: ["fixture.json", "small.ts"],
+      budget: 4_000,
+    });
+
+    // Past half a lane's budget the diff of one file leaves no room for the
+    // rest of the lane, so it is reported with its size rather than packed.
+    expect(oversized.map((entry) => entry.file)).toEqual(["fixture.json"]);
+    expect(oversized[0]?.diffBytes).toBeGreaterThan(2_000);
+    expect(
+      unpackableFiles({ repo, head, base, files: ["small.ts"], budget: 4_000 }),
+    ).toEqual([]);
   });
 
   it("derives the budget from whichever ceiling binds first", () => {

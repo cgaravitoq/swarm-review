@@ -93,7 +93,11 @@ export type SwarmReceipt = {
   status: string;
   requested: { head: string; base: string; pullRequest: number | null };
   findings: Finding[];
-  coverage?: { changedFiles: string[]; uncoveredFiles: string[] };
+  coverage?: {
+    changedFiles: string[];
+    uncoveredFiles: string[];
+    unpackableFiles?: { file: string; diffBytes: number }[];
+  };
   lanes?: {
     laneId?: string;
     role: string;
@@ -593,6 +597,11 @@ export function buildReview(
   if (receipt.coverage && receipt.coverage.uncoveredFiles.length > 0) {
     summary.push(
       `- not reviewed: ${receipt.coverage.uncoveredFiles.map((file) => `\`${file}\``).join(", ")}`,
+    );
+  }
+  for (const entry of receipt.coverage?.unpackableFiles ?? []) {
+    summary.push(
+      `- too large for one lane: \`${entry.file}\` (${Math.round(entry.diffBytes / 1024)} KB of diff)`,
     );
   }
   // A lane that did not finish is an angle nobody took, even when another

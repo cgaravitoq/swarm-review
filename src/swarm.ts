@@ -69,6 +69,7 @@ import {
 import {
   packBudgetChars,
   packLaneContext,
+  unpackableFiles,
   wholeChangeFits,
 } from "./pack-context";
 import { ADVISORY_SEVERITY, publicationDisposition } from "./publish";
@@ -2100,21 +2101,41 @@ async function main() {
     });
 
     stage = "lane-preparation";
+    const laneBudget = options.fast
+      ? Math.min(
+          ...Array.from({ length: options.reviewerLanes }, (_, index) =>
+            packBudgetFor(packedLaneModel(options, reviewerLaneId(index))),
+          ),
+        )
+      : Number.POSITIVE_INFINITY;
+    // A file no packed lane could hold is left out of every assignment and
+    // named in the coverage, so the lanes review the rest instead of one of
+    // them blocking on it. When nothing would be left, the lanes take the
+    // change as it is and block on the truncated pack, which names every file.
+    const oversized = options.fast
+      ? unpackableFiles({
+          repo: sourceRepo,
+          head,
+          base,
+          files: changedFiles,
+          budget: laneBudget,
+        })
+      : [];
+    const unpackable = oversized.length < changedFiles.length ? oversized : [];
+    const packableFiles = changedFiles.filter(
+      (file) => !unpackable.some((entry) => entry.file === file),
+    );
     const wholeChange =
       options.fast &&
       wholeChangeFits({
         repo: sourceRepo,
         head,
         base,
-        files: changedFiles,
-        budget: Math.min(
-          ...Array.from({ length: options.reviewerLanes }, (_, index) =>
-            packBudgetFor(packedLaneModel(options, reviewerLaneId(index))),
-          ),
-        ),
+        files: packableFiles,
+        budget: laneBudget,
       });
     const assignments = assignLanes(
-      changedFiles,
+      packableFiles,
       options.reviewerLanes,
       wholeChange,
     );
@@ -2169,6 +2190,7 @@ async function main() {
       head,
       base,
       changedFiles,
+      unpackable,
       assignments,
       wholeChange,
       reviewerPrompt,
@@ -2198,6 +2220,7 @@ async function main() {
     head,
     base,
     changedFiles,
+    unpackable,
     assignments,
     wholeChange,
     reviewerPrompt,
@@ -3357,6 +3380,7 @@ async function main() {
       ),
       sharedAssignment: assignments[0]?.shared ?? false,
       uncoveredFiles,
+      unpackableFiles: unpackable,
     },
     lanes: laneRows,
     candidates: deduped,

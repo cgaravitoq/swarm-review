@@ -94,6 +94,26 @@ export function symbolsFromDiff(diff: string) {
   return [...found];
 }
 
+const changeDiff = (
+  input: { repo: string; head: string; base: string },
+  files: readonly string[],
+) => {
+  const fileArgs = files.length > 0 ? ["--", ...files] : [];
+  try {
+    return git(input.repo, [
+      "diff",
+      `${input.base}...${input.head}`,
+      ...fileArgs,
+    ]);
+  } catch {
+    return git(input.repo, [
+      "diff",
+      `${input.base}..${input.head}`,
+      ...fileArgs,
+    ]);
+  }
+};
+
 export function packLaneContext(input: {
   repo: string;
   head: string;
@@ -101,21 +121,7 @@ export function packLaneContext(input: {
   files: readonly string[];
   budget: number;
 }) {
-  const fileArgs = input.files.length > 0 ? ["--", ...input.files] : [];
-  let diff = "";
-  try {
-    diff = git(input.repo, [
-      "diff",
-      `${input.base}...${input.head}`,
-      ...fileArgs,
-    ]);
-  } catch {
-    diff = git(input.repo, [
-      "diff",
-      `${input.base}..${input.head}`,
-      ...fileArgs,
-    ]);
-  }
+  const diff = changeDiff(input, input.files);
   const symbols = symbolsFromDiff(diff);
   const grepLines: string[] = [];
   for (const symbol of symbols) {
@@ -200,6 +206,27 @@ export function packLaneContext(input: {
     bytes: pack.length,
     truncated,
   };
+}
+
+/**
+ * The changed files no lane could pack: a diff that alone takes more than half
+ * a lane's budget leaves no room for the file at head beside it, so the lane
+ * it landed in would block on it and review nothing else. A fixture of that
+ * size is named as not reviewed instead of costing the change its review.
+ */
+export function unpackableFiles(input: {
+  repo: string;
+  head: string;
+  base: string;
+  files: readonly string[];
+  budget: number;
+}) {
+  const oversized: { file: string; diffBytes: number }[] = [];
+  for (const file of input.files) {
+    const diffBytes = changeDiff(input, [file]).length;
+    if (diffBytes > input.budget / 2) oversized.push({ file, diffBytes });
+  }
+  return oversized;
 }
 
 export const wholeChangePack = (input: {

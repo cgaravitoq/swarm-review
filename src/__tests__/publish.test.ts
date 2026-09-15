@@ -395,6 +395,22 @@ describe("summary body", () => {
     expect(body).toContain("- not reviewed: `src/other.ts`");
   });
 
+  it("says why a file too large for any lane was left out", () => {
+    const body = build([finding({ id: "c1", severity: "P2" })], {
+      coverage: {
+        changedFiles: ["src/local.ts", "fixtures/corpus.json"],
+        uncoveredFiles: ["fixtures/corpus.json"],
+        unpackableFiles: [
+          { file: "fixtures/corpus.json", diffBytes: 2_150_400 },
+        ],
+      },
+    });
+    expect(body).toContain("- not reviewed: `fixtures/corpus.json`");
+    expect(body).toContain(
+      "- too large for one lane: `fixtures/corpus.json` (2100 KB of diff)",
+    );
+  });
+
   it("lists every published finding and advisory as a table row linked to the head", () => {
     const body = build([
       finding({ id: "c1", severity: "P2", line: 41 }),
