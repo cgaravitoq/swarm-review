@@ -349,6 +349,14 @@ describe("swarmRunArguments", () => {
   it("gives two instances of one repository different swarm ids", () => {
     expect(swarmIdFor("acme/demo@one")).not.toBe(swarmIdFor("acme/demo@two"));
   });
+
+  it("keeps two long ids that differ past the bound apart instead of truncating them together", () => {
+    const a = "kubernetes__kubernetes-123456@abcdef1";
+    const b = "kubernetes__kubernetes-123456@abcdef2";
+    expect(a.length).toBeGreaterThan(SWARM_ID_MAX_LENGTH);
+    expect(swarmIdFor(a)).not.toBe(swarmIdFor(b));
+    expect(swarmIdFor(a).length).toBeLessThanOrEqual(SWARM_ID_MAX_LENGTH);
+  });
 });
 
 describe("publishedFindings", () => {

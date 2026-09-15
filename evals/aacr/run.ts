@@ -172,9 +172,10 @@ export type GitRunner = (invocation: GitInvocation) => Promise<number>;
 export type SwarmRunner = (args: readonly string[]) => Promise<number>;
 
 /**
- * The swarm derives every lane's run id from the swarm id, and the longest
- * one is a relaunched reviewer lane, so the swarm id has to leave that
- * suffix room inside the run-id contract or the swarm throws at startup.
+ * The swarm derives every lane's run id from the swarm id: the reviewer and
+ * verifier ids are asserted at startup and the relaunch id when a lane is
+ * relaunched. The longest is a relaunched reviewer lane, so bounding the
+ * swarm id by that suffix covers every one of them.
  */
 const LONGEST_LANE_SUFFIX = `-${reviewerLaneId(MAX_REVIEWER_LANES - 1)}-r${LANE_RELAUNCHES + 1}`;
 export const SWARM_ID_MAX_LENGTH =
@@ -184,10 +185,10 @@ export const swarmIdFor = (instanceId: string) => {
   const cleaned = instanceId
     .toLowerCase()
     .replace(/[^a-z0-9]+/g, "-")
-    .replace(/^-+|-+$/g, "")
-    .slice(0, SWARM_ID_MAX_LENGTH)
-    .replace(/-+$/g, "");
-  if (RUN_ID_PATTERN.test(cleaned)) return cleaned;
+    .replace(/^-+|-+$/g, "");
+  if (cleaned.length <= SWARM_ID_MAX_LENGTH && RUN_ID_PATTERN.test(cleaned)) {
+    return cleaned;
+  }
   return `aacr-${createHash("sha256").update(instanceId).digest("hex").slice(0, 16)}`;
 };
 
