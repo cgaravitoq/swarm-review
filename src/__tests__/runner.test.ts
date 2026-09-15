@@ -616,6 +616,207 @@ describe("Pi event boundary", () => {
   });
 });
 
+describe("install across manifests", () => {
+  const runnerScript = fileURLToPath(
+    new URL("../../container/review-run.sh", import.meta.url),
+  );
+
+  /**
+   * A real checkout behind a real remote, plus a fake `pi` that answers one
+   * complete review turn and logs the argv it was given. The run is the
+   * runner's own `main`, so the install step is the one the product takes.
+   */
+  const prepareRun = async (runId: string, files: Record<string, string>) => {
+    const root = await mkdtemp(join(tmpdir(), "review-pi-install-"));
+    temporaryDirectories.push(root);
+    const bin = join(root, "bin");
+    const run = join(root, "run");
+    const source = join(root, "source");
+    const remote = join(root, "origin.git");
+    for (const directory of [bin, run, source]) {
+      await mkdir(directory, { recursive: true });
+    }
+    for (const [name, content] of Object.entries(files)) {
+      await writeFile(join(source, name), content);
+    }
+    execFileSync("git", ["init", "-q", source]);
+    execFileSync("git", ["-C", source, "add", "."]);
+    execFileSync("git", [
+      "-C",
+      source,
+      "-c",
+      "user.name=review-pi-test",
+      "-c",
+      "user.email=review-pi-test@invalid",
+      "commit",
+      "-q",
+      "-m",
+      "base",
+    ]);
+    execFileSync("git", ["clone", "-q", "--bare", source, remote]);
+    const sha = execFileSync("git", ["-C", source, "rev-parse", "HEAD"], {
+      encoding: "utf8",
+    }).trim();
+    await writeFile(
+      join(run, "job.json"),
+      JSON.stringify({
+        runId,
+        gitRemote: remote,
+        head: { sha },
+        base: { sha },
+        fixturePatch: "",
+        prompt: "review this change",
+        provider: "opencode",
+        model: "deepseek-v3.2",
+        thinking: "high",
+        checkCommand: "true",
+        installTimeoutSeconds: 60,
+        piTimeoutSeconds: 60,
+      }),
+    );
+    const piArgv = join(root, "pi-argv");
+    await writeFile(
+      join(bin, "pi"),
+      `#!/bin/bash
+printf '%s\\n' "$*" >> ${piArgv}
+cat <<'PI_EVENTS'
+{"type":"turn_end","message":{"stopReason":"stop","usage":{"input":4,"output":5,"totalTokens":9,"cost":{"total":0}}}}
+{"type":"agent_end","messages":[{"role":"assistant","content":[{"type":"text","text":"VERDICT: clean."}]}]}
+PI_EVENTS
+`,
+    );
+    await chmod(join(bin, "pi"), 0o755);
+    const bunArgv = join(root, "bun-argv");
+    // The real image's Bun refuses a checkout with no package.json, and the run
+    // has to survive that refusal without ever asking it.
+    await writeFile(
+      join(bin, "bun"),
+      `#!/bin/bash
+printf '%s\\n' "$*" >> ${bunArgv}
+if [ "$1" = "--version" ]; then printf '1.4.0\\n'; exit 0; fi
+if [ ! -f package.json ]; then
+  printf 'error: Bun could not find a package.json file to install from\\n' >&2
+  exit 1
+fi
+exit 0
+`,
+    );
+    await chmod(join(bin, "bun"), 0o755);
+    return {
+      root,
+      run,
+      piArgv,
+      bunArgv,
+      env: {
+        ...process.env,
+        PATH: `${bin}:${process.env["PATH"] ?? ""}`,
+      },
+    };
+  };
+
+  const readSteps = async (run: string) =>
+    (await readFile(join(run, "steps.jsonl"), "utf8"))
+      .split("\n")
+      .filter(Boolean)
+      .map((line) => JSON.parse(line) as Record<string, unknown>);
+
+  it("installs nothing and still reaches the model when the checkout is not a Bun project", async () => {
+    const prepared = await prepareRun("non-bun", {
+      "main.go": "package main\n\nfunc main() {}\n",
+    });
+
+    const result = spawnSync("bash", [runnerScript, prepared.run], {
+      encoding: "utf8",
+      env: prepared.env,
+    });
+    const steps = await readSteps(prepared.run);
+    const report = JSON.parse(
+      await readFile(join(prepared.run, "report.json"), "utf8"),
+    );
+    const install = steps.findIndex((step) => step["step"] === "install");
+    const review = steps.findIndex((step) => step["step"] === "review");
+
+    expect(result.status).toBe(0);
+    // The step that used to end the lane now says what it did instead.
+    expect(steps[install]).toMatchObject({
+      step: "install",
+      exit: 0,
+      detail: "skipped: the checkout root has no package.json",
+    });
+    expect(review).toBeGreaterThan(install);
+    expect(steps[review]?.["exit"]).toBe(0);
+    expect(report.install).toEqual({
+      status: "skipped",
+      manifest: null,
+      reason: "the checkout root has no package.json",
+    });
+    // Reaching the review step is only half of it: the reviewer has to have
+    // been handed a prompt, and the install must never have been attempted.
+    expect(await readFile(prepared.piArgv, "utf8")).toContain("--mode json");
+    expect(await readFile(prepared.bunArgv, "utf8")).not.toContain(
+      "install --frozen-lockfile",
+    );
+  });
+
+  it("installs with bun when the checkout root carries a Bun manifest", async () => {
+    const prepared = await prepareRun("bun-project", {
+      "package.json": '{"name":"demo"}\n',
+      "bun.lock": '{"lockfileVersion":1}\n',
+      "index.ts": "export const demo = true;\n",
+    });
+
+    const result = spawnSync("bash", [runnerScript, prepared.run], {
+      encoding: "utf8",
+      env: prepared.env,
+    });
+    const steps = await readSteps(prepared.run);
+    const report = JSON.parse(
+      await readFile(join(prepared.run, "report.json"), "utf8"),
+    );
+
+    expect(result.status).toBe(0);
+    expect(await readFile(prepared.bunArgv, "utf8")).toContain(
+      "install --frozen-lockfile",
+    );
+    expect(steps.find((step) => step["step"] === "install")).toMatchObject({
+      exit: 0,
+      detail: "installed with bun.lock",
+    });
+    expect(report.install).toEqual({
+      status: "installed",
+      manifest: "bun.lock",
+      reason: null,
+    });
+  });
+
+  it("names the resolver it could not follow instead of installing a foreign tree", async () => {
+    const prepared = await prepareRun("npm-project", {
+      "package.json": '{"name":"demo"}\n',
+      "package-lock.json": '{"lockfileVersion":3}\n',
+      "index.js": "module.exports = true;\n",
+    });
+
+    const result = spawnSync("bash", [runnerScript, prepared.run], {
+      encoding: "utf8",
+      env: prepared.env,
+    });
+    const report = JSON.parse(
+      await readFile(join(prepared.run, "report.json"), "utf8"),
+    );
+
+    expect(result.status).toBe(0);
+    expect(report.install).toEqual({
+      status: "skipped",
+      manifest: null,
+      reason:
+        "the checkout root has a package.json and no bun lockfile (found package-lock.json)",
+    });
+    expect(await readFile(prepared.bunArgv, "utf8")).not.toContain(
+      "install --frozen-lockfile",
+    );
+  });
+});
+
 /**
  * The suite spawns eighteen supervised runners beside twenty other files that
  * each spawn real processes, so a wait on one of them competes with all of
