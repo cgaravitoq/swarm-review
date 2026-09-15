@@ -645,6 +645,7 @@ describe("supervised native Pi RPC lifecycle", { timeout: 120_000 }, () => {
     initialPrompt: string | null = "standby",
     provider = "openai-codex",
     jobExtra: Record<string, unknown> = {},
+    piEnv: Record<string, string> = {},
   ) => {
     const root = await mkdtemp(join(tmpdir(), "review-pi-supervised-"));
     temporaryDirectories.push(root);
@@ -726,6 +727,7 @@ if (!/^[A-Za-z0-9](?:[A-Za-z0-9._-]*[A-Za-z0-9])?$/.test(sessionId)) {
   process.stderr.write("fake-pi error: invalid session id " + sessionId + "\\n");
   process.exit(2);
 }
+let stateAnswers = 0;
 if (process.env.PI_ARGS_LOG) {
   fs.appendFileSync(process.env.PI_ARGS_LOG, JSON.stringify(args) + "\\n");
 }
@@ -782,7 +784,9 @@ process.stdin.on("data", (chunk) => {
     const cmdId = cmd.id;
 
     if (cmd.type === "get_state") {
-      process.stdout.write(JSON.stringify({
+      const delay = stateAnswers === 0 ? Number(process.env.PI_STATE_DELAY_MS || 0) : 0;
+      stateAnswers += 1;
+      setTimeout(() => process.stdout.write(JSON.stringify({
         id: cmdId,
         type: "response",
         command: "get_state",
@@ -793,7 +797,7 @@ process.stdin.on("data", (chunk) => {
           isStreaming: false,
           messageCount: 0,
         },
-      }) + "\\n");
+      }) + "\\n"), delay);
     } else if (cmd.type === "steer") {
       if (process.env.PI_STEER_LOG) {
         fs.appendFileSync(process.env.PI_STEER_LOG, cmd.message + "\\n");
@@ -1056,6 +1060,7 @@ process.stdin.on("data", (chunk) => {
         PI_STEER_LOG: join(root, "pi-steer.log"),
         PI_PROMPT_LOG: join(root, "pi-prompt.log"),
         PI_DESCENDANT_PID: join(root, "descendant.pid"),
+        ...piEnv,
       },
       stdio: ["ignore", "pipe", "pipe"],
     });
@@ -1561,6 +1566,45 @@ process.stdin.on("data", (chunk) => {
         statusPath,
         (s) => s["state"] === "idle" && s["lastEvent"] === "agent_end",
       );
+      await sendCommand(sockPath, { type: "accept" });
+      await waitForExit(runnerProc);
+    } finally {
+      runnerProc.kill();
+    }
+  });
+
+  it("settles a promptless lane idle when the child's first state answer outlives the init wait", async () => {
+    // The bridge waits five seconds for Pi's first state and a lane with no
+    // prompt has nothing else to move it: the 2026-09-15 sandbox verifier
+    // stayed "running" with an idle child for the whole run and was never
+    // briefed. The answer settles the state whenever it arrives.
+    const { root, sockPath, runnerProc } = await prepareSupervisedRun(
+      "late-first-state",
+      null,
+      "openai-codex",
+      {},
+      { PI_STATE_DELAY_MS: "6000" },
+    );
+    try {
+      const statusPath = join(root, "status.json");
+      const early = await waitForStatus(
+        statusPath,
+        (s) => objectValue(s["process"])["alive"] === true,
+      );
+      expect(early["state"]).toBe("running");
+      const settled = await waitForStatus(
+        statusPath,
+        (s) => s["childIdle"] === true,
+        10_000,
+      );
+      expect(settled["state"]).toBe("idle");
+
+      await sendCommand(sockPath, {
+        id: "brief",
+        type: "prompt",
+        message: "standby",
+      });
+      await waitForStandbySettled(statusPath);
       await sendCommand(sockPath, { type: "accept" });
       await waitForExit(runnerProc);
     } finally {

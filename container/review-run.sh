@@ -577,6 +577,10 @@ function handlePiEvent(child, rawLine) {
         };
         isStreaming = event.data.isStreaming === true;
         childIdle = !isStreaming;
+        // A lane with no prompt yet is idle the moment the child says so,
+        // however late the answer: a briefed lane waits on this state, and a
+        // start that outlives the init wait must not leave it running forever.
+        if (activeAttempt === 0) state = childIdle ? "idle" : "running";
         writeStatus();
       } else {
         appendStderr("get_state reported failure or invalid data\n");
@@ -1032,8 +1036,6 @@ server.listen(sockPath, async () => {
 
   try {
     await sendCommandToPi({ id: "init-state", type: "get_state" }, 5000);
-    state = childIdle ? "idle" : "running";
-    writeStatus();
   } catch {}
 
   if (fs.existsSync(promptPath)) {
