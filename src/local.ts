@@ -175,9 +175,14 @@ export function parseOptions(argv: string[]) {
   if (!isControlAction && !pullRequest && !(head && base)) {
     throw new Error("--pr, or both --head and --base, are required");
   }
-  const promptPath = isControlAction
-    ? (flag(argv, "prompt") ?? "")
-    : required(argv, "prompt");
+  // A briefed lane starts with no prompt and idles in its prepared checkout
+  // until the conductor writes one: the verifier that clones beside the
+  // reviewers instead of after them.
+  const briefPath = flag(argv, "brief");
+  const promptPath =
+    isControlAction || briefPath
+      ? (flag(argv, "prompt") ?? "")
+      : required(argv, "prompt");
 
   const rawRole = flag(argv, "role");
   let role: "single" | "reviewer" | "verifier" = "single";
@@ -211,6 +216,7 @@ export function parseOptions(argv: string[]) {
     ...(head ? { head } : {}),
     ...(base ? { base } : {}),
     promptPath,
+    ...(briefPath ? { briefPath } : {}),
     ...(flag(argv, "context") ? { contextPath: flag(argv, "context") } : {}),
     role,
     candidateIds,
@@ -2500,7 +2506,9 @@ async function main() {
         .update(runner)
         .digest("hex");
       runnerSha = currentRunnerSha;
-      const prompt = await readFile(options.promptPath, "utf8");
+      const prompt = options.briefPath
+        ? ""
+        : await readFile(options.promptPath, "utf8");
       // Pi loads the first context file in the checkout root, which would
       // otherwise be the repo's contributor guide. A reviewer gets a
       // role-appropriate override built from this versioned fragment, or from
@@ -2796,6 +2804,9 @@ async function main() {
 
     let reported = "";
     let activityLine = 1;
+    let briefed = !options.briefPath;
+    const childIdleOf = (data: Record<string, unknown>) =>
+      Boolean(data["childIdle"]);
     while (!interrupted) {
       await sleep(1000, undefined, { signal: controller.signal });
       let inspectRes: Record<string, unknown> | undefined;
@@ -2869,7 +2880,50 @@ async function main() {
 
       if (curState === "cancelled") {
         runError = "cancelled";
+        runnerTerminalReason = String(data["terminalReason"] ?? "cancelled");
         break;
+      }
+      // The brief lands once Pi is up and idle; before that the container is
+      // still cloning or installing. A null brief is the conductor saying
+      // there is nothing to rule on, and the lane ends unused.
+      if (
+        options.briefPath &&
+        !briefed &&
+        curState === "idle" &&
+        childIdleOf(data)
+      ) {
+        const { readLaneBrief } = await import("./drive");
+        const brief = await readLaneBrief(options.briefPath);
+        if (brief?.prompt === null) {
+          await sendBridgeCommand(
+            containerName,
+            containerRunDir,
+            { type: "cancel", reason: "no_candidates" },
+            budget,
+            controller.signal,
+          );
+          briefed = true;
+          continue;
+        }
+        if (brief) {
+          const promptRes = await sendBridgeCommand(
+            containerName,
+            containerRunDir,
+            { type: "prompt", message: brief.prompt },
+            budget,
+            controller.signal,
+          );
+          if (!promptRes["success"]) {
+            runError = `brief rejected: ${String(promptRes["error"] ?? "prompt_rejected")}`;
+            break;
+          }
+          activeCandidateIds = brief.candidateIds;
+          briefed = true;
+          console.log(
+            `${new Date().toISOString()} brief sent (${brief.candidateIds.length} candidates)`,
+          );
+          continue;
+        }
       }
       if (curState === "failed") {
         const reason = String(

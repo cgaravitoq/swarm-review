@@ -1825,7 +1825,16 @@ export const laneArguments = (
     // wrapped in, and the receipt quotes it back from the lane's own state.
     String(laneTimeoutSeconds(totalSeconds)),
     "--pi-timeout",
-    String(Math.max(30, Math.floor(totalSeconds * 0.7))),
+    // A briefed lane idles until its brief arrives, so its model time is the
+    // reserve it was given, not the window it waits in.
+    String(
+      Math.max(
+        30,
+        Math.floor(
+          (lane?.brief ? options.verifierReserveSeconds : totalSeconds) * 0.7,
+        ),
+      ),
+    ),
     ...(options.fixturePath ? ["--fixture", options.fixturePath] : []),
     ...(provider ? ["--provider", provider] : []),
     ...(model ? ["--model", model] : []),
@@ -2615,7 +2624,11 @@ async function main() {
   // reviews instead of following them. Its clock starts with theirs, so its
   // window is the run the reviewers did not use, on top of its own reserve.
   let warmVerifier: Promise<number> | null = null;
-  if (options.worker && !fastUpstream && !controller.signal.aborted) {
+  if (
+    (options.worker || options.sandbox) &&
+    !fastUpstream &&
+    !controller.signal.aborted
+  ) {
     verifierSession = await sessions.start({
       laneId: "verifier",
       role: "verifier",
@@ -3058,8 +3071,12 @@ async function main() {
       });
     }
     // The packed verifier calls the provider from this process, so its window
-    // is the reservation the cold path would have been given.
-    verifierWindowSeconds = laneTimeoutSeconds(laneWindow("verifier"));
+    // is the reservation the cold path would have been given. A warm lane's
+    // container is already running under the window it was started with, and
+    // the receipt keeps that one.
+    if (!warmVerifier) {
+      verifierWindowSeconds = laneTimeoutSeconds(laneWindow("verifier"));
+    }
     let exitCode = fastUpstream
       ? verifierCanaryError
         ? 1

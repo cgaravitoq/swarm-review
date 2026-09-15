@@ -1879,6 +1879,7 @@ set -u
 state="\${FAKE_STATE:?}"
 root="\${FAKE_CONTAINER_ROOT:?}"
 joined=" $* "
+echo "$*" >> "$state/docker.log"
 if [[ "$1" == "ps" ]]; then exit 0; fi
 if [[ "$1 $2" == "image inspect" ]]; then echo sha256:fake-image; exit 0; fi
 if [[ "$1" == "run" && "$joined" == *" --rm "* ]]; then
@@ -1923,6 +1924,12 @@ if [[ "$joined" == *" --detach "* ]]; then
   if [[ "\${FAKE_MODE:-}" == "hang" ]]; then exit 0; fi
   target="$root/$runid"
   mkdir -p "$target"
+  # A verifier starts warm: it idles with no prompt until its brief is sent
+  # over the bridge, and only answers once that prompt has arrived.
+  if [[ "$runid" == *-verifier ]]; then
+    date +%s%N > "$target/awaiting-brief"
+    exit 0
+  fi
   printf '{"runId":"%s","phase":"complete","state":"done","detail":""}\\n' "$runid" > "$target/status.json"
   cp "\${FAKE_REPORTS:?}/$runid.json" "$target/report.json"
   printf '{"type":"turn_end","stopReason":"stop"}\\n' > "$target/trace.jsonl"
@@ -1943,8 +1950,23 @@ if [[ "$1" == "exec" && "$joined" == *" --send "* ]]; then
   rundir=$(printf '%s' "$joined" | grep -o '/workspace/runs/[A-Za-z0-9._-]*' | head -1)
   runid="\${rundir##*/}"
   case "$cmd_type" in
+    prompt)
+      if [[ -f "$root/$runid/awaiting-brief" ]]; then
+        /bin/rm -f "$root/$runid/awaiting-brief"
+        printf '%s' "$payload" > "$root/$runid/brief-prompt.json"
+        printf '{"runId":"%s","phase":"complete","state":"done","detail":""}\\n' "$runid" > "$root/$runid/status.json"
+        cp "\${FAKE_REPORTS:?}/$runid.json" "$root/$runid/report.json"
+        printf '{"type":"turn_end","stopReason":"stop"}\\n' > "$root/$runid/trace.jsonl"
+      fi
+      printf '{"type":"response","command":"prompt","success":true,"data":{}}\\n'
+      exit 0
+      ;;
     inspect)
-      if [[ -f "$root/$runid/status.json" ]]; then
+      if [[ -f "$root/$runid/awaiting-brief" ]]; then
+        printf '{"type":"response","command":"inspect","success":true,"data":{"runId":"%s","phase":"review","state":"idle","detail":"","childIdle":true,"isStreaming":false,"inFlightTool":null,"terminalReason":"","lastCandidateResult":null,"process":{"alive":true,"pid":4242},"session":{"sessionId":"fake-session","sessionFile":"/dev/null"}}}\\n' "$runid"
+      elif [[ -f "$root/$runid/cancelled" ]]; then
+        printf '{"type":"response","command":"inspect","success":true,"data":{"runId":"%s","phase":"review","state":"cancelled","detail":"","childIdle":true,"isStreaming":false,"inFlightTool":null,"terminalReason":"no_candidates","lastCandidateResult":null,"process":{"alive":false,"pid":4242},"session":{"sessionId":"fake-session","sessionFile":"/dev/null"}}}\\n' "$runid"
+      elif [[ -f "$root/$runid/status.json" ]]; then
         printf '{"type":"response","command":"inspect","success":true,"data":{"runId":"%s","phase":"review","state":"done","detail":"","childIdle":true,"isStreaming":false,"inFlightTool":null,"terminalReason":"","lastCandidateResult":null,"process":{"alive":false,"pid":4242},"session":{"sessionId":"fake-session","sessionFile":"/dev/null"}}}\\n' "$runid"
       else
         printf '{"type":"response","command":"inspect","success":true,"data":{"runId":"%s","phase":"review","state":"running","detail":"","childIdle":false,"isStreaming":true,"inFlightTool":"tool-1","terminalReason":"","lastCandidateResult":null,"process":{"alive":true,"pid":4242},"session":{"sessionId":"fake-session","sessionFile":"/dev/null"}}}\\n' "$runid"
@@ -1952,6 +1974,10 @@ if [[ "$1" == "exec" && "$joined" == *" --send "* ]]; then
       exit 0
       ;;
     cancel)
+      if [[ -f "$root/$runid/awaiting-brief" ]]; then
+        /bin/rm -f "$root/$runid/awaiting-brief"
+        touch "$root/$runid/cancelled"
+      fi
       printf '{"type":"response","command":"cancel","success":true,"data":{}}\\n'
       exit 0
       ;;
@@ -2263,6 +2289,100 @@ exec /usr/bin/git "$@"
     expect(result.output).not.toContain("swarm-test-secret");
   }, 120_000);
 
+  it("starts the sandbox verifier beside the reviewers and briefs it once the candidates are frozen", async () => {
+    // A cold verifier pays its clone and install after the reviewers are done,
+    // on the run's critical path. Warm, it idles in its prepared checkout and
+    // is handed the candidates the moment they exist.
+    const arranged = await arrange("success");
+    const swarmId = "swarm-warm-verifier";
+    await writeReport(arranged, `${swarmId}-reviewer-1`, answer([finding()]));
+    await writeReport(arranged, `${swarmId}-reviewer-2`, answer([]));
+    await writeReport(
+      arranged,
+      `${swarmId}-verifier`,
+      fenced({
+        verdicts: [
+          {
+            id: "c1",
+            status: "confirmed",
+            evidenceStrength: "static",
+            reason: "the source matches",
+          },
+        ],
+      }),
+    );
+
+    const result = await runSwarm(swarmArguments(arranged, swarmId), arranged);
+    const receipt = await readReceipt(arranged.out, swarmId);
+    const verifierJob = JSON.parse(
+      await readFile(
+        join(arranged.state, "jobs", `${swarmId}-verifier.json`),
+        "utf8",
+      ),
+    ) as Record<string, unknown>;
+    const briefPrompt = JSON.parse(
+      await readFile(
+        join(
+          arranged.env.FAKE_CONTAINER_ROOT,
+          `${swarmId}-verifier`,
+          "brief-prompt.json",
+        ),
+        "utf8",
+      ),
+    ) as Record<string, unknown>;
+
+    expect(result.code, result.output).toBe(0);
+    expect(receipt["status"]).toBe("completed");
+    // The lane started with no prompt at all, and the prompt it was later
+    // handed over the bridge is the verifier's, naming the frozen candidate.
+    expect(verifierJob["prompt"]).toBe("");
+    expect(briefPrompt["type"]).toBe("prompt");
+    expect(String(briefPrompt["message"])).toContain('"id": "c1"');
+    const findings = receipt["findings"] as Record<string, unknown>[];
+    expect(findings.map((entry) => entry["status"])).toEqual(["confirmed"]);
+    const verifier = (receipt["lanes"] as Record<string, unknown>[]).find(
+      (lane) => lane["role"] === "verifier",
+    );
+    expect(verifier?.["status"]).toBe("completed");
+    // Its window is the run the reviewers did not use on top of its reserve,
+    // measured when it started, and the receipt keeps that one rather than
+    // the cold reservation no container ran under.
+    expect(verifier?.["laneWindowSeconds"]).toBeGreaterThan(300 - 100 - 90);
+    expect(verifier?.["laneWindowSeconds"]).toBeLessThanOrEqual(
+      300 - 100 - 90 + 100,
+    );
+  }, 120_000);
+
+  it("tells a warm sandbox verifier with nothing to rule on to stand down and removes it", async () => {
+    const arranged = await arrange("success");
+    const swarmId = "swarm-warm-idle";
+    await writeReport(arranged, `${swarmId}-reviewer-1`, answer([]));
+    await writeReport(arranged, `${swarmId}-reviewer-2`, answer([]));
+    await writeReport(arranged, `${swarmId}-verifier`, answer([]));
+
+    const result = await runSwarm(swarmArguments(arranged, swarmId), arranged);
+    const receipt = await readReceipt(arranged.out, swarmId);
+    const dockerLog = await readFile(
+      join(arranged.state, "docker.log"),
+      "utf8",
+    );
+
+    expect(result.code, result.output).toBe(0);
+    expect(receipt["status"]).toBe("completed");
+    const verifier = (receipt["lanes"] as Record<string, unknown>[]).find(
+      (lane) => lane["role"] === "verifier",
+    );
+    expect(verifier?.["status"]).toBe("not_run");
+    // The null brief reached the lane as a cancel, and the container it was
+    // idling in did not outlive the run.
+    expect(dockerLog).toMatch(
+      /--send \{"type":"cancel","reason":"no_candidates"\}/,
+    );
+    expect(dockerLog).toContain(
+      `rm --force --volumes review-pi-local-${swarmId}-verifier`,
+    );
+  }, 120_000);
+
   it("reports partial rather than clean when a reviewer answers off-contract", async () => {
     const arranged = await arrange("success");
     const swarmId = "swarm-malformed";
@@ -2410,17 +2530,21 @@ exec /usr/bin/git "$@"
         join(arranged.state, "started.log"),
         "utf8",
       ).catch(() => "");
-      if (started.trim().split("\n").filter(Boolean).length >= REVIEWER_LANES) {
+      if (
+        started.trim().split("\n").filter(Boolean).length >=
+        REVIEWER_LANES + 1
+      ) {
         break;
       }
       await new Promise((resolvePromise) => setTimeout(resolvePromise, 100));
     }
     // Interrupting after the first lane starts would tear down a second one
     // that had not reached its review yet, and the point here is what happens
-    // to a lane that did: every lane the run owns has to be running first.
+    // to a lane that did: every lane the run owns, the warm verifier
+    // included, has to be running first.
     const started = await readFile(join(arranged.state, "started.log"), "utf8");
     expect(started.trim().split("\n").filter(Boolean)).toHaveLength(
-      REVIEWER_LANES,
+      REVIEWER_LANES + 1,
     );
     const exited = new Promise<number>((resolvePromise) => {
       child.once("close", (code) => resolvePromise(code ?? 1));
@@ -2549,6 +2673,7 @@ exec /usr/bin/git "$@"
     expect(started.trim().split("\n").sort()).toEqual([
       `${swarmId}-reviewer-1`,
       `${swarmId}-reviewer-2`,
+      `${swarmId}-verifier`,
     ]);
   }, 180_000);
 
@@ -2657,10 +2782,14 @@ exec /usr/bin/git "$@"
 
     expect(result.code, result.output).toBe(0);
     expect(receipt["outcome"]).toBe("no_candidates");
-    // It decided nothing because it saw nothing, and it never ran at all.
+    // It decided nothing because it saw nothing: its container warmed up
+    // beside the reviewers, but no prompt ever reached it.
     expect(verifier?.["status"]).toBe("not_run");
-    expect(verifier?.["piSessionId"]).toBeNull();
-    expect(started).not.toContain(`${swarmId}-verifier`);
+    expect(started).toContain(`${swarmId}-verifier`);
+    const sessions = receipt["piSessions"] as Record<string, unknown>[];
+    expect(
+      sessions.find((session) => session["laneId"] === "verifier"),
+    ).toMatchObject({ status: "not_run", outcome: null });
   }, 180_000);
 
   it("links every nested pi session to the attempt and starts each one once", async () => {
