@@ -25,6 +25,7 @@ import {
   runAacrCase,
   runAacrSuite,
   SWARM_ID_MAX_LENGTH,
+  selectCases,
   swarmIdFor,
   swarmRunArguments,
   USAGE,
@@ -737,6 +738,53 @@ describe("runAacrSuite", () => {
         { runGit: gitRecorder().runGit },
       ),
     ).rejects.toThrow(/names no case: nope/);
+  });
+});
+
+describe("selectCases", () => {
+  const cases = ["a", "b", "c", "d"].map((id) => ({
+    ...ENTRY,
+    instanceId: `acme__demo-${id}@abc1234`,
+  }));
+  const ids = (selected: readonly { instanceId: string }[]) =>
+    selected.map((entry) => entry.instanceId);
+
+  it("keeps exactly the --instance cases, in file order", () => {
+    expect(
+      ids(
+        selectCases(cases, {
+          instances: ["acme__demo-d@abc1234", "acme__demo-b@abc1234"],
+        }),
+      ),
+    ).toEqual(["acme__demo-b@abc1234", "acme__demo-d@abc1234"]);
+  });
+
+  it("refuses an --instance the dataset does not hold", () => {
+    expect(() =>
+      selectCases(cases, { instances: ["acme__demo-b@abc1234", "nope"] }),
+    ).toThrow(/names no case: nope/);
+  });
+
+  it("keeps the first --limit cases in file order", () => {
+    expect(ids(selectCases(cases, { limit: 2 }))).toEqual([
+      "acme__demo-a@abc1234",
+      "acme__demo-b@abc1234",
+    ]);
+  });
+
+  it("applies --limit after --instance", () => {
+    expect(
+      ids(
+        selectCases(cases, {
+          limit: 2,
+          instances: [
+            "acme__demo-d@abc1234",
+            "acme__demo-c@abc1234",
+            "acme__demo-a@abc1234",
+          ],
+        }),
+      ),
+    ).toEqual(["acme__demo-a@abc1234", "acme__demo-c@abc1234"]);
   });
 });
 
