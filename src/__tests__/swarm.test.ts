@@ -2187,7 +2187,16 @@ exec /usr/bin/git "$@"
 
   type Arranged = Awaited<ReturnType<typeof arrange>>;
 
-  const writeReport = (arranged: Arranged, runId: string, finalText: string) =>
+  const writeReport = (
+    arranged: Arranged,
+    runId: string,
+    finalText: string,
+    install: Record<string, unknown> = {
+      status: "installed",
+      manifest: "bun.lock",
+      reason: null,
+    },
+  ) =>
     writeFile(
       join(arranged.reports, `${runId}.json`),
       JSON.stringify({
@@ -2199,6 +2208,7 @@ exec /usr/bin/git "$@"
           checkedOutBase: arranged.base,
           fixtureCommitApplied: "false",
         },
+        install,
         usage: { totalTokens: 7 },
         piVersion: "0.85.0",
         finalText,
@@ -2400,6 +2410,53 @@ exec /usr/bin/git "$@"
     expect(verifier?.["laneWindowSeconds"]).toBeLessThanOrEqual(
       300 - 100 - 90 + 100,
     );
+  }, 120_000);
+
+  it("carries a skipped install into the swarm receipt without marking the lanes that installed", async () => {
+    const arranged = await arrange("success");
+    const swarmId = "swarm-install";
+    await writeReport(arranged, `${swarmId}-reviewer-1`, answer([finding()]), {
+      status: "skipped",
+      manifest: null,
+      reason: "the checkout root has no package.json",
+    });
+    await writeReport(arranged, `${swarmId}-reviewer-2`, answer([]));
+    await writeReport(
+      arranged,
+      `${swarmId}-verifier`,
+      fenced({
+        verdicts: [
+          {
+            id: "c1",
+            status: "confirmed",
+            evidenceStrength: "static",
+            reason: "the source matches",
+          },
+        ],
+      }),
+    );
+
+    const result = await runSwarm(swarmArguments(arranged, swarmId), arranged);
+    const receipt = await readReceipt(arranged.out, swarmId);
+    const lanes = receipt["lanes"] as Record<string, unknown>[];
+    const lane = (id: string) => lanes.find((entry) => entry["laneId"] === id);
+
+    expect(result.code, result.output).toBe(0);
+    // The swarm receipt is what a verifier or a human reads: a lane that ran
+    // without dependencies has to be readable there, and a lane that installed
+    // must not inherit the same mark.
+    expect(lane("reviewer-1")).toMatchObject({
+      installSkipped: true,
+      installSkipReason: "the checkout root has no package.json",
+    });
+    expect(lane("reviewer-2")).toMatchObject({
+      installSkipped: false,
+      installSkipReason: null,
+    });
+    expect(lane("verifier")).toMatchObject({
+      installSkipped: false,
+      installSkipReason: null,
+    });
   }, 120_000);
 
   it("tells a warm sandbox verifier with nothing to rule on to stand down and removes it", async () => {
@@ -2623,6 +2680,12 @@ exec /usr/bin/git "$@"
       );
       expect(laneReceipt).toContain('"outcome": "cancelled"');
       expect(laneReceipt).toContain('"containerRemoved": true');
+      // The lane died before the runner reported, so its install is
+      // unobserved on both the lane receipt and the swarm's row for it.
+      expect(JSON.parse(laneReceipt)["installSkipped"]).toBeNull();
+      expect(JSON.parse(laneReceipt)["installSkipReason"]).toBeNull();
+      expect(lane["installSkipped"]).toBeNull();
+      expect(lane["installSkipReason"]).toBeNull();
       // The window the lane ran under, not the cancelling invocation's own
       // default: the conductor's cancel knows nothing about the lane's clock.
       expect(JSON.parse(laneReceipt)["deadlineSeconds"]).toBe(

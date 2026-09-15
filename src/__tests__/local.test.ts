@@ -312,7 +312,11 @@ if [[ "$joined" == *" --detach "* ]]; then
     observed_head=0000000000000000000000000000000000000000
   fi
   printf '{"runId":"%s","phase":"complete","state":"done","detail":""}\\n' "\${FAKE_RUN_ID:?}" > "$root/status.json"
-  printf '{"checkout":{"commitIdentityPreserved":true,"requestedHeadSha":"%s","requestedBaseSha":"%s","checkedOutHead":"%s","checkedOutBase":"%s","fixtureCommitApplied":"%s"},"usage":{"totalTokens":1},"piVersion":"0.85.0","finalText":"VERDICT: safe. CONSUMERS READ: none. CHECK RUN: bun test, exit 0."}\\n' "\${FAKE_HEAD_SHA:?}" "\${FAKE_BASE_SHA:?}" "$observed_head" "$observed_base" "$fixture_applied" > "$root/report.json"
+  printf '{"checkout":{"commitIdentityPreserved":true,"requestedHeadSha":"%s","requestedBaseSha":"%s","checkedOutHead":"%s","checkedOutBase":"%s","fixtureCommitApplied":"%s"},"install":{"status":"installed","manifest":"bun.lock","reason":null},"usage":{"totalTokens":1},"piVersion":"0.85.0","finalText":"VERDICT: safe. CONSUMERS READ: none. CHECK RUN: bun test, exit 0."}\\n' "\${FAKE_HEAD_SHA:?}" "\${FAKE_BASE_SHA:?}" "$observed_head" "$observed_base" "$fixture_applied" > "$root/report.json"
+  if [ "$FAKE_MODE" = "install-skipped" ]; then
+    jq '.install={status:"skipped",manifest:null,reason:"the checkout root has no package.json"}' "$root/report.json" > "$root/report.json.tmp"
+    mv "$root/report.json.tmp" "$root/report.json"
+  fi
   printf '{"type":"turn_end","stopReason":"stop"}\\n' > "$root/trace.jsonl"
   if [[ "\${FAKE_MODE:-}" == "oversize-trace" ]]; then
     head -c 600000 /dev/zero | tr '\\0' 'x' >> "$root/trace.jsonl"
@@ -1278,14 +1282,45 @@ describe("deadline and redaction", () => {
     );
     await writeFile(
       join(directory, "report.json"),
-      JSON.stringify({ usage: { input: 9, output: 2 } }),
+      JSON.stringify({
+        usage: { input: 9, output: 2 },
+        install: {
+          status: "skipped",
+          manifest: null,
+          reason: "the checkout root has no package.json",
+        },
+      }),
     );
     await expect(readLaneReceipt(directory)).resolves.toMatchObject({
       runId: "lane-1",
       attemptId: "lane-1",
       outcome: "completed",
       usage: { input: 9, output: 2 },
+      installSkipped: true,
+      installSkipReason: "the checkout root has no package.json",
     });
+  });
+
+  it("leaves the install unobserved when the cloud lane wrote no report", async () => {
+    const directory = join(tmpdir(), `review-pi-no-report-${Date.now()}`);
+    await mkdir(directory);
+    temporaryDirectories.push(directory);
+    await writeFile(
+      join(directory, "receipt.json"),
+      JSON.stringify({
+        runId: "lane-1",
+        provider: "xai",
+        model: "grok-4.6",
+        wallSeconds: 12,
+        runError: "killed at clone",
+      }),
+    );
+    const receipt = await readLaneReceipt(directory);
+
+    // A lane that never reported is not a lane that installed: false would
+    // read as an install that ran, and true as a skip nobody recorded.
+    expect(receipt.installSkipped).toBeNull();
+    expect(receipt.installSkipReason).toBeNull();
   });
 });
 
@@ -1367,6 +1402,50 @@ describe("public local CLI lifecycle", () => {
     expect(receipt).toContain('"repo": "acme/demo"');
     expect(receipt).toContain('"review-error.json"');
     expect(receipt).toContain('"absentArtifacts"');
+    // The runner installed in this lane, which is not the same evidence as a
+    // lane that ran without dependencies.
+    expect(receipt).toContain('"installSkipped": false');
+  });
+
+  it("reads a skipped install back out of the lane receipt with its reason", async () => {
+    const root = await mkdtemp(join(tmpdir(), "review-pi-cli-"));
+    temporaryDirectories.push(root);
+    const arranged = await arrangeFakeDocker(root);
+    const runId = "install-skipped";
+    const out = join(root, "out");
+
+    const result = await runLocalCli(
+      localArguments(out, runId),
+      fakeEnvironment(arranged, runId, "install-skipped"),
+    );
+    const receipt = await readLocalReceipt(join(out, runId));
+
+    expect(result.code, result.output).toBe(0);
+    // The install step's exit code is zero either way; the receipt is where a
+    // lane that ran without dependencies is readable as such.
+    expect(receipt.installSkipped).toBe(true);
+    expect(receipt.installSkipReason).toBe(
+      "the checkout root has no package.json",
+    );
+  });
+
+  it("leaves the install unobserved when the runner never reported", async () => {
+    const root = await mkdtemp(join(tmpdir(), "review-pi-cli-"));
+    temporaryDirectories.push(root);
+    const arranged = await arrangeFakeDocker(root);
+    const runId = "install-unobserved";
+    const out = join(root, "out");
+
+    const result = await runLocalCli(
+      localArguments(out, runId),
+      fakeEnvironment(arranged, runId, "review-failure"),
+    );
+    const receipt = await readLocalReceipt(join(out, runId));
+
+    expect(result.code).toBe(1);
+    expect(receipt.outcome).toBe("failed");
+    expect(receipt.installSkipped).toBeNull();
+    expect(receipt.installSkipReason).toBeNull();
   });
 
   it("refuses a run that names no target repository or checkout", async () => {
