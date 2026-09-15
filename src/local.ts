@@ -1878,6 +1878,16 @@ async function main() {
   let containerCreated = false;
   let reviewStarted = false;
   let finalAccepted = false;
+  // Where the runner itself stopped, when the driver saw it stop. A container
+  // whose end was observed is disposed of like an accepted one; a container
+  // the driver lost sight of is kept with its evidence, and an auth-blocked
+  // one is kept because it is the one kind of end a resume can pick up.
+  let runnerTerminalReason: string | null = null;
+  const containerDisposable = () =>
+    options.cancel ||
+    finalAccepted ||
+    !reviewStarted ||
+    (runnerTerminalReason !== null && runnerTerminalReason !== "auth_blocked");
   let imageId: string | null = null;
   let containerRunnerSha: string | null = null;
   let status: ReturnType<typeof readStatus> | undefined;
@@ -2001,13 +2011,13 @@ async function main() {
     let removeError: string | null = null;
     let removalSkippedReason: string | null = null;
     const shouldRemoveContainer =
-      ownedContainer &&
-      !options.keepContainer &&
-      (options.cancel || finalAccepted || !reviewStarted);
+      ownedContainer && !options.keepContainer && containerDisposable();
     if (ownedContainer && !shouldRemoveContainer) {
       removalSkippedReason = options.keepContainer
         ? "kept by --keep"
-        : "run is unfinished, so its container is retained for inspection and resume";
+        : runnerTerminalReason === "auth_blocked"
+          ? "run is auth-blocked, so its container is retained for resume"
+          : "run is unfinished, so its container is retained for inspection and resume";
     }
 
     if (shouldRemoveContainer && ownedContainer) {
@@ -2815,6 +2825,8 @@ async function main() {
             detail: runnerStatus.detail,
           };
           runError = `run ${runnerStatus.state} at ${runnerStatus.phase}: ${runnerStatus.terminalReason ?? (runnerStatus.detail || "no reason recorded")}`;
+          runnerTerminalReason =
+            runnerStatus.terminalReason ?? runnerStatus.state;
           break;
         }
         console.warn(`status observation uncertain: ${messageOf(err)}`);
@@ -2859,11 +2871,13 @@ async function main() {
           data["terminalReason"] ?? data["detail"] ?? "unknown failure",
         );
         runError = `run failed at ${phase}: ${reason}`;
+        runnerTerminalReason = reason;
         break;
       }
       if (curState === "blocked") {
         const reason = String(data["terminalReason"] ?? "blocked");
         runError = `run blocked at ${phase}: ${reason}`;
+        runnerTerminalReason = reason;
         break;
       }
       if (curState === "done") {
@@ -2984,7 +2998,7 @@ async function main() {
   if (
     shutdown.ownedContainer &&
     !options.keepContainer &&
-    (options.cancel || finalAccepted || !reviewStarted) &&
+    containerDisposable() &&
     !shutdown.removed &&
     !shutdown.removeError
   ) {

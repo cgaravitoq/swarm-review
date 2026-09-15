@@ -1733,12 +1733,23 @@ describe("public local CLI lifecycle", () => {
       FAKE_TERMINAL_REASON: "quota_blocked",
     });
     const receipt = await readLocalReceipt(join(out, runId));
+    const dockerLog = await readFile(
+      join(arranged.state, "docker.log"),
+      "utf8",
+    );
 
     expect(result.code, result.output).toBe(1);
     expect(receipt.outcome).toBe("blocked");
     expect(receipt.error).toContain("quota_blocked");
     expect(receipt.modelRequests).toBe(62);
     expect(neverReachedModel(receipt)).toBe(false);
+    // The runner was seen ending and nothing can resume a quota-blocked run,
+    // so the container goes with it: three of these at 2 GiB each were left
+    // running beside the relaunches that replaced them.
+    expect(dockerLog).toContain(
+      `rm --force --volumes review-pi-local-${runId}`,
+    );
+    expect(receipt.error).not.toContain("teardown failed");
   });
 
   it("removes staged OAuth after a review-start failure", async () => {
