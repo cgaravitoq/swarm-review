@@ -1,0 +1,19 @@
+{
+  "$schema": "https://btca.dev/btca.schema.json",
+  "resources": [
+    {
+      "name": "open-code-review",
+      "type": "git",
+      "url": "https://github.com/alibaba/open-code-review",
+      "branch": "main",
+      "specialNotes": "Alibaba's single-model diff review CLI (Go). The review loop is internal/llmloop and internal/agent; prompts live in internal/config/template/prompts; per-language rule docs in internal/config/rules/rule_docs; line relocation in internal/diff. The 'reflection module' on the website has no implementation here."
+    },
+    {
+      "name": "aacr-bench",
+      "type": "git",
+      "url": "https://github.com/alibaba/aacr-bench",
+      "branch": "main",
+      "specialNotes": "The 200-PR, 1505-issue code review benchmark behind open-codereview.ai's leaderboard (paper arXiv:2601.19494, data on Hugging Face Alibaba-Aone/aacr-bench). evaluation/judge.py matches a comment to ground truth by path, side, line distance k, then an LLM judge. evaluation/reviewers/*.py are the adapters that wrap Claude Code and Codex as reviewers."
+    }
+  ]
+}
