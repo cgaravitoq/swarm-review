@@ -434,7 +434,7 @@ describe("deterministic lane coverage", () => {
     expect(options.totalTimeoutSeconds).toBe(600);
   });
 
-  it("holds a sandbox run to fifteen minutes unless told otherwise", () => {
+  it("holds a sandbox run to twenty-five minutes unless told otherwise", () => {
     const sandbox = parseSwarmOptions([
       "--head",
       "a".repeat(40),
@@ -444,15 +444,16 @@ describe("deterministic lane coverage", () => {
       "/out",
       "--sandbox",
     ]);
-    // Five minutes of verifier, the teardown, and the rest for the reviewers:
-    // the deep run's ceiling, which the budget notice keys three quarters of.
-    expect(sandbox.totalTimeoutSeconds).toBe(900);
-    expect(sandbox.verifierReserveSeconds).toBe(300);
+    // The warm verifier's model time, the teardown, and the rest for reviewers
+    // that install before they read: the deep run's ceiling, which the budget
+    // notice keys three quarters of once the install is paid.
+    expect(sandbox.totalTimeoutSeconds).toBe(1500);
+    expect(sandbox.verifierReserveSeconds).toBe(200);
     expect(laneTimeoutSeconds(laneWindowSeconds(sandbox, 0, "reviewer"))).toBe(
-      900 - 300 - TEARDOWN_BUDGET_SECONDS,
+      1500 - 200 - TEARDOWN_BUDGET_SECONDS,
     );
     expect(laneTimeoutSeconds(laneWindowSeconds(sandbox, 0, "verifier"))).toBe(
-      300,
+      200,
     );
   });
 
@@ -479,9 +480,9 @@ describe("deterministic lane coverage", () => {
     // A cold verifier's window is its own reservation, which is smaller than
     // the shortest lane that ever produced a review.
     expect(relaunchRefusal(options, 10, "verifier")).toMatch(/200s/);
-    // A reservation large enough for a relaunch is still refused once the
-    // run cannot honour it: the 2026-09-15 sandbox run relaunched a cold
-    // verifier under a 300 s reservation with 23 s of run left.
+    // A reservation is refused once the run cannot honour it, however large:
+    // the 2026-09-15 sandbox run relaunched a cold verifier under a 300 s
+    // reservation with 23 s of run left.
     const deep = parseSwarmOptions([
       "--head",
       "a".repeat(40),
@@ -490,9 +491,11 @@ describe("deterministic lane coverage", () => {
       "--out",
       "/out",
       "--sandbox",
+      "--verifier-reserve",
+      "300",
     ]);
     expect(relaunchRefusal(deep, 10, "verifier")).toBeNull();
-    expect(relaunchRefusal(deep, 877, "verifier")).toMatch(
+    expect(relaunchRefusal(deep, 1477, "verifier")).toMatch(
       /only -67s of verifier window left/,
     );
     expect(RELAUNCH_MINIMUM_SECONDS).toBe(

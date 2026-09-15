@@ -176,15 +176,17 @@ export function parseSwarmOptions(argv: string[]) {
   }
   const worker = flag(argv, "worker");
   const sandboxFlag = argv.includes("--sandbox");
-  // A sandbox run is the deep one, and fifteen minutes is the ceiling it is
-  // held to, not the time it is expected to take: five for the verifier, the
-  // teardown every lane owes, and the rest for reviewers that clone, install
-  // and run things.
+  // A sandbox run is the deep one, and twenty-five minutes is the ceiling it
+  // is held to, not the time it is expected to take. The verifier starts warm
+  // beside the reviewers, so its reserve is model time only; the rest, less
+  // the teardown every lane owes, is for reviewers that clone, install and
+  // run things: the 2026-09-15 vidext lanes spent 320 s installing, and the
+  // two reviewers a fifteen-minute ceiling left 170 s of model were both cut.
   const totalTimeoutSeconds = Number(
-    flag(argv, "total-timeout") ?? (sandboxFlag ? 900 : 600),
+    flag(argv, "total-timeout") ?? (sandboxFlag ? 1500 : 600),
   );
   const verifierReserveSeconds = Number(
-    flag(argv, "verifier-reserve") ?? (worker ? 150 : sandboxFlag ? 300 : 200),
+    flag(argv, "verifier-reserve") ?? (worker ? 150 : 200),
   );
   if (verifierReserveSeconds >= totalTimeoutSeconds) {
     throw new Error("--verifier-reserve must be under --total-timeout");
