@@ -43,6 +43,7 @@ import {
   resolveRunCredentials,
   resolveUpstream,
   TARGET_UID,
+  TEARDOWN_BUDGET_SECONDS,
   targetProviderEnv,
 } from "../local";
 import { SESSION_CAPS } from "../provider-budget";
@@ -164,6 +165,13 @@ const revision = (format: string) => {
   return sha;
 };
 
+// A stalled run has to end through its own receipt, which names the phase that
+// hung, before vitest gives up on the test: the run budget, then the teardown's
+// own budget, then a margin for the receipt write.
+const RUN_BUDGET_SECONDS = 20;
+const LIFECYCLE_TEST_TIMEOUT_MS =
+  (RUN_BUDGET_SECONDS + TEARDOWN_BUDGET_SECONDS + 10) * 1000;
+
 const localArguments = (out: string, runId: string) => [
   localScript,
   "--head",
@@ -180,9 +188,8 @@ const localArguments = (out: string, runId: string) => [
   "acme/demo",
   "--source",
   repoRoot,
-  // The CLI budget must expire before vitest's 30 s so a stalled command surfaces in the receipt with its phase.
   "--total-timeout",
-  "20",
+  String(RUN_BUDGET_SECONDS),
 ];
 
 const runLocalCli = (args: string[], env: NodeJS.ProcessEnv) =>
@@ -1325,7 +1332,9 @@ describe("deadline and redaction", () => {
   });
 });
 
-describe("public local CLI lifecycle", () => {
+describe("public local CLI lifecycle", {
+  timeout: LIFECYCLE_TEST_TIMEOUT_MS,
+}, () => {
   const arrangeFakeDocker = async (root: string) => {
     const bin = join(root, "bin");
     const state = join(root, "state");
@@ -1377,7 +1386,7 @@ describe("public local CLI lifecycle", () => {
       requests: SESSION_CAPS.t1b.maxRequests,
       inputTokens: SESSION_CAPS.t1b.maxCumulativeInputTokens,
     });
-    expect(job["totalTimeoutSeconds"]).toBe(20);
+    expect(job["totalTimeoutSeconds"]).toBe(RUN_BUDGET_SECONDS);
   });
 
   it("accepts a missing optional artifact and requires report plus trace", async () => {
