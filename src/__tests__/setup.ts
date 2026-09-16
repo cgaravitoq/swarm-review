@@ -45,9 +45,28 @@ const groupAlive = (pid: number) => {
   }
 };
 
-afterEach(async () => {
+// A group still alive when its test failed is the only witness of what hung;
+// the reaper reads it before it kills it.
+const groupTree = (pid: number) =>
+  spawnSync("ps", ["-eo", "pid,pgid,ppid,stat,etime,command"], {
+    encoding: "utf8",
+  })
+    .stdout.split("\n")
+    .filter((line) => {
+      const [, pgid, ppid] = line.trim().split(/\s+/);
+      return pgid === String(pid) || ppid === String(pid);
+    })
+    .join("\n");
+
+afterEach(async (context) => {
+  const failed = context.task.result?.state === "fail";
   await Promise.all(
     [...groups].map(async (pid) => {
+      if (failed && groupAlive(pid)) {
+        console.error(
+          `process group ${pid} alive when "${context.task.name}" failed\n${groupTree(pid)}`,
+        );
+      }
       try {
         process.kill(-pid, "SIGKILL");
       } catch (error) {
