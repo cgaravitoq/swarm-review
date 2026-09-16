@@ -50,8 +50,20 @@ import { SESSION_CAPS } from "../provider-budget";
 import { neverReachedModel } from "../swarm";
 
 const temporaryDirectories: string[] = [];
+const runOutputs = new Map<number, () => string>();
 
-afterEach(async () => {
+// A failed test keeps its scratch (the fake docker's log lives there) and
+// prints what each CLI it ran had said, since a timeout shows neither.
+afterEach(async (context) => {
+  if (context.task.result?.state === "fail") {
+    for (const [pid, output] of runOutputs) {
+      console.error(`local CLI pid ${pid} said:\n${output()}`);
+    }
+    console.error(`scratch kept: ${temporaryDirectories.splice(0).join(" ")}`);
+    runOutputs.clear();
+    return;
+  }
+  runOutputs.clear();
   await Promise.all(
     temporaryDirectories
       .splice(0)
@@ -206,6 +218,7 @@ const runLocalCli = (args: string[], env: NodeJS.ProcessEnv) =>
     child.stderr.on("data", (chunk) => {
       output += chunk.toString();
     });
+    if (child.pid) runOutputs.set(child.pid, () => output);
     child.once("close", (code) => resolvePromise({ code: code ?? 1, output }));
   });
 
