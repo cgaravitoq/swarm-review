@@ -180,8 +180,9 @@ const localArguments = (out: string, runId: string) => [
   "acme/demo",
   "--source",
   repoRoot,
+  // The CLI budget must expire before vitest's 30 s so a stalled command surfaces in the receipt with its phase.
   "--total-timeout",
-  "30",
+  "20",
 ];
 
 const runLocalCli = (args: string[], env: NodeJS.ProcessEnv) =>
@@ -1376,7 +1377,7 @@ describe("public local CLI lifecycle", () => {
       requests: SESSION_CAPS.t1b.maxRequests,
       inputTokens: SESSION_CAPS.t1b.maxCumulativeInputTokens,
     });
-    expect(job["totalTimeoutSeconds"]).toBe(30);
+    expect(job["totalTimeoutSeconds"]).toBe(20);
   });
 
   it("accepts a missing optional artifact and requires report plus trace", async () => {
