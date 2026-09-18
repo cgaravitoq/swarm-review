@@ -14,6 +14,69 @@
       "url": "https://github.com/alibaba/aacr-bench",
       "branch": "main",
       "specialNotes": "The 200-PR, 1505-issue code review benchmark behind open-codereview.ai's leaderboard (paper arXiv:2601.19494, data on Hugging Face Alibaba-Aone/aacr-bench). evaluation/judge.py matches a comment to ground truth by path, side, line distance k, then an LLM judge. evaluation/reviewers/*.py are the adapters that wrap Claude Code and Codex as reviewers."
+    },
+    {
+      "name": "pr-agent-oss",
+      "type": "git",
+      "url": "https://github.com/The-PR-Agent/pr-agent",
+      "branch": "main",
+      "specialNotes": "MIT. The original Qodo OSS PR reviewer; qodo-ai/pr-agent now 301s here. Self-hostable as GitHub App, Action, CLI or Docker. Reads the PR via the GitHub API with no checkout; each tool is a single LLM call with no verification pass. Its App server (pr_agent/servers/github_app.py) uses FastAPI background tasks, Auth.AppInstallationAuth per installation, .pr_agent.toml for per-repo config, and pulls.createReview to publish."
+    },
+    {
+      "name": "pr-af",
+      "type": "git",
+      "url": "https://github.com/Agent-Field/pr-af",
+      "branch": "main",
+      "specialNotes": "Closest mechanism match: dynamically compiled review dimensions spawn ephemeral parallel reviewer agents, then an adversarial falsifiability gate tries to invalidate each finding before it becomes a GitHub comment. Publishes benchmark/martian-code-review-bench. License caution: the README badge says Apache-2.0 but there is no LICENSE file and the GitHub API reports no license, so treat reuse as unlicensed until that changes."
+    },
+    {
+      "name": "kodus-ai",
+      "type": "git",
+      "url": "https://github.com/kodustech/kodus-ai",
+      "branch": "main",
+      "specialNotes": "AGPL-3.0 with enterprise carve-outs: any file with .ee. in its name or ee/ in its path is commercial-only. Ships as a multi-tenant GitHub App plus CLI, so it is the reference for hosting review across many installations. Its README documents context review with severity, not a verification pass; copying any of it into this MIT repo pulls AGPL in."
+    },
+    {
+      "name": "ai-diff-reviewer",
+      "type": "git",
+      "url": "https://github.com/DailybotHQ/ai-diff-reviewer",
+      "branch": "main",
+      "specialNotes": "MIT, small. One review methodology shipped as a GitHub Action and as a coding-agent skill. prompts/default.md is its verification stance (read only what confirms or discards a hypothesis), the cheapest thing here to compare against our verifier prompt. No benchmark."
+    },
+    {
+      "name": "octokit-auth-app",
+      "type": "git",
+      "url": "https://github.com/octokit/auth-app.js",
+      "branch": "main",
+      "specialNotes": "MIT, v8.3.1. Usable on Cloudflare Workers with WebCrypto: it mints the RS256 App JWT (via universal-github-app-jwt, WebCrypto) and the installation access tokens, and caches them in memory. Gotcha its README states: GitHub hands out the private key in PKCS#1 and WebCrypto only accepts PKCS#8, so it must be converted before signing. This is the piece the publish path would use instead of a plain token when this becomes an installable GitHub App."
+    },
+    {
+      "name": "cloudflare-worker-github-app-example",
+      "type": "git",
+      "url": "https://github.com/gr2m/cloudflare-worker-github-app-example",
+      "branch": "main",
+      "specialNotes": "ISC. The end-to-end shape of a GitHub App on Workers: HMAC webhook verification via WebCrypto plus @octokit/app for installation tokens. Probot does not run on Workers (probot/probot#1656). Multi-tenant notes: GitHub fails a webhook after 10s and never auto-redelivers it, so answer fast and queue; Cloudflare caps 1,500 concurrent vCPU per account (standard-4 = 4 vCPU); one Durable Object per installation is the documented pattern."
+    },
+    {
+      "name": "octokit-webhooks-methods",
+      "type": "git",
+      "url": "https://github.com/octokit/webhooks-methods.js",
+      "branch": "main",
+      "specialNotes": "MIT, v6.0.0. Signature calculation and verification with WebCrypto (crypto.subtle.importKey in src/web.ts), which is what a Workers webhook route should use. The sibling @octokit/webhooks is documented as a Node.js toolset and @octokit/app as not meant for browser usage, so neither is the Workers path."
+    },
+    {
+      "name": "wrily",
+      "type": "git",
+      "url": "https://github.com/barryroodt/wrily",
+      "branch": "main",
+      "specialNotes": "MIT and the closest existing thing to the target: a self-hosted AI code reviewer with parallel review agents that already ships a Cloudflare Worker GitHub App (integrations/cloudflare-worker/src/index.ts fetches installations/{id}/access_tokens and handles fetch(request, env, ctx)) plus src/post/github.ts publishing via pulls.createReview. Per-repo config lives in .wrily.yml read through the contents API. Read this before designing the installable App."
+    },
+    {
+      "name": "kodiai",
+      "type": "git",
+      "url": "https://github.com/xbmc/kodiai",
+      "branch": "main",
+      "specialNotes": "GitHub App for PR auto-review. License caution: GitHub reports no license, so read it for architecture only, do not copy. Useful mechanics: src/auth/github-app.ts caches the installation Octokit for 55 minutes, src/jobs/queue.ts gives each installation its own PQueue(concurrency: 1), per-repo config comes from .kodiai.yml, and publishing goes through pulls.createReview."
     }
   ]
 }
