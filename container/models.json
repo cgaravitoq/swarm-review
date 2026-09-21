@@ -50,6 +50,18 @@
         "@cf/deepseek-ai/deepseek-v4-flash-0731": {
           "contextWindow": 1048576,
           "maxTokens": 65536
+        },
+        "@cf/zai-org/glm-5.3-flash": {
+          "contextWindow": 1048576,
+          "maxTokens": 65536
+        },
+        "@cf/zai-org/glm-5.3": {
+          "contextWindow": 1048576,
+          "maxTokens": 65536
+        },
+        "@cf/moonshotai/kimi-k2.7-code": {
+          "contextWindow": 262144,
+          "maxTokens": 32768
         }
       }
     },
