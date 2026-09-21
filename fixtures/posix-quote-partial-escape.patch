@@ -1,0 +1,13 @@
+diff --git a/src/isolation.ts b/src/isolation.ts
+index b99d8ce..b4f331d 100644
+--- a/src/isolation.ts
++++ b/src/isolation.ts
+@@ -20,7 +20,7 @@ const CANARY_PATH = /^\/[A-Za-z0-9][A-Za-z0-9._/-]*$/;
+ const MAX_TIMEOUT_SECONDS = 86_400;
+ 
+ export const posixQuote = (value: string) =>
+-  `'${value.replaceAll("'", `'\\''`)}'`;
++  `'${value.replace("'", `'\\''`)}'`;
+ 
+ export function assertCloudRunId(runId: string) {
+   if (!RUN_ID_PATTERN.test(runId)) {
