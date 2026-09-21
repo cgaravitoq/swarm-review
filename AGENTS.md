@@ -22,6 +22,16 @@ bun run test        # vitest run
 `lefthook` gates every commit on secretlint, biome, typecheck and the anti-slop lint; CI runs the same four plus the tests.
 A commit that fails a gate is not committed, so fix the cause rather than bypassing it.
 
+A lane image is not published anywhere, so a host that has never built one has no image to run.
+The build context is `container/`, and its `context/` subdirectory is generated rather than committed, so it has to exist first: `bun run deploy --target <checkout>` writes it, or copy the target's `package.json` and lockfile in by hand.
+The tag is the one the driver defaults to, and the platform is the one the driver runs, which is emulated on Apple silicon:
+
+```sh
+docker build --platform linux/amd64 -t review-pi-b5-swarm container/
+```
+
+`src/swarm.ts` runs the packed path unless it is given `--sandbox`, `--orca` or `--worker`, and the packed path never starts a container.
+
 ## Layout
 
 | Path | What it holds |
@@ -83,3 +93,7 @@ Tests never reach the network. `fetch` is stubbed and Pi is a fake binary that l
 
 Assert the mechanism at the hop it names.
 A test whose result can be produced by another path does not prove the path it names, and this suite is the only thing standing between a lane and a published review.
+
+This suite is not a usable `--check` for a lane reviewing this repository.
+It drives this CLI against fake bridges, and a lane that runs it spends the review window inside the check instead of on the change: measured at 526 s of a 1500 s run, and at all of it in another, with no model request in either.
+Give a lane reviewing this tree a narrow check, and read `status.json` and the broker ledger rather than the lane receipt when a run ends with nothing, because the phase it died in is not in the receipt.
