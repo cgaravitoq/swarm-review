@@ -3001,7 +3001,7 @@ async function main() {
         wallSeconds: receipt?.wallSeconds ?? null,
         teardownSeconds: receipt?.teardownSeconds ?? null,
         truncatedArtifacts: receipt?.truncatedArtifacts ?? [],
-        error: receipt?.error ?? null,
+        error: receipt?.error ?? laneEvidence.damage,
         orcaTerminal: laneTerminalFor(laneId),
         cleanup: laneCleanupFor(laneId),
         piSessionId: session.sessionId,
