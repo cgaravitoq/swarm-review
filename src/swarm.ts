@@ -44,6 +44,7 @@ import {
   assertRunId,
   createBudget,
   ensureObjects,
+  isMissingFile,
   mintRunId,
   readLaneReceipt,
   requiredRepo,
@@ -1978,12 +1979,6 @@ type LaneReceiptEvidence =
   | { receipt: null; damage: string };
 
 const NO_LANE_RECEIPT: LaneReceiptEvidence = { receipt: null, damage: null };
-
-const isMissingFile = (error: unknown) =>
-  typeof error === "object" &&
-  error !== null &&
-  "code" in error &&
-  error.code === "ENOENT";
 
 /**
  * A lane's receipt, and whether the read that should have produced it failed.

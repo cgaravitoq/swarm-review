@@ -1541,7 +1541,7 @@ export async function readLocalReceipt(directory: string) {
   };
 }
 
-const isMissingFile = (error: unknown) =>
+export const isMissingFile = (error: unknown) =>
   typeof error === "object" &&
   error !== null &&
   "code" in error &&
