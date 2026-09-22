@@ -107,6 +107,32 @@ describe("completeOnce", () => {
     expect(answer.usage).toEqual({ inputTokens: 11, outputTokens: 8192 });
   });
 
+  it("leaves a count the usage object never carried unobserved", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn<typeof fetch>(() =>
+        Promise.resolve(
+          new Response(
+            JSON.stringify({
+              choices: [{ message: { content: "{}" }, finish_reason: "stop" }],
+              usage: { completion_tokens: 34 },
+            }),
+            { status: 200 },
+          ),
+        ),
+      ),
+    );
+
+    const answer = await completeOnce({
+      baseUrl: "https://provider.invalid/v1",
+      bearer: "token",
+      model: "grok-4.6",
+      prompt: "review",
+    });
+
+    expect(answer.usage).toStrictEqual({ outputTokens: 34 });
+  });
+
   it("reads the spend out of an answer the gateway pretty-printed", async () => {
     // OpenAI's answers arrive indented, so no line of the body parses on its
     // own and a line-by-line reader reports a paid call as free.

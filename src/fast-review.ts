@@ -174,8 +174,8 @@ const usageFrom = (value: unknown) => {
     record?.["outputTokens"];
   if (typeof input !== "number" && typeof output !== "number") return null;
   return {
-    inputTokens: typeof input === "number" ? input : 0,
-    outputTokens: typeof output === "number" ? output : 0,
+    ...(typeof input === "number" ? { inputTokens: input } : {}),
+    ...(typeof output === "number" ? { outputTokens: output } : {}),
   };
 };
 
