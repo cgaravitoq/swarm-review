@@ -1874,7 +1874,7 @@ describe("public local CLI lifecycle", {
     expect(receipt.outcome).toBe("blocked");
     expect(receipt.error).toContain("quota_blocked");
     expect(receipt.modelRequests).toBe(62);
-    expect(neverReachedModel(receipt)).toBe(false);
+    expect(neverReachedModel({ receipt, damage: null })).toBe(false);
     // The runner was seen ending and nothing can resume a quota-blocked run,
     // so the container goes with it: three of these at 2 GiB each were left
     // running beside the relaunches that replaced them.
