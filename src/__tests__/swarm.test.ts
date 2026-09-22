@@ -33,6 +33,7 @@ import {
   LANE_KILL_GRACE_MS,
   laneArguments,
   laneBudgets,
+  laneReceiptEvidence,
   laneTimeoutSeconds,
   laneWindowSeconds,
   MAX_CONCURRENT_LANES,
@@ -183,22 +184,77 @@ describe("deterministic lane coverage", () => {
     lanes.map((lane) => lane.files);
 
   it("relaunches only a lane that never reached the model", () => {
-    expect(neverReachedModel(null)).toBe(true);
-    expect(neverReachedModel({ outcome: "failed", modelRequests: null })).toBe(
-      true,
-    );
-    expect(neverReachedModel({ outcome: "failed", modelRequests: 0 })).toBe(
-      true,
-    );
-    expect(neverReachedModel({ outcome: "failed", modelRequests: 3 })).toBe(
-      false,
-    );
+    const read = (receipt: {
+      outcome: string;
+      modelRequests?: number | null;
+    }) => ({ receipt, damage: null });
+
+    expect(neverReachedModel({ receipt: null, damage: null })).toBe(true);
     expect(
-      neverReachedModel({ outcome: "completed", modelRequests: null }),
+      neverReachedModel(read({ outcome: "failed", modelRequests: null })),
+    ).toBe(true);
+    expect(
+      neverReachedModel(read({ outcome: "failed", modelRequests: 0 })),
+    ).toBe(true);
+    expect(
+      neverReachedModel(read({ outcome: "failed", modelRequests: 3 })),
     ).toBe(false);
-    expect(neverReachedModel({ outcome: "completed", modelRequests: 0 })).toBe(
-      false,
+    expect(
+      neverReachedModel(read({ outcome: "completed", modelRequests: null })),
+    ).toBe(false);
+    expect(
+      neverReachedModel(read({ outcome: "completed", modelRequests: 0 })),
+    ).toBe(false);
+    // The lane ran and left a record the run cannot read, so what it spent is
+    // unknown rather than zero: only an absent receipt is free to repeat.
+    expect(
+      neverReachedModel({ receipt: null, damage: "Unexpected end of JSON" }),
+    ).toBe(false);
+  });
+
+  it("reads an absent lane receipt apart from a damaged one", async () => {
+    const root = await mkdtemp(join(tmpdir(), "review-pi-receipt-"));
+    temporaryDirectories.push(root);
+
+    const absent = await laneReceiptEvidence(join(root, "absent"));
+    expect(absent).toEqual({ receipt: null, damage: null });
+    expect(neverReachedModel(absent)).toBe(true);
+
+    // The container exported the receipt, the run cut it short, and the lane is
+    // spent: only an absent record is free to repeat.
+    for (const [name, file] of [
+      ["damaged-local", "local-receipt.json"],
+      ["damaged-cloud", "receipt.json"],
+    ] as const) {
+      const damagedDir = join(root, name);
+      await mkdir(damagedDir);
+      await writeFile(join(damagedDir, file), '{"runId": "cut mid-write');
+
+      const damaged = await laneReceiptEvidence(damagedDir);
+
+      expect(damaged.receipt).toBeNull();
+      expect(damaged.damage).toBeTruthy();
+      expect(neverReachedModel(damaged)).toBe(false);
+    }
+
+    const validDir = join(root, "valid");
+    await mkdir(validDir);
+    await writeFile(
+      join(validDir, "receipt.json"),
+      JSON.stringify({
+        runId: "run-1",
+        provider: "acme",
+        model: "lab",
+        wallSeconds: 60,
+        modelRequests: 4,
+      }),
     );
+
+    const read = await laneReceiptEvidence(validDir);
+
+    expect(read.damage).toBeNull();
+    expect(read.receipt?.outcome).toBe("completed");
+    expect(neverReachedModel(read)).toBe(false);
   });
 
   it("partitions the changed files evenly and identically whatever the order", () => {
