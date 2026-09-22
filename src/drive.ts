@@ -273,6 +273,21 @@ export const observedModelRequests = (state: RunState | undefined) => {
   return typeof requests === "number" ? requests : null;
 };
 
+/**
+ * The isolation verdicts the control plane reported when the lane started.
+ *
+ * A lane that never started observed nothing, so it reads null: a receipt that
+ * answered with a contained verdict there would report containment the run
+ * never measured.
+ */
+export const observedIsolation = (started: RunStart | undefined) =>
+  started
+    ? {
+        controlApi: started.probes.controlApi,
+        targetReadBroker: started.probes.targetReadBroker,
+      }
+    : null;
+
 const statusRecord = (state: RunState) =>
   asRecord(parseJson(artifactOf(state, "status.json")?.content));
 
@@ -992,6 +1007,7 @@ async function main() {
     placementId: started?.placementId ?? state?.placementId ?? null,
     processId: started?.processId ?? null,
     container: started?.container ?? null,
+    isolation: observedIsolation(started),
     modelRequests: observedModelRequests(state),
     finalize,
     runError: lifecycle.runError ? messageOf(lifecycle.runError) : null,

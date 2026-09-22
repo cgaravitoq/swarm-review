@@ -1346,6 +1346,16 @@ const optionalBoolean = (
   return typeof value === "boolean" ? value : null;
 };
 
+const optionalRecord = (
+  object: Readonly<Record<string, unknown>>,
+  key: string,
+) => {
+  const value = object[key];
+  return typeof value === "object" && value !== null && !Array.isArray(value)
+    ? (value as Readonly<Record<string, unknown>>)
+    : null;
+};
+
 const recordAt = (
   object: Readonly<Record<string, unknown>>,
   key: string,
@@ -1402,6 +1412,34 @@ const readInstallEvidence = (report: Readonly<Record<string, unknown>>) => {
       status === "skipped" && install
         ? optionalString(install, "reason")
         : null,
+  };
+};
+
+/**
+ * The isolation verdicts the cloud driver recorded for the lane.
+ *
+ * A receipt that carries no verdict, and a verdict the control plane could not
+ * take, each read null: never as a probe that found the target contained.
+ */
+const readIsolationEvidence = (receipt: Readonly<Record<string, unknown>>) => {
+  const isolation = optionalRecord(receipt, "isolation");
+  if (!isolation) return null;
+  const controlApi = optionalRecord(isolation, "controlApi");
+  const brokerRead = optionalRecord(isolation, "targetReadBroker");
+  return {
+    controlApi: controlApi
+      ? {
+          uid: optionalNumber(controlApi, "uid"),
+          reason: optionalString(controlApi, "reason"),
+          escaped: optionalBoolean(controlApi, "escaped"),
+        }
+      : null,
+    targetReadBroker: brokerRead
+      ? {
+          verdict: optionalString(brokerRead, "verdict"),
+          reason: optionalString(brokerRead, "reason"),
+        }
+      : null,
   };
 };
 
@@ -1497,6 +1535,7 @@ export async function readLocalReceipt(directory: string) {
     installSkipReason: optionalString(receipt, "installSkipReason"),
     truncatedArtifacts: stringList(receipt["shutdown"], "truncatedArtifacts"),
     modelRequests: optionalNumber(receipt, "modelRequests"),
+    isolation: readIsolationEvidence(receipt),
     error: optionalString(receipt, "error"),
   };
 }
@@ -1546,6 +1585,7 @@ export async function readLaneReceipt(directory: string) {
     installSkipReason: install?.reason ?? null,
     truncatedArtifacts: [],
     modelRequests: optionalNumber(receipt, "modelRequests"),
+    isolation: readIsolationEvidence(receipt),
     error: runError,
   };
 }
