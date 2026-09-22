@@ -1,6 +1,7 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import {
   emptyModelTotals,
+  type ModelCaps,
   modelCapability,
   modelProxyBaseUrl,
   modelsJsonForProxy,
@@ -13,6 +14,36 @@ import {
 afterEach(() => {
   vi.unstubAllGlobals();
 });
+
+/** A session whose caps the proxy reads, with the module's default 1024-byte cap. */
+const capsFor = (overrides: Partial<ModelCaps> = {}): ModelCaps => ({
+  maxRequests: 8,
+  maxRetriesPerRequest: 1,
+  maxCumulativeInputTokens: 1000,
+  maxCumulativeOutputTokens: 1000,
+  maxRequestBytes: 1024,
+  ...overrides,
+});
+
+const sessionConsumer =
+  (totals = emptyModelTotals(), caps = capsFor()) =>
+  async () => ({
+    ok: true as const,
+    session: {
+      handle: "review-pi-handle",
+      upstreamBaseUrl: "https://api.x.ai/v1",
+      upstreamAuthorization: "Bearer real-secret",
+      caps,
+      totals,
+    },
+  });
+
+const proxyTarget = async (runId: string, secret = "control-secret") => {
+  const capability = await modelCapability(runId, secret);
+  return new URL(
+    `${modelProxyBaseUrl("https://review.invalid", runId, capability)}/chat/completions`,
+  );
+};
 
 describe("model proxy", () => {
   it("counts the cached halves of an Anthropic prompt as input, not as nothing", () => {
@@ -212,5 +243,80 @@ describe("model proxy", () => {
       handle: "review-pi-handle",
       totals: { requests: 1, input: 4, output: 2 },
     });
+  });
+
+  it("refuses a body whose declared length is over the session's byte cap", async () => {
+    const upstream = vi.fn<typeof fetch>(() =>
+      Promise.resolve(new Response("unexpected")),
+    );
+    vi.stubGlobal("fetch", upstream);
+    const url = await proxyTarget("run-declared-length");
+
+    const response = await proxyModelFetch(
+      new Request(url, {
+        method: "POST",
+        headers: {
+          authorization: "Bearer review-pi-handle",
+          "content-type": "application/json",
+          "content-length": "2048",
+        },
+        body: "{}",
+      }),
+      url,
+      "control-secret",
+      sessionConsumer(),
+      async () => undefined,
+    );
+
+    expect(response.status).toBe(413);
+    expect(await response.json()).toMatchObject({
+      error: { type: "review_pi_model", reason: "max_request_bytes" },
+    });
+    expect(upstream).not.toHaveBeenCalled();
+  });
+
+  it("counts the bytes of a body whose length the request does not declare", async () => {
+    const upstream = vi.fn<typeof fetch>(() =>
+      Promise.resolve(new Response("unexpected")),
+    );
+    vi.stubGlobal("fetch", upstream);
+    const url = await proxyTarget("run-counted-length");
+    const oversize = (declared?: string) =>
+      new Request(url, {
+        method: "POST",
+        headers: {
+          authorization: "Bearer review-pi-handle",
+          "content-type": "application/json",
+          ...(declared ? { "content-length": declared } : {}),
+        },
+        body: new ReadableStream<Uint8Array>({
+          start(controller) {
+            controller.enqueue(new Uint8Array(2048));
+            controller.close();
+          },
+        }),
+        duplex: "half",
+      } as RequestInit);
+
+    const undeclared = await proxyModelFetch(
+      oversize(),
+      url,
+      "control-secret",
+      sessionConsumer(),
+      async () => undefined,
+    );
+    expect(undeclared.status).toBe(413);
+
+    // A container that understates its own length is still counted: the
+    // declared value is a hint from the side of the boundary that is untrusted.
+    const understated = await proxyModelFetch(
+      oversize("2"),
+      url,
+      "control-secret",
+      sessionConsumer(),
+      async () => undefined,
+    );
+    expect(understated.status).toBe(413);
+    expect(upstream).not.toHaveBeenCalled();
   });
 });

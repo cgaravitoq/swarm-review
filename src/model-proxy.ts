@@ -209,6 +209,40 @@ const jsonError = (status: number, reason: string) =>
   });
 
 /**
+ * The request body, or null when it is over the session's byte cap.
+ *
+ * The declared length arrives from the container, which is the untrusted side
+ * of this boundary, so the bytes are counted as they are read either way: a
+ * target that understates its own `content-length` cannot carry a body past
+ * the cap the broker enforces for the local path.
+ */
+const readBoundedBody = async (request: Request, maxBytes: number) => {
+  const declared = request.headers.get("content-length");
+  if (declared !== null && Number(declared) > maxBytes) return null;
+  if (!request.body) return new Uint8Array();
+  const reader = request.body.getReader();
+  const chunks: Uint8Array[] = [];
+  let total = 0;
+  while (true) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    total += value.byteLength;
+    if (total > maxBytes) {
+      await reader.cancel();
+      return null;
+    }
+    chunks.push(value);
+  }
+  const body = new Uint8Array(total);
+  let offset = 0;
+  for (const chunk of chunks) {
+    body.set(chunk, offset);
+    offset += chunk.byteLength;
+  }
+  return body;
+};
+
+/**
  * The handle the target presented, from either header it may arrive on.
  *
  * Pi blanks `authorization` and signs with `cf-aig-authorization` for the AI
@@ -276,18 +310,21 @@ export async function proxyModelFetch(
   // the target's handle on it would send the upstream a credential that is not
   // one.
   headers.delete("cf-aig-authorization");
+  headers.delete("content-length");
   if (consumed.session.upstreamAccountId) {
     headers.set("chatgpt-account-id", consumed.session.upstreamAccountId);
   }
+  const method = request.method;
+  const body =
+    method === "GET" || method === "HEAD"
+      ? null
+      : await readBoundedBody(request, consumed.session.caps.maxRequestBytes);
+  if (body === null) return jsonError(413, "max_request_bytes");
   const upstream = await fetch(target, {
-    method: request.method,
+    method,
     headers,
-    body:
-      request.method === "GET" || request.method === "HEAD"
-        ? null
-        : request.body,
+    body,
     redirect: "manual",
-    ...(request.method === "POST" ? { duplex: "half" } : {}),
   } as RequestInit);
   const responseHeaders = new Headers(upstream.headers);
   responseHeaders.delete("content-encoding");
