@@ -1,12 +1,32 @@
+import { createHash } from "node:crypto";
 import { readFile } from "node:fs/promises";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { describe, expect, it } from "vitest";
-import { responseAnswerText } from "../../container/response-seal";
+import {
+  RESPONSE_TAIL_CHARS,
+  responseSealer,
+  SSE_LINE_CHARS,
+} from "../../container/response-seal";
 
 const containerDir = fileURLToPath(
   new URL("../../container", import.meta.url).href,
 );
+
+const sha256 = (text: string) =>
+  createHash("sha256").update(text, "utf8").digest("hex");
+
+/** A body as a hop sees it: in pieces that split lines and events anywhere. */
+const sealOf = (body: string, piece = 7) => {
+  const sealer = responseSealer();
+  for (let start = 0; start < body.length; start += piece) {
+    sealer.write(body.slice(start, start + piece));
+  }
+  return sealer.seal();
+};
+
+const chatBody = (content: string) =>
+  `data: ${JSON.stringify({ choices: [{ delta: { content } }] })}\n\ndata: [DONE]\n\n`;
 
 describe("response seal", () => {
   it("reads each provider family's answer the way pi renders finalText", () => {
@@ -35,13 +55,31 @@ describe("response seal", () => {
       choices: [{ message: { content: "json answer" } }],
     });
 
-    expect(responseAnswerText(anthropic)).toBe("alpha one\nseed beta");
-    expect(responseAnswerText(chat)).toBe("gamma delta");
-    expect(responseAnswerText(responses)).toBe("eps zeta\neta");
-    expect(responseAnswerText(jsonChat)).toBe("json answer");
+    expect(sealOf(anthropic)).toBe(sha256("alpha one\nseed beta"));
+    expect(sealOf(chat)).toBe(sha256("gamma delta"));
+    expect(sealOf(responses)).toBe(sha256("eps zeta\neta"));
+    expect(sealOf(jsonChat)).toBe(sha256("json answer"));
     for (const body of ["Unauthorized", "", '{"error":"quota"}']) {
-      expect(responseAnswerText(body)).toBeNull();
+      expect(sealOf(body)).toBeNull();
     }
+  });
+
+  it("hashes a stream as it passes and keeps only a tail and one line of it", () => {
+    const long = "x".repeat(RESPONSE_TAIL_CHARS * 4);
+    const streamed = Array.from({ length: 64 }, () =>
+      chatBody(long.slice(0, RESPONSE_TAIL_CHARS / 16)).replace(
+        "data: [DONE]\n\n",
+        "",
+      ),
+    ).join("");
+
+    expect(sealOf(streamed, 4096)).toBe(sha256(long));
+    // A JSON body is read from the retained tail, so one longer than the tail
+    // was never held whole and cannot be sealed.
+    expect(
+      sealOf(JSON.stringify({ choices: [{ message: { content: long } }] })),
+    ).toBeNull();
+    expect(sealOf(chatBody("x".repeat(SSE_LINE_CHARS)), 1 << 20)).toBeNull();
   });
 
   it("ships in the image beside every broker that imports it", async () => {

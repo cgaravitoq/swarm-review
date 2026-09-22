@@ -1,5 +1,6 @@
 import { createHash } from "node:crypto";
 import { afterEach, describe, expect, it, vi } from "vitest";
+import { RESPONSE_TAIL_CHARS } from "../../container/response-seal";
 import {
   emptyModelTotals,
   type ModelCaps,
@@ -491,6 +492,53 @@ describe("model proxy", () => {
       .update("alpha one more", "utf8")
       .digest("hex");
     expect(seals).toEqual([expected]);
+  });
+
+  it("seals a stream far past its tail, but no JSON body it only kept the tail of", async () => {
+    const pieces = Array.from({ length: 64 }, () =>
+      "x".repeat(RESPONSE_TAIL_CHARS / 16),
+    );
+    const long = pieces.join("");
+    const bodies = [
+      pieces
+        .map(
+          (content) =>
+            `data: ${JSON.stringify({ choices: [{ delta: { content } }] })}`,
+        )
+        .join("\n\n"),
+      JSON.stringify({ choices: [{ message: { content: long } }] }),
+    ];
+    vi.stubGlobal(
+      "fetch",
+      vi.fn<typeof fetch>(() =>
+        Promise.resolve(new Response(bodies.shift() ?? "", { status: 200 })),
+      ),
+    );
+    const url = await proxyTarget("run-seal-bound");
+    const seals: (string | null)[] = [];
+
+    for (let call = 0; call < 2; call += 1) {
+      const response = await proxyModelFetch(
+        new Request(url, {
+          method: "POST",
+          headers: { authorization: "Bearer review-pi-handle" },
+          body: "{}",
+        }),
+        url,
+        "control-secret",
+        sessionOpener(),
+        sessionConsumer(),
+        async (_runId, _usage, _retryable, seal) => {
+          seals.push(seal);
+        },
+      );
+      await response.text();
+    }
+
+    expect(seals).toEqual([
+      createHash("sha256").update(long, "utf8").digest("hex"),
+      null,
+    ]);
   });
 
   it("bounds a retried attempt by the request budget alone", () => {

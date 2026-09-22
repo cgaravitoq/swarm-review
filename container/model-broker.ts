@@ -16,7 +16,7 @@
 import { appendFileSync, readFileSync } from "node:fs";
 import type { IncomingMessage, ServerResponse } from "node:http";
 import { createServer } from "node:http";
-import { responseSeal } from "./response-seal";
+import { responseSealer } from "./response-seal";
 
 /** The cap that would be broken by admitting one more request, or null. */
 export type BrokerCaps = {
@@ -189,9 +189,6 @@ export const readUsage = (
   return seen ? totals : null;
 };
 
-/** Enough tail to hold a provider's final usage frame, never the transcript. */
-const USAGE_TAIL_BYTES = 65_536;
-
 const readBody = (stream: IncomingMessage) =>
   new Promise<Buffer>((resolve, reject) => {
     const chunks: Buffer[] = [];
@@ -319,20 +316,19 @@ export function createBrokerServer(config: BrokerConfig) {
         res.writeHead(upstream.status);
         // Pi streams, so the answer is forwarded chunk by chunk. Buffering the
         // whole body here would turn a streamed review into one long silence
-        // and break the activity the run is watched through. The body is still
-        // decoded as it passes: the seal is what this process observed, and
-        // the usage frame lives in the last bytes of that same text.
+        // and break the activity the run is watched through. The sealer hashes
+        // the answer as it passes and keeps only the tail the usage frame is in.
         const decoder = new TextDecoder();
-        let streamed = "";
+        const sealer = responseSealer();
         if (upstream.body) {
           for await (const chunk of upstream.body) {
-            streamed += decoder.decode(chunk, { stream: true });
+            sealer.write(decoder.decode(chunk, { stream: true }));
             res.write(Buffer.from(chunk));
           }
-          streamed += decoder.decode();
+          sealer.write(decoder.decode());
         }
         res.end();
-        const usage = readUsage(streamed.slice(-USAGE_TAIL_BYTES));
+        const usage = readUsage(sealer.tail());
         if (usage) {
           totals.input += usage.input;
           totals.output += usage.output;
@@ -343,7 +339,7 @@ export function createBrokerServer(config: BrokerConfig) {
           attempt,
           path: target.pathname,
           usage,
-          seal: upstream.body ? responseSeal(streamed) : null,
+          seal: upstream.body ? sealer.seal() : null,
           totals: { ...totals },
         });
         return;

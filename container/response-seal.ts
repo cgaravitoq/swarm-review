@@ -1,5 +1,24 @@
 import { createHash } from "node:crypto";
 
+/** Enough tail to hold a provider's final usage frame, never the transcript. */
+export const RESPONSE_TAIL_CHARS = 65_536;
+
+/**
+ * The longest SSE line the seal reads. A line is one event, and a Responses
+ * event echoes the request's instructions, so it is bounded like a request.
+ */
+export const SSE_LINE_CHARS = 8 * 1024 * 1024;
+
+const ANTHROPIC_EVENTS = new Set([
+  "content_block_start",
+  "content_block_delta",
+  "content_block_stop",
+  "message_start",
+  "message_delta",
+  "message_stop",
+  "ping",
+]);
+
 const objectRecord = (value: unknown): Record<string, unknown> | null =>
   typeof value === "object" && value !== null && Array.isArray(value) === false
     ? (value as Record<string, unknown>)
@@ -7,107 +26,6 @@ const objectRecord = (value: unknown): Record<string, unknown> | null =>
 
 const isStreamIndex = (value: unknown): value is number =>
   typeof value === "number" && Number.isInteger(value) && value >= 0;
-
-/**
- * The answer text one streamed response carries, or null for a body this
- * seal cannot be taken over.
- *
- * This is what pi renders into report.json's `finalText`: the assistant
- * message's text blocks joined with `"\n"`. Anthropic keeps one block per
- * `content_block`, chat completions concatenates every `delta.content` into
- * one block, and the Responses API concatenates per output item the way pi's
- * own slots do. A body of any other shape answers null rather than a digest
- * of a guess: the host must be able to prove the answer crossed this
- * channel, and a seal over invented text proves nothing.
- */
-const sseAnswerText = (body: string): string | null => {
-  let family: "anthropic" | "chat" | "responses" | null = null;
-  const anthropic = new Map<number, { text: string; isText: boolean }>();
-  const responses = new Map<number, string>();
-  let chatText = "";
-  for (const rawLine of body.split("\n")) {
-    const line = rawLine.replace(/\r$/, "");
-    if (!line.startsWith("data:")) continue;
-    const payload = line.slice(5).replace(/^ /, "");
-    if (payload === "" || payload === "[DONE]") continue;
-    let parsed: unknown;
-    try {
-      parsed = JSON.parse(payload);
-    } catch {
-      // A data line that is not JSON is a shape this seal cannot stand on.
-      return null;
-    }
-    const record = objectRecord(parsed);
-    if (!record) return null;
-    const type = typeof record["type"] === "string" ? record["type"] : "";
-
-    if (Array.isArray(record["choices"])) {
-      if (family !== null && family !== "chat") return null;
-      family = "chat";
-      const choice = objectRecord(record["choices"][0]);
-      const delta = objectRecord(choice?.["delta"]);
-      const content = delta?.["content"];
-      if (typeof content === "string" && content.length > 0) {
-        chatText += content;
-      }
-      continue;
-    }
-    if (type.startsWith("response.")) {
-      if (family !== null && family !== "responses") return null;
-      family = "responses";
-      if (
-        type === "response.output_text.delta" ||
-        type === "response.refusal.delta"
-      ) {
-        const index = record["output_index"];
-        const delta = record["delta"];
-        if (!isStreamIndex(index) || typeof delta !== "string") return null;
-        responses.set(index, (responses.get(index) ?? "") + delta);
-      }
-      continue;
-    }
-    if (
-      type === "content_block_start" ||
-      type === "content_block_delta" ||
-      type === "content_block_stop" ||
-      type === "message_start" ||
-      type === "message_delta" ||
-      type === "message_stop" ||
-      type === "ping"
-    ) {
-      if (family !== null && family !== "anthropic") return null;
-      family = "anthropic";
-      if (type === "content_block_start") {
-        const index = record["index"];
-        if (!isStreamIndex(index)) return null;
-        const block = objectRecord(record["content_block"]);
-        const isText = block?.["type"] === "text";
-        const seed =
-          isText && typeof block?.["text"] === "string" ? block["text"] : "";
-        anthropic.set(index, { text: seed, isText });
-      } else if (type === "content_block_delta") {
-        const index = record["index"];
-        if (!isStreamIndex(index)) return null;
-        const delta = objectRecord(record["delta"]);
-        if (delta?.["type"] !== "text_delta") continue;
-        const text = delta["text"];
-        if (typeof text !== "string") return null;
-        const block = anthropic.get(index);
-        // A delta whose block never opened as text is text pi never rendered.
-        if (block?.isText) block.text += text;
-      }
-    }
-  }
-  if (family === "anthropic") {
-    return [...anthropic.values()]
-      .filter((block) => block.isText)
-      .map((block) => block.text)
-      .join("\n");
-  }
-  if (family === "chat") return chatText;
-  if (family === "responses") return [...responses.values()].join("\n");
-  return null;
-};
 
 const jsonAnswerText = (body: string): string | null => {
   let parsed: unknown;
@@ -161,24 +79,152 @@ const jsonAnswerText = (body: string): string | null => {
   return null;
 };
 
-export const responseAnswerText = (body: string): string | null => {
-  const firstLine = body
-    .split("\n")
-    .find((line) => line.trim() !== "")
-    ?.trim();
-  if (!firstLine) return null;
-  if (firstLine.startsWith("{")) return jsonAnswerText(body.trim());
-  if (/^(?:data|event|id|retry):/.test(firstLine)) return sseAnswerText(body);
-  return null;
-};
-
 /**
- * The seal of one response: sha256 of the answer text it carried through
- * this process, or null when its shape put it beyond this seal.
+ * Seals one response as it streams through a model hop: sha256 of the answer
+ * text it carried, or null for a body this seal cannot be taken over.
+ *
+ * The answer is what pi renders into report.json's `finalText`: the assistant
+ * message's text blocks joined with `"\n"`. Anthropic keeps one block per
+ * `content_block`, chat completions concatenates every `delta.content` into
+ * one block, and the Responses API concatenates per output item the way pi's
+ * own slots do. A body of any other shape answers null rather than a digest
+ * of a guess: the host must be able to prove the answer crossed this
+ * channel, and a seal over invented text proves nothing.
+ *
+ * The text is hashed as it arrives, so what is retained is one SSE line and
+ * the bounded tail the usage frame is read from. A JSON body is read from
+ * that tail, and one longer than the tail answers null.
  */
-export const responseSeal = (body: string): string | null => {
-  const text = responseAnswerText(body);
-  return text === null
-    ? null
-    : createHash("sha256").update(text, "utf8").digest("hex");
+export const responseSealer = () => {
+  const hash = createHash("sha256");
+  let tail = "";
+  let total = 0;
+  let pending = "";
+  let mode: "unknown" | "sse" | "json" | "unsealable" = "unknown";
+  let sawLine = false;
+  let family: "anthropic" | "chat" | "responses" | null = null;
+  const anthropicBlocks = new Map<number, boolean>();
+  let anthropicText: number | null = null;
+  const responseItems = new Set<number>();
+  let responseItem: number | null = null;
+
+  const readLine = (rawLine: string): boolean => {
+    if (rawLine.length > SSE_LINE_CHARS) return false;
+    const line = rawLine.replace(/\r$/, "");
+    if (!sawLine) {
+      if (line.trim() === "") return true;
+      sawLine = true;
+      if (!/^(?:data|event|id|retry):/.test(line.trim())) return false;
+    }
+    if (!line.startsWith("data:")) return true;
+    const payload = line.slice(5).replace(/^ /, "");
+    if (payload === "" || payload === "[DONE]") return true;
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(payload);
+    } catch {
+      // A data line that is not JSON is a shape this seal cannot stand on.
+      return false;
+    }
+    const record = objectRecord(parsed);
+    if (!record) return false;
+    const type = typeof record["type"] === "string" ? record["type"] : "";
+
+    if (Array.isArray(record["choices"])) {
+      if (family !== null && family !== "chat") return false;
+      family = "chat";
+      const choice = objectRecord(record["choices"][0]);
+      const content = objectRecord(choice?.["delta"])?.["content"];
+      if (typeof content === "string") hash.update(content, "utf8");
+      return true;
+    }
+    if (type.startsWith("response.")) {
+      if (family !== null && family !== "responses") return false;
+      family = "responses";
+      if (
+        type !== "response.output_text.delta" &&
+        type !== "response.refusal.delta"
+      ) {
+        return true;
+      }
+      const index = record["output_index"];
+      const delta = record["delta"];
+      if (!isStreamIndex(index) || typeof delta !== "string") return false;
+      if (index !== responseItem) {
+        // A hash cannot go back to an item it already closed.
+        if (responseItems.has(index)) return false;
+        if (responseItems.size > 0) hash.update("\n", "utf8");
+        responseItems.add(index);
+        responseItem = index;
+      }
+      hash.update(delta, "utf8");
+      return true;
+    }
+    if (!ANTHROPIC_EVENTS.has(type)) return true;
+    if (family !== null && family !== "anthropic") return false;
+    family = "anthropic";
+    if (type === "content_block_start") {
+      const index = record["index"];
+      if (!isStreamIndex(index) || anthropicBlocks.has(index)) return false;
+      const block = objectRecord(record["content_block"]);
+      const isText = block?.["type"] === "text";
+      if (isText) {
+        if (anthropicText !== null) hash.update("\n", "utf8");
+        anthropicText = index;
+        const seed = block["text"];
+        if (typeof seed === "string") hash.update(seed, "utf8");
+      }
+      anthropicBlocks.set(index, isText);
+    } else if (type === "content_block_delta") {
+      const index = record["index"];
+      if (!isStreamIndex(index)) return false;
+      const delta = objectRecord(record["delta"]);
+      if (delta?.["type"] !== "text_delta") return true;
+      const text = delta["text"];
+      if (typeof text !== "string") return false;
+      // A delta whose block never opened as text is text pi never rendered.
+      if (anthropicBlocks.get(index) !== true) return true;
+      if (index !== anthropicText) return false;
+      hash.update(text, "utf8");
+    }
+    return true;
+  };
+
+  return {
+    write(chunk: string) {
+      total += chunk.length;
+      tail = (tail + chunk).slice(-RESPONSE_TAIL_CHARS);
+      if (mode === "json" || mode === "unsealable") return;
+      let text = chunk;
+      if (mode === "unknown") {
+        text = chunk.trimStart();
+        if (text === "") return;
+        mode = text.startsWith("{") ? "json" : "sse";
+        if (mode === "json") return;
+      }
+      if (!text.includes("\n")) {
+        pending += text;
+      } else {
+        const lines = (pending + text).split("\n");
+        pending = lines.pop() ?? "";
+        if (!lines.every(readLine)) mode = "unsealable";
+      }
+      if (mode === "unsealable" || pending.length > SSE_LINE_CHARS) {
+        mode = "unsealable";
+        pending = "";
+      }
+    },
+    tail: () => tail,
+    seal(): string | null {
+      if (mode === "json") {
+        const text =
+          total <= RESPONSE_TAIL_CHARS ? jsonAnswerText(tail.trim()) : null;
+        return text === null
+          ? null
+          : createHash("sha256").update(text, "utf8").digest("hex");
+      }
+      if (mode !== "sse" || !readLine(pending) || family === null) return null;
+      return hash.digest("hex");
+    },
+  };
 };

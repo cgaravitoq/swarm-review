@@ -7,7 +7,7 @@
  * run-scoped URL under /model/<runId>/<capability>/.
  */
 
-import { responseSeal } from "../container/response-seal";
+import { responseSealer } from "../container/response-seal";
 import { assertCloudRunId } from "./isolation";
 
 export type ModelCaps = {
@@ -365,19 +365,19 @@ export async function proxyModelFetch(
     });
   }
   const decoder = new TextDecoder();
-  let streamed = "";
+  const sealer = responseSealer();
   const stream = new TransformStream<Uint8Array, Uint8Array>({
     transform(chunk, controller) {
-      streamed += decoder.decode(chunk, { stream: true });
+      sealer.write(decoder.decode(chunk, { stream: true }));
       controller.enqueue(chunk);
     },
     async flush() {
-      streamed += decoder.decode();
+      sealer.write(decoder.decode());
       await recordAttempt(
         runId,
-        readUsage(streamed.slice(-65_536)),
+        readUsage(sealer.tail()),
         retryable,
-        responseSeal(streamed),
+        sealer.seal(),
       );
     },
   });
