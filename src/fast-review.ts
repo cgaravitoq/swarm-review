@@ -4,6 +4,7 @@
 
 import { mkdir, writeFile } from "node:fs/promises";
 import { join } from "node:path";
+import { writeLocalReceipt } from "./local";
 import { readUsage } from "./model-proxy";
 
 const FAST_MAX_TOKENS = 8192;
@@ -379,23 +380,16 @@ export async function writeFastLaneArtifacts(input: {
     join(input.artifactDir, "report.json"),
     JSON.stringify({ finalText: input.finalText }, null, 2),
   );
-  await writeFile(
-    join(input.artifactDir, "local-receipt.json"),
-    JSON.stringify(
-      {
-        runId: input.runId,
-        attemptId: input.attemptId,
-        outcome: input.error ? "failed" : "completed",
-        provider: input.provider,
-        model: input.model,
-        wallSeconds: input.wallSeconds,
-        teardownSeconds: 0,
-        usage: input.usage ?? {},
-        error: input.error ?? null,
-        shutdown: { truncatedArtifacts: [] },
-      },
-      null,
-      2,
-    ),
-  );
+  await writeLocalReceipt(input.artifactDir, {
+    runId: input.runId,
+    attemptId: input.attemptId,
+    outcome: input.error ? "failed" : "completed",
+    provider: input.provider,
+    model: input.model,
+    wallSeconds: input.wallSeconds,
+    teardownSeconds: 0,
+    usage: input.usage ?? {},
+    error: input.error ?? null,
+    shutdown: { truncatedArtifacts: [] },
+  });
 }
