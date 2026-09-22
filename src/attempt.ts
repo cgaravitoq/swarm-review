@@ -31,6 +31,8 @@ export const PREPARATION_STAGES = [
 
 export type PreparationStage = (typeof PREPARATION_STAGES)[number];
 
+export const PARTIAL_SUFFIX = ".partial";
+
 /**
  * The one way anything in this tree lands a receipt on disk.
  *
@@ -38,8 +40,9 @@ export type PreparationStage = (typeof PREPARATION_STAGES)[number];
  * whole file or finds none there - never a prefix of one.
  */
 export const writeAtomic = async (path: string, body: string) => {
-  await writeFile(`${path}.partial`, body);
-  await rename(`${path}.partial`, path);
+  const partial = `${path}${PARTIAL_SUFFIX}`;
+  await writeFile(partial, body);
+  await rename(partial, path);
 };
 
 /**
