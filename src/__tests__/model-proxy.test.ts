@@ -1,6 +1,6 @@
 import { createHash } from "node:crypto";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { responseSeal as brokerSeal } from "../../container/model-broker";
+import { RESPONSE_TAIL_CHARS } from "../../container/response-seal";
 import {
   emptyModelTotals,
   type ModelCaps,
@@ -12,7 +12,6 @@ import {
   publicModelUsage,
   readUsage,
   reserveAttempt,
-  responseSeal,
 } from "../model-proxy";
 
 afterEach(() => {
@@ -449,7 +448,7 @@ describe("model proxy", () => {
     expect(recorded).toEqual([{ input: null, output: 42 }]);
   });
 
-  it("seals the answer text it streamed, over what the local broker seals", async () => {
+  it("seals the answer text it streamed", async () => {
     const body = [
       'data: {"type":"message_start","message":{"content":[]}}',
       'data: {"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}',
@@ -493,43 +492,53 @@ describe("model proxy", () => {
       .update("alpha one more", "utf8")
       .digest("hex");
     expect(seals).toEqual([expected]);
-    expect(brokerSeal(body)).toBe(expected);
   });
 
-  it("seals both transports' bytes the same way, or not at all", () => {
-    const anthropic = [
-      'data: {"type":"content_block_start","index":0,"content_block":{"type":"thinking","thinking":""}}',
-      'data: {"type":"content_block_delta","index":0,"delta":{"type":"thinking_delta","thinking":"secret reasoning"}}',
-      'data: {"type":"content_block_start","index":1,"content_block":{"type":"text","text":""}}',
-      'data: {"type":"content_block_delta","index":1,"delta":{"type":"text_delta","text":"alpha one"}}',
-      'data: {"type":"content_block_start","index":2,"content_block":{"type":"text","text":"seed"}}',
-      'data: {"type":"content_block_delta","index":2,"delta":{"type":"text_delta","text":" beta"}}',
-      "data: [DONE]",
-    ].join("\n\n");
-    const chat = [
-      'data: {"choices":[{"delta":{"role":"assistant","content":""}}]}',
-      'data: {"choices":[{"delta":{"content":"gamma "}}]}',
-      'data: {"choices":[{"delta":{"content":"delta"},"finish_reason":"stop"}]}',
-      "data: [DONE]",
-    ].join("\n");
-    const responses = [
-      'data: {"type":"response.output_text.delta","output_index":0,"content_index":0,"delta":"eps "}',
-      'data: {"type":"response.refusal.delta","output_index":0,"content_index":0,"delta":"zeta"}',
-      'data: {"type":"response.output_text.delta","output_index":1,"content_index":0,"delta":"eta"}',
-      "data: [DONE]",
-    ].join("\n");
-    const jsonChat = JSON.stringify({
-      choices: [{ message: { content: "json answer" } }],
-    });
+  it("seals a stream far past its tail, but no JSON body it only kept the tail of", async () => {
+    const pieces = Array.from({ length: 64 }, () =>
+      "x".repeat(RESPONSE_TAIL_CHARS / 16),
+    );
+    const long = pieces.join("");
+    const bodies = [
+      pieces
+        .map(
+          (content) =>
+            `data: ${JSON.stringify({ choices: [{ delta: { content } }] })}`,
+        )
+        .join("\n\n"),
+      JSON.stringify({ choices: [{ message: { content: long } }] }),
+    ];
+    vi.stubGlobal(
+      "fetch",
+      vi.fn<typeof fetch>(() =>
+        Promise.resolve(new Response(bodies.shift() ?? "", { status: 200 })),
+      ),
+    );
+    const url = await proxyTarget("run-seal-bound");
+    const seals: (string | null)[] = [];
 
-    for (const body of [anthropic, chat, responses, jsonChat]) {
-      expect(responseSeal(body)).toBe(brokerSeal(body));
-      expect(responseSeal(body)).not.toBeNull();
+    for (let call = 0; call < 2; call += 1) {
+      const response = await proxyModelFetch(
+        new Request(url, {
+          method: "POST",
+          headers: { authorization: "Bearer review-pi-handle" },
+          body: "{}",
+        }),
+        url,
+        "control-secret",
+        sessionOpener(),
+        sessionConsumer(),
+        async (_runId, _usage, _retryable, seal) => {
+          seals.push(seal);
+        },
+      );
+      await response.text();
     }
-    for (const body of ["Unauthorized", "", '{"error":"quota"}']) {
-      expect(responseSeal(body)).toBeNull();
-      expect(brokerSeal(body)).toBeNull();
-    }
+
+    expect(seals).toEqual([
+      createHash("sha256").update(long, "utf8").digest("hex"),
+      null,
+    ]);
   });
 
   it("bounds a retried attempt by the request budget alone", () => {

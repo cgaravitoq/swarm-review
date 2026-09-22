@@ -114,6 +114,7 @@ RUN groupadd --gid 1101 review-control \
   && useradd --uid 1102 --gid 1102 --create-home --shell /bin/bash review-target
 
 COPY model-broker.ts /opt/review/model-broker.ts
+COPY response-seal.ts /opt/review/response-seal.ts
 RUN chmod 0755 /opt/review/model-broker.ts
 
 # Last, so a runner or broker edit reuses every layer above it. The install runs

@@ -652,6 +652,7 @@ describe("deployed container image", () => {
       ["models.json", "/opt/review/pi-config/models.json"],
       ["review-run.sh", REVIEW_RUNNER],
       ["model-broker.ts", MODEL_BROKER],
+      ["response-seal.ts", "/opt/review/response-seal.ts"],
     ]);
   });
 
@@ -696,6 +697,7 @@ describe("cloud model session accounting", () => {
         entries.set(key, value);
         return Promise.resolve();
       },
+      delete: (key: string) => Promise.resolve(entries.delete(key)),
     };
   };
 
@@ -802,5 +804,48 @@ describe("cloud model session accounting", () => {
     expect(await sandbox.modelSeals()).toEqual([
       createHash("sha256").update("sealed answer", "utf8").digest("hex"),
     ]);
+  });
+
+  it("answers a repeated stop with the seals the first one shipped", async () => {
+    const sandbox = await runningSandbox();
+    Object.assign(sandbox, {
+      killAllProcesses: vi.fn(() => Promise.resolve(0)),
+      exec: vi.fn(() => Promise.resolve({ stdout: "-1\n" })),
+      destroy: vi.fn(() => Promise.resolve()),
+    });
+    getSandbox.mockReturnValue(sandbox);
+    vi.stubGlobal(
+      "fetch",
+      vi.fn<typeof fetch>(() =>
+        Promise.resolve(
+          new Response(
+            `data: ${JSON.stringify({ choices: [{ delta: { content: "sealed answer" } }] })}\n\n`,
+          ),
+        ),
+      ),
+    );
+    await (await postModel("stop-run")).text();
+
+    const stops: unknown[] = [];
+    for (let stop = 0; stop < 2; stop += 1) {
+      const response = await handler.fetch(
+        authorized("https://review.invalid/runs/stop-run/stop", {
+          method: "POST",
+        }),
+        env,
+      );
+      stops.push(((await response.json()) as { control: unknown }).control);
+    }
+
+    const shipped = {
+      modelSeals: [
+        createHash("sha256").update("sealed answer", "utf8").digest("hex"),
+      ],
+    };
+    expect(stops).toEqual([shipped, shipped]);
+    expect(await sandbox.consumeModelAttempt()).toEqual({
+      ok: false,
+      reason: "no_session",
+    });
   });
 });

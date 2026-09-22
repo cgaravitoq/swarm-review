@@ -18,7 +18,7 @@ import { readFile, writeFile } from "node:fs/promises";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { readLocalReceipt } from "../src/local";
-import { DEFAULT_SWARM_IMAGE, parseVerdicts } from "../src/swarm";
+import { DEFAULT_SWARM_IMAGE, laneReport, parseVerdicts } from "../src/swarm";
 
 const localScript = join(
   dirname(fileURLToPath(import.meta.url)),
@@ -166,23 +166,6 @@ const spawnLocal = (args: readonly string[]) =>
     child.once("exit", (code) => resolvePromise(code ?? 1));
   });
 
-const finalText = async (artifactDir: string) => {
-  const raw = await readFile(join(artifactDir, "report.json"), "utf8").catch(
-    () => null,
-  );
-  if (!raw) return null;
-  try {
-    const report: unknown = JSON.parse(raw);
-    const value =
-      typeof report === "object" && report !== null
-        ? (report as Record<string, unknown>)["finalText"]
-        : undefined;
-    return typeof value === "string" ? value : null;
-  } catch {
-    return null;
-  }
-};
-
 /**
  * Runs one T1a top-level trial.
  *
@@ -207,7 +190,6 @@ export async function runT1aTrial(
   },
   deps: {
     run?: (args: readonly string[]) => Promise<number>;
-    readFinalText?: (dir: string) => Promise<string | null>;
     readReceipt?: (
       dir: string,
     ) => Promise<Awaited<ReturnType<typeof readLocalReceipt>> | null>;
@@ -220,7 +202,6 @@ export async function runT1aTrial(
   const artifactDir = join(options.outDir, options.runId);
   const promptPath = join(options.outDir, `${options.runId}-verifier.txt`);
   const run = deps.run ?? spawnLocal;
-  const readText = deps.readFinalText ?? finalText;
   const readReceipt =
     deps.readReceipt ??
     ((dir: string) => readLocalReceipt(dir).catch(() => null));
@@ -304,10 +285,13 @@ export async function runT1aTrial(
     row.error ??= `verifier session exited ${exitCode}`;
     return row;
   }
-  const parsed = parseVerdicts(
-    (await readText(artifactDir)) ?? "",
-    candidateIds,
-  );
+  const report = await laneReport(artifactDir, { requireSeal: true });
+  if (report && !report.attested) {
+    row.outcome = "invalid";
+    row.contractError = report.attestationReason;
+    return row;
+  }
+  const parsed = parseVerdicts(report?.finalText ?? "", candidateIds);
   if (parsed.error) {
     row.outcome = "invalid";
     row.contractError = parsed.error;

@@ -11,6 +11,7 @@ import {
   reserveAttempt,
   resolveUpstreamTarget,
 } from "../../container/model-broker";
+import { RESPONSE_TAIL_CHARS } from "../../container/response-seal";
 
 const CANARY = "canary-bearer-do-not-log-9f3c";
 
@@ -238,6 +239,32 @@ describe("model broker", () => {
 
     expect(response.status).toBe(200);
     expect((await requestEntry())?.["seal"]).toBeNull();
+  });
+
+  it("seals a stream far past its tail, but no JSON body it only kept the tail of", async () => {
+    const pieces = Array.from({ length: 64 }, () =>
+      "x".repeat(RESPONSE_TAIL_CHARS / 16),
+    );
+    const long = pieces.join("");
+    upstreamBody = pieces
+      .map(
+        (content) =>
+          `data: ${JSON.stringify({ choices: [{ delta: { content } }] })}`,
+      )
+      .join("\n\n");
+    await call().then((response) => response.text());
+    upstreamBody = JSON.stringify({
+      choices: [{ message: { content: long } }],
+    });
+    await call().then((response) => response.text());
+
+    const seals = (await readFile(ledgerPath, "utf8"))
+      .split("\n")
+      .filter(Boolean)
+      .map((line) => JSON.parse(line) as Record<string, unknown>)
+      .filter((entry) => entry["event"] === "provider_request")
+      .map((entry) => entry["seal"]);
+    expect(seals).toEqual([sha256(long), null]);
   });
 
   it("stops calling the provider once a cumulative token cap is reached", async () => {

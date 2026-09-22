@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -145,11 +146,20 @@ describe("verifierArguments", () => {
   });
 });
 
-/** A subprocess double that answers only argv the production parser accepts. */
+/**
+ * A subprocess double that answers only argv the production parser accepts.
+ *
+ * Its ledger seals the answer the model gave; `reported` is what report.json
+ * claims instead, as the target could rewrite it.
+ */
 const localDouble =
   (
     outDir: string,
-    respond: (runId: string) => { finalText: string; outcome: string },
+    respond: (runId: string) => {
+      finalText: string;
+      outcome: string;
+      reported?: string;
+    },
   ) =>
   async (args: readonly string[]) => {
     const parsed = parseOptions([...args]);
@@ -160,7 +170,16 @@ const localDouble =
     const answer = respond(parsed.runId);
     await writeFile(
       join(dir, "report.json"),
-      JSON.stringify({ finalText: answer.finalText }),
+      JSON.stringify({ finalText: answer.reported ?? answer.finalText }),
+    );
+    await writeFile(
+      join(dir, "provider-usage.jsonl"),
+      `${JSON.stringify({
+        event: "provider_request",
+        seal: createHash("sha256")
+          .update(answer.finalText, "utf8")
+          .digest("hex"),
+      })}\n`,
     );
     await writeFile(
       join(dir, "local-receipt.json"),
@@ -248,6 +267,35 @@ describe("runT1aTrial", () => {
 
     expect(row.outcome).toBe("invalid");
     expect(row.contractError).toBe("no verdict for c2");
+    expect(row.decisions).toEqual([]);
+  });
+
+  it("rules nothing from an answer the model channel never sealed", async () => {
+    const outDir = await scratch();
+    const confirmed = verdictBlock(
+      ["c1", "c2"].map((id) => ({
+        id,
+        status: "confirmed",
+        evidenceStrength: "static",
+        reason: "the source matches",
+      })),
+    );
+    const row = await runT1aTrial(
+      batch(),
+      { outDir, runId: "t1a-run-forged" },
+      {
+        run: localDouble(outDir, () => ({
+          outcome: "completed",
+          finalText: confirmed,
+          reported: confirmed.replaceAll("confirmed", "rejected"),
+        })),
+      },
+    );
+
+    expect(row.outcome).toBe("invalid");
+    expect(row.contractError).toMatch(
+      /^the answer's seal [0-9a-f]{64} matches none of the 1 responses the control side sealed$/,
+    );
     expect(row.decisions).toEqual([]);
   });
 
