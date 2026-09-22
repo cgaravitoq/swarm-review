@@ -17,11 +17,14 @@ export type ModelCaps = {
   maxRequestBytes: number;
 };
 
+/** Provider-reported usage. A field the body never carried is null, never zero. */
+export type ModelUsage = { input: number | null; output: number | null };
+
 export type ModelTotals = {
   requests: number;
   retries: number;
-  input: number;
-  output: number;
+  input: number | null;
+  output: number | null;
 };
 
 export type ModelSession = {
@@ -31,6 +34,8 @@ export type ModelSession = {
   upstreamAccountId?: string;
   caps: ModelCaps;
   totals: ModelTotals;
+  /** Set once an attempt failed the way a client repeats; the next one is a retry. */
+  retryPending?: boolean;
 };
 
 const hex = (buffer: ArrayBuffer) =>
@@ -86,8 +91,8 @@ export function modelsJsonForProxy(
 export const emptyModelTotals = (): ModelTotals => ({
   requests: 0,
   retries: 0,
-  input: 0,
-  output: 0,
+  input: null,
+  output: null,
 });
 
 export function publicModelUsage(session: ModelSession | undefined) {
@@ -101,11 +106,13 @@ export function publicModelUsage(session: ModelSession | undefined) {
 
 export const capViolation = (totals: ModelTotals, caps: ModelCaps) => {
   if (totals.requests >= caps.maxRequests) return "max_requests";
-  if (totals.retries >= caps.maxRetriesPerRequest * caps.maxRequests) {
-    return "max_retries";
+  if (totals.input !== null && totals.input >= caps.maxCumulativeInputTokens) {
+    return "max_input_tokens";
   }
-  if (totals.input >= caps.maxCumulativeInputTokens) return "max_input_tokens";
-  if (totals.output >= caps.maxCumulativeOutputTokens) {
+  if (
+    totals.output !== null &&
+    totals.output >= caps.maxCumulativeOutputTokens
+  ) {
     return "max_output_tokens";
   }
   return null;
@@ -146,11 +153,8 @@ export function resolveUpstreamTarget(requestUrl: string, baseUrl: string) {
   return target;
 }
 
-export const readUsage = (
-  body: string,
-): { input: number; output: number } | null => {
-  const totals = { input: 0, output: 0 };
-  let seen = false;
+export const readUsage = (body: string): ModelUsage | null => {
+  const totals: ModelUsage = { input: null, output: null };
   const numberAt = (record: Record<string, unknown>, key: string) => {
     const value = record[key];
     return typeof value === "number" ? value : 0;
@@ -165,7 +169,6 @@ export const readUsage = (
       candidate["completion_tokens"] ??
       candidate["outputTokens"];
     if (typeof input !== "number" && typeof output !== "number") return;
-    seen = true;
     if (typeof input === "number") {
       totals.input =
         input +
@@ -199,7 +202,7 @@ export const readUsage = (
       );
     } catch {}
   }
-  return seen ? totals : null;
+  return totals.input === null && totals.output === null ? null : totals;
 };
 
 const jsonError = (status: number, reason: string) =>
@@ -207,6 +210,53 @@ const jsonError = (status: number, reason: string) =>
     status,
     headers: { "content-type": "application/json" },
   });
+
+/**
+ * A status a client repeats, which makes the attempt that follows it on this
+ * session a retry rather than a new request. The observed attempt is the only
+ * source of that count the container cannot forge.
+ */
+const retryableFailure = (status: number) =>
+  status === 408 || status === 429 || status >= 500;
+
+/**
+ * The request body, or the refusal when it is over the session's byte cap.
+ *
+ * The declared length arrives from the container, which is the untrusted side
+ * of this boundary, so the bytes are counted as they are read either way: a
+ * target that understates its own `content-length` cannot carry a body past
+ * the cap the broker enforces for the local path.
+ */
+const readBoundedBody = async (
+  request: Request,
+  maxBytes: number,
+): Promise<Uint8Array | "max_request_bytes"> => {
+  const declared = request.headers.get("content-length");
+  if (declared !== null && Number(declared) > maxBytes) {
+    return "max_request_bytes";
+  }
+  if (!request.body) return new Uint8Array();
+  const reader = request.body.getReader();
+  const chunks: Uint8Array[] = [];
+  let total = 0;
+  while (true) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    total += value.byteLength;
+    if (total > maxBytes) {
+      await reader.cancel();
+      return "max_request_bytes";
+    }
+    chunks.push(value);
+  }
+  const body = new Uint8Array(total);
+  let offset = 0;
+  for (const chunk of chunks) {
+    body.set(chunk, offset);
+    offset += chunk.byteLength;
+  }
+  return body;
+};
 
 /**
  * The handle the target presented, from either header it may arrive on.
@@ -226,14 +276,16 @@ export async function proxyModelFetch(
   request: Request,
   url: URL,
   secret: string,
+  open: (runId: string) => Promise<{ handle: string; caps: ModelCaps } | null>,
   consume: (
     runId: string,
   ) => Promise<
     { ok: true; session: ModelSession } | { ok: false; reason: string }
   >,
-  recordUsage: (
+  recordAttempt: (
     runId: string,
-    usage: { input: number; output: number } | null,
+    usage: ModelUsage | null,
+    retryable: boolean,
   ) => Promise<void>,
 ): Promise<Response> {
   const segments = url.pathname.split("/").filter(Boolean);
@@ -252,11 +304,19 @@ export async function proxyModelFetch(
   if (capability !== (await modelCapability(runId, secret))) {
     return jsonError(403, "capability_rejected");
   }
-  const consumed = await consume(runId);
-  if (!consumed.ok) return jsonError(429, consumed.reason);
-  if (presentedHandle(request) !== consumed.session.handle) {
+  const opened = await open(runId);
+  if (!opened) return jsonError(429, "no_session");
+  if (presentedHandle(request) !== opened.handle) {
     return jsonError(401, "handle_rejected");
   }
+  const method = request.method;
+  const body =
+    method === "GET" || method === "HEAD"
+      ? null
+      : await readBoundedBody(request, opened.caps.maxRequestBytes);
+  if (body === "max_request_bytes") return jsonError(413, body);
+  const consumed = await consume(runId);
+  if (!consumed.ok) return jsonError(429, consumed.reason);
   let target: URL;
   try {
     target = resolveUpstreamTarget(
@@ -276,24 +336,25 @@ export async function proxyModelFetch(
   // the target's handle on it would send the upstream a credential that is not
   // one.
   headers.delete("cf-aig-authorization");
+  headers.delete("content-length");
   if (consumed.session.upstreamAccountId) {
     headers.set("chatgpt-account-id", consumed.session.upstreamAccountId);
   }
   const upstream = await fetch(target, {
-    method: request.method,
+    method,
     headers,
-    body:
-      request.method === "GET" || request.method === "HEAD"
-        ? null
-        : request.body,
+    body,
     redirect: "manual",
-    ...(request.method === "POST" ? { duplex: "half" } : {}),
-  } as RequestInit);
+  } as RequestInit).catch(async (error: unknown) => {
+    await recordAttempt(runId, null, true);
+    throw error;
+  });
+  const retryable = retryableFailure(upstream.status);
   const responseHeaders = new Headers(upstream.headers);
   responseHeaders.delete("content-encoding");
   responseHeaders.delete("content-length");
   if (!upstream.body) {
-    await recordUsage(runId, null);
+    await recordAttempt(runId, null, retryable);
     return new Response(null, {
       status: upstream.status,
       headers: responseHeaders,
@@ -306,7 +367,7 @@ export async function proxyModelFetch(
       controller.enqueue(chunk);
     },
     async flush() {
-      await recordUsage(runId, readUsage(tail));
+      await recordAttempt(runId, readUsage(tail), retryable);
     },
   });
   return new Response(upstream.body.pipeThrough(stream), {

@@ -174,8 +174,8 @@ const usageFrom = (value: unknown) => {
     record?.["outputTokens"];
   if (typeof input !== "number" && typeof output !== "number") return null;
   return {
-    inputTokens: typeof input === "number" ? input : 0,
-    outputTokens: typeof output === "number" ? output : 0,
+    ...(typeof input === "number" ? { inputTokens: input } : {}),
+    ...(typeof output === "number" ? { outputTokens: output } : {}),
   };
 };
 
@@ -278,7 +278,12 @@ export async function completeOnce(input: {
       (record?.["response"] as Record<string, unknown> | undefined)?.["usage"],
     ) ??
     (streamed
-      ? { inputTokens: streamed.input, outputTokens: streamed.output }
+      ? {
+          ...(streamed.input === null ? {} : { inputTokens: streamed.input }),
+          ...(streamed.output === null
+            ? {}
+            : { outputTokens: streamed.output }),
+        }
       : null);
   return {
     content,

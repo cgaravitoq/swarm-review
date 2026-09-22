@@ -32,6 +32,7 @@ import {
 import {
   emptyModelTotals,
   type ModelSession,
+  type ModelUsage,
   modelCapability,
   modelProxyBaseUrl,
   modelsJsonForProxy,
@@ -52,18 +53,29 @@ export class ReviewSandbox extends Sandbox<ReviewPiEnv> {
   async consumeModelAttempt() {
     const session = await this.ctx.storage.get<ModelSession>(MODEL_SESSION_KEY);
     if (!session) return { ok: false as const, reason: "no_session" };
-    const refusal = reserveAttempt(session.totals, session.caps, false);
+    const refusal = reserveAttempt(
+      session.totals,
+      session.caps,
+      session.retryPending === true,
+    );
     if (refusal) return { ok: false as const, reason: refusal };
+    session.retryPending = false;
     await this.ctx.storage.put(MODEL_SESSION_KEY, session);
     return { ok: true as const, session };
   }
 
-  async addModelUsage(usage: { input: number; output: number } | null) {
-    if (!usage) return;
+  async recordModelAttempt(usage: ModelUsage | null, retryable: boolean) {
     const session = await this.ctx.storage.get<ModelSession>(MODEL_SESSION_KEY);
     if (!session) return;
-    session.totals.input += usage.input;
-    session.totals.output += usage.output;
+    if (usage) {
+      if (usage.input !== null) {
+        session.totals.input = (session.totals.input ?? 0) + usage.input;
+      }
+      if (usage.output !== null) {
+        session.totals.output = (session.totals.output ?? 0) + usage.output;
+      }
+    }
+    session.retryPending = retryable;
     await this.ctx.storage.put(MODEL_SESSION_KEY, session);
   }
 
@@ -230,10 +242,14 @@ export default {
         request,
         url0,
         env.CONTROL_SECRET,
+        async (runId) => getSandbox(env.REVIEW_SANDBOX, runId).modelUsage(),
         async (runId) =>
           getSandbox(env.REVIEW_SANDBOX, runId).consumeModelAttempt(),
-        async (runId, usage) =>
-          getSandbox(env.REVIEW_SANDBOX, runId).addModelUsage(usage),
+        async (runId, usage, retryable) =>
+          getSandbox(env.REVIEW_SANDBOX, runId).recordModelAttempt(
+            usage,
+            retryable,
+          ),
       );
     }
 
