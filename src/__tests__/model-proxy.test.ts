@@ -1,6 +1,5 @@
 import { createHash } from "node:crypto";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { responseSeal as brokerSeal } from "../../container/model-broker";
 import {
   emptyModelTotals,
   type ModelCaps,
@@ -12,7 +11,6 @@ import {
   publicModelUsage,
   readUsage,
   reserveAttempt,
-  responseSeal,
 } from "../model-proxy";
 
 afterEach(() => {
@@ -449,7 +447,7 @@ describe("model proxy", () => {
     expect(recorded).toEqual([{ input: null, output: 42 }]);
   });
 
-  it("seals the answer text it streamed, over what the local broker seals", async () => {
+  it("seals the answer text it streamed", async () => {
     const body = [
       'data: {"type":"message_start","message":{"content":[]}}',
       'data: {"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}',
@@ -493,43 +491,6 @@ describe("model proxy", () => {
       .update("alpha one more", "utf8")
       .digest("hex");
     expect(seals).toEqual([expected]);
-    expect(brokerSeal(body)).toBe(expected);
-  });
-
-  it("seals both transports' bytes the same way, or not at all", () => {
-    const anthropic = [
-      'data: {"type":"content_block_start","index":0,"content_block":{"type":"thinking","thinking":""}}',
-      'data: {"type":"content_block_delta","index":0,"delta":{"type":"thinking_delta","thinking":"secret reasoning"}}',
-      'data: {"type":"content_block_start","index":1,"content_block":{"type":"text","text":""}}',
-      'data: {"type":"content_block_delta","index":1,"delta":{"type":"text_delta","text":"alpha one"}}',
-      'data: {"type":"content_block_start","index":2,"content_block":{"type":"text","text":"seed"}}',
-      'data: {"type":"content_block_delta","index":2,"delta":{"type":"text_delta","text":" beta"}}',
-      "data: [DONE]",
-    ].join("\n\n");
-    const chat = [
-      'data: {"choices":[{"delta":{"role":"assistant","content":""}}]}',
-      'data: {"choices":[{"delta":{"content":"gamma "}}]}',
-      'data: {"choices":[{"delta":{"content":"delta"},"finish_reason":"stop"}]}',
-      "data: [DONE]",
-    ].join("\n");
-    const responses = [
-      'data: {"type":"response.output_text.delta","output_index":0,"content_index":0,"delta":"eps "}',
-      'data: {"type":"response.refusal.delta","output_index":0,"content_index":0,"delta":"zeta"}',
-      'data: {"type":"response.output_text.delta","output_index":1,"content_index":0,"delta":"eta"}',
-      "data: [DONE]",
-    ].join("\n");
-    const jsonChat = JSON.stringify({
-      choices: [{ message: { content: "json answer" } }],
-    });
-
-    for (const body of [anthropic, chat, responses, jsonChat]) {
-      expect(responseSeal(body)).toBe(brokerSeal(body));
-      expect(responseSeal(body)).not.toBeNull();
-    }
-    for (const body of ["Unauthorized", "", '{"error":"quota"}']) {
-      expect(responseSeal(body)).toBeNull();
-      expect(brokerSeal(body)).toBeNull();
-    }
   });
 
   it("bounds a retried attempt by the request budget alone", () => {

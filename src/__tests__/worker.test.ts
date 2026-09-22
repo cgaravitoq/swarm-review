@@ -652,6 +652,7 @@ describe("deployed container image", () => {
       ["models.json", "/opt/review/pi-config/models.json"],
       ["review-run.sh", REVIEW_RUNNER],
       ["model-broker.ts", MODEL_BROKER],
+      ["response-seal.ts", "/opt/review/response-seal.ts"],
     ]);
   });
 
