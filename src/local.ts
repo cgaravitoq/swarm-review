@@ -2875,7 +2875,7 @@ async function main() {
         supervised: true,
         ...(options.pullRequest ? { pullRequest: options.pullRequest } : {}),
       };
-      await writeFile(metadataPath, JSON.stringify(metadata, null, 2));
+      await writeAtomic(metadataPath, JSON.stringify(metadata, null, 2));
 
       await docker(
         [
