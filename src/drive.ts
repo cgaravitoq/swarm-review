@@ -131,10 +131,17 @@ type RunState = {
   control?: { modelUsage?: unknown };
   artifacts: Artifact[];
 };
+/**
+ * Both answers `POST /runs` gives: a started lane and a canary.
+ *
+ * A canary starts no review process, so it names itself and answers with a
+ * null process id; the isolation probes are the same object on both.
+ */
 type RunStart = {
   runId: string;
-  processId: string;
+  processId: string | null;
   startedAt: string;
+  canary?: boolean;
   placementId: string | null;
   container: {
     runnerSha: string;
@@ -147,10 +154,14 @@ type RunStart = {
     controlUid: number;
     targetUid: number;
   };
-  controlApi: {
-    httpStatus: number | null;
-    uid: number | null;
-    reason: string;
+  probes: {
+    targetReadBroker: { verdict: string | null; reason: string };
+    controlApi: {
+      httpStatus: number | null;
+      uid: number | null;
+      reason: string;
+      escaped: boolean;
+    };
   };
 };
 type RunStop = {
