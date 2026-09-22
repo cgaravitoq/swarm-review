@@ -22,11 +22,13 @@ import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import {
   openAttempt,
+  PARTIAL_SUFFIX,
   type PreparationStage,
   planTrialReservation,
   preparationFailureReceipt,
   reserveWholeTrial,
   sessionLedger,
+  writeAtomic,
   writeTerminalReceipt,
 } from "./attempt";
 import {
@@ -43,6 +45,7 @@ import {
   assertRunId,
   createBudget,
   ensureObjects,
+  isMissingFile,
   mintRunId,
   readLaneReceipt,
   requiredRepo,
@@ -1158,11 +1161,6 @@ export async function pullRequestContext(input: {
   }
 }
 
-const writeAtomic = async (path: string, body: string) => {
-  await writeFile(`${path}.tmp`, body);
-  await rename(`${path}.tmp`, path);
-};
-
 /**
  * The work queue the verifier pool claims from.
  *
@@ -1170,13 +1168,17 @@ const writeAtomic = async (path: string, body: string) => {
  * because the loser of the race finds no source left to rename. Nothing reads
  * a queue entry without moving it first, so a candidate can be briefed to at
  * most one verifier, and a lane that finds nothing to claim is either told to
- * wait or told to end.
+ * wait or told to end. A name still carrying the write's partial suffix is a
+ * group mid-publish, or one a crash stranded before its rename, and is not an
+ * entry yet.
  */
 export function claimQueue(root: string) {
   const pendingDir = join(root, "pending");
   const takenDir = join(root, "taken");
-  const namesIn = (directory: string) =>
-    readdir(directory).catch(() => [] as string[]);
+  const namesIn = async (directory: string) =>
+    (await readdir(directory).catch(() => [] as string[])).filter(
+      (name) => !name.endsWith(PARTIAL_SUFFIX),
+    );
   return {
     root,
     async publish(groups: readonly CandidateGroup[]) {
@@ -1982,12 +1984,6 @@ type LaneReceiptEvidence =
   | { receipt: null; damage: string };
 
 const NO_LANE_RECEIPT: LaneReceiptEvidence = { receipt: null, damage: null };
-
-const isMissingFile = (error: unknown) =>
-  typeof error === "object" &&
-  error !== null &&
-  "code" in error &&
-  error.code === "ENOENT";
 
 /**
  * A lane's receipt, and whether the read that should have produced it failed.

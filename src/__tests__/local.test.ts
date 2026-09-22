@@ -3,6 +3,7 @@ import { createHash } from "node:crypto";
 import { existsSync, readFileSync, realpathSync } from "node:fs";
 import {
   chmod,
+  link,
   mkdir,
   mkdtemp,
   readFile,
@@ -12,7 +13,7 @@ import {
 } from "node:fs/promises";
 import { createRequire } from "node:module";
 import { tmpdir } from "node:os";
-import { dirname, join } from "node:path";
+import { basename, dirname, join } from "node:path";
 import { fileURLToPath, pathToFileURL, URL } from "node:url";
 import { afterAll, afterEach, describe, expect, it, vi } from "vitest";
 import {
@@ -45,6 +46,7 @@ import {
   TARGET_UID,
   TEARDOWN_BUDGET_SECONDS,
   targetProviderEnv,
+  writeLocalReceipt,
 } from "../local";
 import { SESSION_CAPS } from "../provider-budget";
 import { neverReachedModel } from "../swarm";
@@ -229,7 +231,7 @@ root="\${FAKE_CONTAINER_ROOT:?}"
 joined=" $* "
 echo "$*" >> "$state/docker.log"
 if [[ "$1" == "ps" ]]; then
-  if [[ "$joined" == *" label=review-pi.ownership="* && -f "$state/created" ]]; then
+  if [[ ("$joined" == *" label=review-pi.ownership="* || "$joined" == *" name=^"*) && -f "$state/created" ]]; then
     echo fake-container-id
   fi
   exit 0
@@ -275,6 +277,7 @@ if [[ "$1" == "cp" ]]; then
     /bin/cp "$2" "$root/copied-models.json"
   fi
   if [[ "$3" == *"/job.json" ]]; then
+    /bin/cp "$2" "$root/job.json"
     /bin/cp "$2" "$root/copied-job.json"
   fi
   exit 0
@@ -1721,6 +1724,81 @@ describe("public local CLI lifecycle", {
     await expect(readFile(stagedAuthPath, "utf8")).rejects.toThrow();
   });
 
+  // A reader that opened the previous file keeps its inode. A write through
+  // the file's own name rewrites that inode under the reader; a rename swaps a
+  // whole new one in and leaves the held one as it was.
+  const holdPrevious = async (root: string, path: string) => {
+    const held = join(root, `held-${basename(path)}`);
+    await rm(path, { force: true });
+    await writeFile(held, "previous");
+    await link(held, path);
+    return held;
+  };
+
+  it("swaps its metadata and receipt in by rename, never through their names", async () => {
+    const root = await mkdtemp(join(tmpdir(), "review-pi-cli-"));
+    temporaryDirectories.push(root);
+    const arranged = await arrangeFakeDocker(root);
+    const runId = "atomic-receipts";
+    const out = join(root, "out");
+    await mkdir(join(out, runId), { recursive: true });
+    const metadata = await holdPrevious(
+      root,
+      join(out, runId, "metadata.json"),
+    );
+    const receipt = await holdPrevious(
+      root,
+      join(out, runId, "local-receipt.json"),
+    );
+
+    const result = await runLocalCli(
+      localArguments(out, runId),
+      fakeEnvironment(arranged, runId, "success"),
+    );
+
+    expect(result.code, result.output).toBe(0);
+    expect(await readFile(metadata, "utf8")).toBe("previous");
+    expect(await readFile(receipt, "utf8")).toBe("previous");
+    expect(
+      JSON.parse(await readFile(join(out, runId, "metadata.json"), "utf8")),
+    ).toMatchObject({ runId });
+    await expect(readLocalReceipt(join(out, runId))).resolves.toMatchObject({
+      runId,
+      outcome: "completed",
+    });
+  });
+
+  it("swaps a cancelled run's receipt in by rename", async () => {
+    const root = await mkdtemp(join(tmpdir(), "review-pi-cli-"));
+    temporaryDirectories.push(root);
+    const arranged = await arrangeFakeDocker(root);
+    const runId = "atomic-cancel";
+    const out = join(root, "out");
+    const environment = fakeEnvironment(arranged, runId, "success");
+    const kept = await runLocalCli(
+      [...localArguments(out, runId), "--keep"],
+      environment,
+    );
+    expect(kept.code, kept.output).toBe(0);
+    const receipt = await holdPrevious(
+      root,
+      join(out, runId, "local-receipt.json"),
+    );
+
+    const result = await runLocalCli(
+      [localScript, "--out", out, "--run-id", runId, "--cancel"],
+      environment,
+    );
+
+    expect(result.code, result.output).toBe(0);
+    expect(await readFile(join(arranged.state, "cancelled"), "utf8")).toBe("");
+    expect(await readFile(receipt, "utf8")).toBe("previous");
+    await expect(readLocalReceipt(join(out, runId))).resolves.toMatchObject({
+      runId,
+      outcome: "cancelled",
+    });
+  });
+
   it("collects a lane that died before the bridge existed", async () => {
     // The real hang: bun install failed at 21:56:49Z, status.json said failed
     // with a dead process from that second on, and the coordinator waited
@@ -2276,5 +2354,38 @@ describe("mintRunId", () => {
     } finally {
       now.mockRestore();
     }
+  });
+});
+
+describe("writeLocalReceipt", () => {
+  it("never lets a reader observe a partial receipt", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "review-pi-receipt-"));
+    temporaryDirectories.push(directory);
+    const path = join(directory, "local-receipt.json");
+    const receipt = {
+      runId: "run-1",
+      probe: "x".repeat(8 * 1024 * 1024),
+    };
+    const body = JSON.stringify(receipt, null, 2);
+    const state = { writing: true, absent: false, torn: false };
+    const readers = Array.from({ length: 4 }, () =>
+      (async () => {
+        while (state.writing) {
+          const raw = await readFile(path, "utf8").catch(() => null);
+          if (raw === null) state.absent = true;
+          else if (raw !== body) state.torn = true;
+        }
+      })(),
+    );
+    try {
+      await writeLocalReceipt(directory, receipt);
+    } finally {
+      state.writing = false;
+    }
+    await Promise.all(readers);
+
+    expect(state.absent).toBe(true);
+    expect(state.torn).toBe(false);
+    expect(await readFile(path, "utf8")).toBe(body);
   });
 });

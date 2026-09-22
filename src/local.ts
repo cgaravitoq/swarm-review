@@ -33,6 +33,7 @@ import {
   evaluateAdmission,
   parseEnvironmentProbe,
 } from "./admission";
+import { writeAtomic } from "./attempt";
 import {
   BROKER_PORT,
   CONTROL_DIR,
@@ -1540,7 +1541,7 @@ export async function readLocalReceipt(directory: string) {
   };
 }
 
-const isMissingFile = (error: unknown) =>
+export const isMissingFile = (error: unknown) =>
   typeof error === "object" &&
   error !== null &&
   "code" in error &&
@@ -1589,6 +1590,16 @@ export async function readLaneReceipt(directory: string) {
     error: runError,
   };
 }
+
+/** Writes the local driver's receipt so a reader never sees it half-written. */
+export const writeLocalReceipt = async (
+  directory: string,
+  receipt: Record<string, unknown>,
+) =>
+  writeAtomic(
+    join(directory, "local-receipt.json"),
+    JSON.stringify(receipt, null, 2),
+  );
 
 async function exportArtifacts(
   containerName: string,
@@ -2465,10 +2476,7 @@ async function main() {
             transportError: shutdown.transportError,
           },
         };
-        await writeFile(
-          join(outDir, "local-receipt.json"),
-          JSON.stringify(receipt, null, 2),
-        );
+        await writeLocalReceipt(outDir, receipt);
         console.log(JSON.stringify(cancelRes, null, 2));
         return;
       }
@@ -2867,7 +2875,7 @@ async function main() {
         supervised: true,
         ...(options.pullRequest ? { pullRequest: options.pullRequest } : {}),
       };
-      await writeFile(metadataPath, JSON.stringify(metadata, null, 2));
+      await writeAtomic(metadataPath, JSON.stringify(metadata, null, 2));
 
       await docker(
         [
@@ -3277,10 +3285,7 @@ async function main() {
       transportError: shutdown.transportError,
     },
   };
-  await writeFile(
-    join(outDir, "local-receipt.json"),
-    JSON.stringify(receipt, null, 2),
-  );
+  await writeLocalReceipt(outDir, receipt);
   process.off("SIGINT", onSignal);
   process.off("SIGTERM", onSignal);
   process.off("SIGHUP", onSignal);

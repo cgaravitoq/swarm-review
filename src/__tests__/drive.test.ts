@@ -1,4 +1,4 @@
-import { mkdtemp, writeFile } from "node:fs/promises";
+import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
@@ -18,6 +18,7 @@ import {
   REPORT_GRACE_MS,
   requestControl,
   runWithCleanup,
+  writeCloudReceipt,
 } from "../drive";
 import { BROKER_LEDGER, parseCloudRunRequest } from "../isolation";
 import {
@@ -1145,5 +1146,38 @@ describe("local driver lifecycle", () => {
     expect(parseCloudRunRequest(payload).job.targetEnv).toEqual({
       CLOUDFLARE_ACCOUNT_ID: "0630089e",
     });
+  });
+});
+
+describe("writeCloudReceipt", () => {
+  it("never lets a reader observe a partial receipt", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "review-pi-receipt-"));
+    const path = join(directory, "receipt.json");
+    const receipt = {
+      runId: "run-1",
+      probe: "x".repeat(8 * 1024 * 1024),
+    };
+    const body = JSON.stringify(receipt, null, 2);
+    const state = { writing: true, absent: false, torn: false };
+    const readers = Array.from({ length: 4 }, () =>
+      (async () => {
+        while (state.writing) {
+          const raw = await readFile(path, "utf8").catch(() => null);
+          if (raw === null) state.absent = true;
+          else if (raw !== body) state.torn = true;
+        }
+      })(),
+    );
+    try {
+      await writeCloudReceipt(directory, receipt);
+    } finally {
+      state.writing = false;
+    }
+    await Promise.all(readers);
+
+    expect(state.absent).toBe(true);
+    expect(state.torn).toBe(false);
+    expect(await readFile(path, "utf8")).toBe(body);
+    await rm(directory, { recursive: true, force: true });
   });
 });

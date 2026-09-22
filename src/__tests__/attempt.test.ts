@@ -9,6 +9,7 @@ import {
   preparationFailureReceipt,
   reserveWholeTrial,
   sessionLedger,
+  writeAtomic,
 } from "../attempt";
 
 const temporaryDirectories: string[] = [];
@@ -249,5 +250,39 @@ describe("preparation failure receipt", () => {
     });
     expect(receipt.lanes).toEqual([]);
     expect(receipt.findings).toEqual([]);
+  });
+});
+
+describe("writeAtomic", () => {
+  it("never lets a reader observe a partial file", async () => {
+    const directory = await suite();
+    const path = join(directory, "receipt.json");
+    const body = JSON.stringify(
+      { runId: "run-1", probe: "x".repeat(8 * 1024 * 1024) },
+      null,
+      2,
+    );
+    const state = { writing: true, absent: false, torn: false };
+    const readers = Array.from({ length: 4 }, () =>
+      (async () => {
+        while (state.writing) {
+          const raw = await readFile(path, "utf8").catch(() => null);
+          if (raw === null) state.absent = true;
+          else if (raw !== body) state.torn = true;
+        }
+      })(),
+    );
+    try {
+      await writeAtomic(path, body);
+    } finally {
+      state.writing = false;
+    }
+    await Promise.all(readers);
+
+    // Correct final bytes prove nothing on their own: what makes this atomic
+    // is that every read during the write saw absence, never a prefix.
+    expect(state.absent).toBe(true);
+    expect(state.torn).toBe(false);
+    expect(await readFile(path, "utf8")).toBe(body);
   });
 });

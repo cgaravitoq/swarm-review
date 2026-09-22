@@ -12,6 +12,7 @@ import { mkdir, readFile, writeFile } from "node:fs/promises";
 import { dirname, join } from "node:path";
 import { setTimeout as sleep } from "node:timers/promises";
 import { fileURLToPath } from "node:url";
+import { writeAtomic } from "./attempt";
 import { BROKER_LEDGER } from "./isolation";
 import {
   adaptModelsConfig,
@@ -974,7 +975,7 @@ async function main() {
     );
   }
   if (finalize) {
-    await writeFile(
+    await writeAtomic(
       join(outDir, "finalize.json"),
       JSON.stringify(finalize, null, 2),
     );
@@ -1023,10 +1024,7 @@ async function main() {
         : (stopped?.shutdown.destroy.error ?? null),
     },
   };
-  await writeFile(
-    join(outDir, "receipt.json"),
-    JSON.stringify(receipt, null, 2),
-  );
+  await writeCloudReceipt(outDir, receipt);
   console.log(`receipts: ${outDir}`);
 
   const failure = lifecycle.runError ?? lifecycle.cleanupError;
@@ -1040,6 +1038,16 @@ async function main() {
 
 const messageOf = (error: unknown) =>
   error instanceof Error ? error.message : String(error);
+
+/** Writes the cloud driver's receipt so a reader never sees it half-written. */
+export const writeCloudReceipt = async (
+  directory: string,
+  receipt: Record<string, unknown>,
+) =>
+  writeAtomic(
+    join(directory, "receipt.json"),
+    JSON.stringify(receipt, null, 2),
+  );
 
 if (import.meta.main) {
   await main();

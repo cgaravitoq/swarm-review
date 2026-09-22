@@ -1,9 +1,13 @@
+import { mkdtemp, readFile, rm } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import {
   canaryModel,
   canaryModels,
   completeOnce,
   packedRequestBody,
+  writeFastLaneArtifacts,
 } from "../fast-review";
 
 afterEach(() => {
@@ -506,5 +510,58 @@ describe("canaryModel", () => {
       "workers-ai/@cf/deepseek-ai/deepseek-v4-flash-0731",
     ]);
     expect(upstream).toHaveBeenCalledTimes(3);
+  });
+});
+
+describe("writeFastLaneArtifacts", () => {
+  it("never lets a reader observe a partial receipt", async () => {
+    const artifactDir = await mkdtemp(join(tmpdir(), "review-pi-receipt-"));
+    const path = join(artifactDir, "local-receipt.json");
+    const state = { writing: true, absent: false, torn: false };
+    const readers = Array.from({ length: 4 }, () =>
+      (async () => {
+        while (state.writing) {
+          const raw = await readFile(path, "utf8").catch(() => null);
+          if (raw === null) state.absent = true;
+          else {
+            // Every strict prefix of the receipt stops before its closing
+            // brace, so a parse is the proof the bytes were all there.
+            try {
+              JSON.parse(raw);
+            } catch {
+              state.torn = true;
+            }
+          }
+        }
+      })(),
+    );
+    try {
+      await writeFastLaneArtifacts({
+        artifactDir,
+        runId: "run-1",
+        attemptId: "attempt-1",
+        provider: "grok",
+        model: "grok-4.6",
+        finalText: "",
+        wallSeconds: 7,
+        usage: { ["x".repeat(8 * 1024 * 1024)]: 1 },
+      });
+    } finally {
+      state.writing = false;
+    }
+    await Promise.all(readers);
+
+    expect(state.absent).toBe(true);
+    expect(state.torn).toBe(false);
+    const written = JSON.parse(await readFile(path, "utf8")) as Record<
+      string,
+      unknown
+    >;
+    expect(written).toMatchObject({
+      runId: "run-1",
+      attemptId: "attempt-1",
+      outcome: "completed",
+    });
+    await rm(artifactDir, { recursive: true, force: true });
   });
 });
