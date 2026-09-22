@@ -331,6 +331,36 @@ export default {
           Number.isInteger(controlApiStatus) ? controlApiStatus : 0,
           controlApiBody,
         );
+        const targetRead = await bounded(
+          "target broker read",
+          sandbox.exec(targetBrokerReadProbe),
+        );
+        if (controlApi.escaped) {
+          return json(
+            {
+              error: "isolation_failed",
+              controlApi: {
+                httpStatus: Number.isInteger(controlApiStatus)
+                  ? controlApiStatus
+                  : null,
+                uid: controlApi.uid,
+                reason: controlApi.reason,
+              },
+              shutdown: { destroy: await destroySandbox(sandbox) },
+            },
+            409,
+          );
+        }
+        if (targetRead.stdout.trim() === "READ") {
+          return json(
+            {
+              error: "isolation_failed",
+              targetReadBroker: targetRead.stdout.trim(),
+              shutdown: { destroy: await destroySandbox(sandbox) },
+            },
+            409,
+          );
+        }
         const capability = await modelCapability(job.runId, env.CONTROL_SECRET);
         const modelsJson = modelsJsonForProxy(
           parsed.modelsJson,
@@ -361,20 +391,6 @@ export default {
         );
 
         if (parsed.canary) {
-          const targetRead = await bounded(
-            "target broker read",
-            sandbox.exec(targetBrokerReadProbe),
-          );
-          if (targetRead.stdout.trim() === "READ") {
-            return json(
-              {
-                error: "isolation_failed",
-                targetReadBroker: targetRead.stdout.trim(),
-                shutdown: { destroy: await destroySandbox(sandbox) },
-              },
-              409,
-            );
-          }
           let provider = null;
           if (parsed.canaryRequest) {
             await bounded(
