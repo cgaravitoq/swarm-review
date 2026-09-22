@@ -3787,6 +3787,165 @@ await writeFile(
       });
     }, 180_000);
 
+    it("never hands back a pool claim whose lane left a damaged receipt", async () => {
+      const arranged = await arrange("success");
+      const swarmId = "swarm-pool-damaged";
+      const provider = await fakeProvider((_prompt, path) =>
+        path.startsWith("/repos/")
+          ? pullAnswer(arranged)
+          : completion(
+              answer([
+                finding({ file: "changed-a.ts", line: 1 }),
+                finding({ file: "changed-b.ts", line: 1 }),
+              ]),
+            ),
+      );
+      await pointUpstream(arranged, {
+        "https://api.x.ai/v1": provider.baseUrl,
+      });
+      await pointGitHub(arranged, provider.baseUrl);
+      // The lane that claimed changed-a.ts read its brief and left a receipt
+      // cut mid-write, once: a claim handed back would be ruled by the next
+      // lane, which leaves a whole one.
+      await writeFile(
+        join(arranged.repo, "agents/review-pi/src/drive.ts"),
+        `${fakeDriver}
+const cutOnce = join(process.env.FAKE_STATE, "receipt-cut");
+if (
+  String(brief.prompt ?? "").includes('"file": "changed-a.ts"') &&
+  !(await readFile(cutOnce, "utf8").catch(() => null))
+) {
+  await writeFile(cutOnce, "");
+  await writeFile(join(artifactDir, "receipt.json"), '{"runId": "cut mid-write');
+}
+`,
+      );
+
+      await runSwarm(
+        packedArguments(arranged, swarmId, [
+          "--fast",
+          "--pr",
+          "6567",
+          "--worker",
+          "https://review.invalid",
+        ]),
+        arranged,
+        { ...arranged.env, GITHUB_TOKEN: "test-token" },
+      );
+      const receipt = await readReceipt(arranged.out, swarmId);
+      const verifiers = laneRows(receipt).filter(
+        (lane) => lane["role"] === "verifier",
+      );
+
+      expect(
+        verifiers.filter((lane) =>
+          String(lane["blockerReason"]).includes("never reached the model"),
+        ),
+      ).toEqual([]);
+      const damaged = verifiers.filter(
+        (lane) => lane["claimedFile"] === "changed-a.ts",
+      );
+      expect(damaged).toHaveLength(1);
+      expect(damaged[0]).toMatchObject({
+        status: "failed",
+        blockerReason: expect.stringMatching(/^lane receipt damaged: /),
+        error: expect.stringMatching(/^lane receipt damaged: /),
+      });
+      expect(findingsByFile(receipt)["changed-a.ts"]?.["status"]).not.toBe(
+        "confirmed",
+      );
+    }, 180_000);
+
+    it("relaunches neither a reviewer nor the verifier that left a damaged receipt", async () => {
+      const arranged = await arrange("success");
+      const swarmId = "swarm-worker-damaged";
+      const reviewerAnswer = answer([
+        finding({ file: "changed-a.ts", line: 1 }),
+      ]);
+      // Every lane reaches the model and answers; the first reviewer and the
+      // verifier leave their receipt cut mid-write. A relaunched lane (-r2)
+      // would leave a whole one.
+      await writeFile(
+        join(arranged.repo, "agents/review-pi/src/drive.ts"),
+        `import { appendFile, mkdir, readFile, writeFile } from "node:fs/promises";
+import { join } from "node:path";
+const argv = process.argv.slice(2);
+const flag = (name) => (argv.includes(name) ? argv[argv.indexOf(name) + 1] : null);
+const runId = flag("--run-id");
+const artifactDir = join(flag("--out"), runId);
+await appendFile(join(process.env.FAKE_STATE, "driven.log"), runId + "\\n");
+let prompt = flag("--prompt") ? await readFile(flag("--prompt"), "utf8") : "";
+while (flag("--brief") && !prompt) {
+  const brief = await readFile(flag("--brief"), "utf8").then(JSON.parse, () => null);
+  if (brief) prompt = String(brief.prompt ?? "");
+  else await new Promise((wake) => setTimeout(wake, 200));
+}
+const verdicts = Array.from(prompt.matchAll(/"id": "(c\\d+)"/g), ([, id]) => ({
+  id,
+  status: "confirmed",
+  evidenceStrength: "static",
+  reason: "the source shows it",
+  diffRelation: "touched",
+}));
+const fence = String.fromCharCode(96).repeat(3);
+await mkdir(artifactDir, { recursive: true });
+await writeFile(
+  join(artifactDir, "report.json"),
+  JSON.stringify({
+    finalText:
+      flag("--role") === "verifier"
+        ? ["", fence + "json", JSON.stringify({ verdicts }), fence, ""].join("\\n")
+        : ${JSON.stringify(reviewerAnswer)},
+    usage: { totalTokens: 7 },
+  }),
+);
+await writeFile(
+  join(artifactDir, "receipt.json"),
+  runId.endsWith("-reviewer-1") || runId.endsWith("-verifier")
+    ? '{"runId": "cut mid-write'
+    : JSON.stringify({
+        runId,
+        provider: "xai",
+        model: "grok-4.6",
+        wallSeconds: 1,
+        modelRequests: 3,
+      }),
+);
+`,
+      );
+
+      await runSwarm(
+        [
+          ...packedArguments(arranged, swarmId, [
+            "--worker",
+            "https://review.invalid",
+          ]),
+          "--total-timeout",
+          "1500",
+          "--verifier-reserve",
+          "300",
+        ],
+        arranged,
+      );
+      const receipt = await readReceipt(arranged.out, swarmId);
+      const driven = await readFile(join(arranged.state, "driven.log"), "utf8");
+
+      expect(driven.trim().split("\n").sort()).toEqual([
+        `${swarmId}-reviewer-1`,
+        `${swarmId}-reviewer-2`,
+        `${swarmId}-verifier`,
+      ]);
+      const rows = Object.fromEntries(
+        laneRows(receipt).map((lane) => [lane["laneId"], lane]),
+      );
+      for (const laneId of ["reviewer-1", "verifier"]) {
+        expect(rows[laneId]).toMatchObject({
+          relaunch: { attempts: 0, refusedReason: null },
+          error: expect.stringMatching(/^lane receipt damaged: /),
+        });
+      }
+    }, 180_000);
+
     it("blocks the lane whose assigned file did not fit the pack", async () => {
       const arranged = await arrange("success");
       const swarmId = "swarm-packed-dropped";
