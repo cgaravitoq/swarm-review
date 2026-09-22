@@ -45,6 +45,7 @@ import {
   TARGET_UID,
   TEARDOWN_BUDGET_SECONDS,
   targetProviderEnv,
+  writeLocalReceipt,
 } from "../local";
 import { SESSION_CAPS } from "../provider-budget";
 import { neverReachedModel } from "../swarm";
@@ -2276,5 +2277,38 @@ describe("mintRunId", () => {
     } finally {
       now.mockRestore();
     }
+  });
+});
+
+describe("writeLocalReceipt", () => {
+  it("never lets a reader observe a partial receipt", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "review-pi-receipt-"));
+    temporaryDirectories.push(directory);
+    const path = join(directory, "local-receipt.json");
+    const receipt = {
+      runId: "run-1",
+      probe: "x".repeat(8 * 1024 * 1024),
+    };
+    const body = JSON.stringify(receipt, null, 2);
+    const state = { writing: true, absent: false, torn: false };
+    const readers = Array.from({ length: 4 }, () =>
+      (async () => {
+        while (state.writing) {
+          const raw = await readFile(path, "utf8").catch(() => null);
+          if (raw === null) state.absent = true;
+          else if (raw !== body) state.torn = true;
+        }
+      })(),
+    );
+    try {
+      await writeLocalReceipt(directory, receipt);
+    } finally {
+      state.writing = false;
+    }
+    await Promise.all(readers);
+
+    expect(state.absent).toBe(true);
+    expect(state.torn).toBe(false);
+    expect(await readFile(path, "utf8")).toBe(body);
   });
 });
