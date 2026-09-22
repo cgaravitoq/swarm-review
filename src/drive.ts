@@ -975,7 +975,7 @@ async function main() {
     );
   }
   if (finalize) {
-    await writeFile(
+    await writeAtomic(
       join(outDir, "finalize.json"),
       JSON.stringify(finalize, null, 2),
     );
