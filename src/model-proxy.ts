@@ -223,16 +223,21 @@ const retryableFailure = (status: number) =>
   status === 408 || status === 429 || status >= 500;
 
 /**
- * The request body, or null when it is over the session's byte cap.
+ * The request body, or the refusal when it is over the session's byte cap.
  *
  * The declared length arrives from the container, which is the untrusted side
  * of this boundary, so the bytes are counted as they are read either way: a
  * target that understates its own `content-length` cannot carry a body past
  * the cap the broker enforces for the local path.
  */
-const readBoundedBody = async (request: Request, maxBytes: number) => {
+const readBoundedBody = async (
+  request: Request,
+  maxBytes: number,
+): Promise<Uint8Array | "max_request_bytes"> => {
   const declared = request.headers.get("content-length");
-  if (declared !== null && Number(declared) > maxBytes) return null;
+  if (declared !== null && Number(declared) > maxBytes) {
+    return "max_request_bytes";
+  }
   if (!request.body) return new Uint8Array();
   const reader = request.body.getReader();
   const chunks: Uint8Array[] = [];
@@ -243,7 +248,7 @@ const readBoundedBody = async (request: Request, maxBytes: number) => {
     total += value.byteLength;
     if (total > maxBytes) {
       await reader.cancel();
-      return null;
+      return "max_request_bytes";
     }
     chunks.push(value);
   }
@@ -334,7 +339,7 @@ export async function proxyModelFetch(
     method === "GET" || method === "HEAD"
       ? null
       : await readBoundedBody(request, consumed.session.caps.maxRequestBytes);
-  if (body === null) return jsonError(413, "max_request_bytes");
+  if (body === "max_request_bytes") return jsonError(413, body);
   const upstream = await fetch(target, {
     method,
     headers,

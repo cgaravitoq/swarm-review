@@ -322,6 +322,33 @@ describe("model proxy", () => {
     expect(upstream).not.toHaveBeenCalled();
   });
 
+  it.each(["GET", "HEAD"])(
+    "forwards a %s, which carries no body, instead of refusing it",
+    async (method) => {
+      const upstream = vi.fn<typeof fetch>(() =>
+        Promise.resolve(new Response(null, { status: 200 })),
+      );
+      vi.stubGlobal("fetch", upstream);
+      const url = await proxyTarget(`run-${method.toLowerCase()}`);
+
+      const response = await proxyModelFetch(
+        new Request(url, {
+          method,
+          headers: { authorization: "Bearer review-pi-handle" },
+        }),
+        url,
+        "control-secret",
+        sessionConsumer(),
+        async () => undefined,
+      );
+
+      expect(response.status).toBe(200);
+      expect(upstream).toHaveBeenCalledOnce();
+      const [, init] = upstream.mock.calls[0] ?? [];
+      expect(init).toMatchObject({ method, body: null });
+    },
+  );
+
   it("leaves the input of a usage frame the body never carried unobserved", () => {
     // Anthropic reports the input on the frame it opens with and the output on
     // the one it closes with. A reading that answers zero for the half it never
