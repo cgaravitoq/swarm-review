@@ -33,6 +33,7 @@ import {
   LANE_KILL_GRACE_MS,
   laneArguments,
   laneBudgets,
+  laneReceiptEvidence,
   laneTimeoutSeconds,
   laneWindowSeconds,
   MAX_CONCURRENT_LANES,
@@ -183,22 +184,77 @@ describe("deterministic lane coverage", () => {
     lanes.map((lane) => lane.files);
 
   it("relaunches only a lane that never reached the model", () => {
-    expect(neverReachedModel(null)).toBe(true);
-    expect(neverReachedModel({ outcome: "failed", modelRequests: null })).toBe(
-      true,
-    );
-    expect(neverReachedModel({ outcome: "failed", modelRequests: 0 })).toBe(
-      true,
-    );
-    expect(neverReachedModel({ outcome: "failed", modelRequests: 3 })).toBe(
-      false,
-    );
+    const read = (receipt: {
+      outcome: string;
+      modelRequests?: number | null;
+    }) => ({ receipt, damage: null });
+
+    expect(neverReachedModel({ receipt: null, damage: null })).toBe(true);
     expect(
-      neverReachedModel({ outcome: "completed", modelRequests: null }),
+      neverReachedModel(read({ outcome: "failed", modelRequests: null })),
+    ).toBe(true);
+    expect(
+      neverReachedModel(read({ outcome: "failed", modelRequests: 0 })),
+    ).toBe(true);
+    expect(
+      neverReachedModel(read({ outcome: "failed", modelRequests: 3 })),
     ).toBe(false);
-    expect(neverReachedModel({ outcome: "completed", modelRequests: 0 })).toBe(
-      false,
+    expect(
+      neverReachedModel(read({ outcome: "completed", modelRequests: null })),
+    ).toBe(false);
+    expect(
+      neverReachedModel(read({ outcome: "completed", modelRequests: 0 })),
+    ).toBe(false);
+    // The lane ran and left a record the run cannot read, so what it spent is
+    // unknown rather than zero: only an absent receipt is free to repeat.
+    expect(
+      neverReachedModel({ receipt: null, damage: "Unexpected end of JSON" }),
+    ).toBe(false);
+  });
+
+  it("reads an absent lane receipt apart from a damaged one", async () => {
+    const root = await mkdtemp(join(tmpdir(), "review-pi-receipt-"));
+    temporaryDirectories.push(root);
+
+    const absent = await laneReceiptEvidence(join(root, "absent"));
+    expect(absent).toEqual({ receipt: null, damage: null });
+    expect(neverReachedModel(absent)).toBe(true);
+
+    // The container exported the receipt, the run cut it short, and the lane is
+    // spent: only an absent record is free to repeat.
+    for (const [name, file] of [
+      ["damaged-local", "local-receipt.json"],
+      ["damaged-cloud", "receipt.json"],
+    ] as const) {
+      const damagedDir = join(root, name);
+      await mkdir(damagedDir);
+      await writeFile(join(damagedDir, file), '{"runId": "cut mid-write');
+
+      const damaged = await laneReceiptEvidence(damagedDir);
+
+      expect(damaged.receipt).toBeNull();
+      expect(damaged.damage).toBeTruthy();
+      expect(neverReachedModel(damaged)).toBe(false);
+    }
+
+    const validDir = join(root, "valid");
+    await mkdir(validDir);
+    await writeFile(
+      join(validDir, "receipt.json"),
+      JSON.stringify({
+        runId: "run-1",
+        provider: "acme",
+        model: "lab",
+        wallSeconds: 60,
+        modelRequests: 4,
+      }),
     );
+
+    const read = await laneReceiptEvidence(validDir);
+
+    expect(read.damage).toBeNull();
+    expect(read.receipt?.outcome).toBe("completed");
+    expect(neverReachedModel(read)).toBe(false);
   });
 
   it("partitions the changed files evenly and identically whatever the order", () => {
@@ -895,6 +951,62 @@ describe("candidate contract", () => {
     );
     expect(cut.error).toMatch(/unparsable json block/);
     expect(cut.candidates).toEqual([]);
+  });
+
+  it("reads the last block the lane opened, not the last one it closed", () => {
+    // The lane wrote a block, reconsidered, and left the second fence open. The
+    // closed fence above is the answer it abandoned, and reading it back turned
+    // a lane that found the defect into one that found nothing.
+    const parsed = parseCandidates(
+      [
+        fenced({ status: "complete", blockerReason: "", findings: [] }),
+        "That block predates the new function. Answering again:",
+        `\`\`\`json\n${JSON.stringify({
+          status: "complete",
+          blockerReason: "",
+          findings: [finding()],
+        })}`,
+      ].join("\n\n"),
+      "reviewer-1",
+    );
+
+    expect(parsed.error).toBeNull();
+    expect(parsed.candidates).toHaveLength(1);
+    expect(parsed.candidates[0]).toMatchObject({ line: 12 });
+  });
+
+  it("reads the last of two closed blocks", () => {
+    const parsed = parseCandidates(
+      [
+        fenced({ status: "complete", blockerReason: "", findings: [] }),
+        fenced({
+          status: "complete",
+          blockerReason: "",
+          findings: [finding({ line: 77 })],
+        }),
+      ].join("\n\n"),
+      "reviewer-1",
+    );
+
+    expect(parsed.error).toBeNull();
+    expect(parsed.candidates).toHaveLength(1);
+    expect(parsed.candidates[0]).toMatchObject({ line: 77 });
+  });
+
+  it("keeps a complete answer when a later label has no block behind it", () => {
+    for (const tail of [
+      "Answering again:\n```json",
+      "The ```json block above is my answer.",
+    ]) {
+      const parsed = parseCandidates(
+        `${answer([finding({ line: 41 })])}\n\n${tail}`,
+        "reviewer-1",
+      );
+
+      expect(parsed.error).toBeNull();
+      expect(parsed.candidates).toHaveLength(1);
+      expect(parsed.candidates[0]).toMatchObject({ line: 41 });
+    }
   });
 
   it("separates a finished clean lane from a lane that was blocked", () => {
@@ -3673,6 +3785,165 @@ await writeFile(
         declaredIntent: "set media bullet narration copy duration to 2 seconds",
         publication: "advisory",
       });
+    }, 180_000);
+
+    it("never hands back a pool claim whose lane left a damaged receipt", async () => {
+      const arranged = await arrange("success");
+      const swarmId = "swarm-pool-damaged";
+      const provider = await fakeProvider((_prompt, path) =>
+        path.startsWith("/repos/")
+          ? pullAnswer(arranged)
+          : completion(
+              answer([
+                finding({ file: "changed-a.ts", line: 1 }),
+                finding({ file: "changed-b.ts", line: 1 }),
+              ]),
+            ),
+      );
+      await pointUpstream(arranged, {
+        "https://api.x.ai/v1": provider.baseUrl,
+      });
+      await pointGitHub(arranged, provider.baseUrl);
+      // The lane that claimed changed-a.ts read its brief and left a receipt
+      // cut mid-write, once: a claim handed back would be ruled by the next
+      // lane, which leaves a whole one.
+      await writeFile(
+        join(arranged.repo, "agents/review-pi/src/drive.ts"),
+        `${fakeDriver}
+const cutOnce = join(process.env.FAKE_STATE, "receipt-cut");
+if (
+  String(brief.prompt ?? "").includes('"file": "changed-a.ts"') &&
+  !(await readFile(cutOnce, "utf8").catch(() => null))
+) {
+  await writeFile(cutOnce, "");
+  await writeFile(join(artifactDir, "receipt.json"), '{"runId": "cut mid-write');
+}
+`,
+      );
+
+      await runSwarm(
+        packedArguments(arranged, swarmId, [
+          "--fast",
+          "--pr",
+          "6567",
+          "--worker",
+          "https://review.invalid",
+        ]),
+        arranged,
+        { ...arranged.env, GITHUB_TOKEN: "test-token" },
+      );
+      const receipt = await readReceipt(arranged.out, swarmId);
+      const verifiers = laneRows(receipt).filter(
+        (lane) => lane["role"] === "verifier",
+      );
+
+      expect(
+        verifiers.filter((lane) =>
+          String(lane["blockerReason"]).includes("never reached the model"),
+        ),
+      ).toEqual([]);
+      const damaged = verifiers.filter(
+        (lane) => lane["claimedFile"] === "changed-a.ts",
+      );
+      expect(damaged).toHaveLength(1);
+      expect(damaged[0]).toMatchObject({
+        status: "failed",
+        blockerReason: expect.stringMatching(/^lane receipt damaged: /),
+        error: expect.stringMatching(/^lane receipt damaged: /),
+      });
+      expect(findingsByFile(receipt)["changed-a.ts"]?.["status"]).not.toBe(
+        "confirmed",
+      );
+    }, 180_000);
+
+    it("relaunches neither a reviewer nor the verifier that left a damaged receipt", async () => {
+      const arranged = await arrange("success");
+      const swarmId = "swarm-worker-damaged";
+      const reviewerAnswer = answer([
+        finding({ file: "changed-a.ts", line: 1 }),
+      ]);
+      // Every lane reaches the model and answers; the first reviewer and the
+      // verifier leave their receipt cut mid-write. A relaunched lane (-r2)
+      // would leave a whole one.
+      await writeFile(
+        join(arranged.repo, "agents/review-pi/src/drive.ts"),
+        `import { appendFile, mkdir, readFile, writeFile } from "node:fs/promises";
+import { join } from "node:path";
+const argv = process.argv.slice(2);
+const flag = (name) => (argv.includes(name) ? argv[argv.indexOf(name) + 1] : null);
+const runId = flag("--run-id");
+const artifactDir = join(flag("--out"), runId);
+await appendFile(join(process.env.FAKE_STATE, "driven.log"), runId + "\\n");
+let prompt = flag("--prompt") ? await readFile(flag("--prompt"), "utf8") : "";
+while (flag("--brief") && !prompt) {
+  const brief = await readFile(flag("--brief"), "utf8").then(JSON.parse, () => null);
+  if (brief) prompt = String(brief.prompt ?? "");
+  else await new Promise((wake) => setTimeout(wake, 200));
+}
+const verdicts = Array.from(prompt.matchAll(/"id": "(c\\d+)"/g), ([, id]) => ({
+  id,
+  status: "confirmed",
+  evidenceStrength: "static",
+  reason: "the source shows it",
+  diffRelation: "touched",
+}));
+const fence = String.fromCharCode(96).repeat(3);
+await mkdir(artifactDir, { recursive: true });
+await writeFile(
+  join(artifactDir, "report.json"),
+  JSON.stringify({
+    finalText:
+      flag("--role") === "verifier"
+        ? ["", fence + "json", JSON.stringify({ verdicts }), fence, ""].join("\\n")
+        : ${JSON.stringify(reviewerAnswer)},
+    usage: { totalTokens: 7 },
+  }),
+);
+await writeFile(
+  join(artifactDir, "receipt.json"),
+  runId.endsWith("-reviewer-1") || runId.endsWith("-verifier")
+    ? '{"runId": "cut mid-write'
+    : JSON.stringify({
+        runId,
+        provider: "xai",
+        model: "grok-4.6",
+        wallSeconds: 1,
+        modelRequests: 3,
+      }),
+);
+`,
+      );
+
+      await runSwarm(
+        [
+          ...packedArguments(arranged, swarmId, [
+            "--worker",
+            "https://review.invalid",
+          ]),
+          "--total-timeout",
+          "1500",
+          "--verifier-reserve",
+          "300",
+        ],
+        arranged,
+      );
+      const receipt = await readReceipt(arranged.out, swarmId);
+      const driven = await readFile(join(arranged.state, "driven.log"), "utf8");
+
+      expect(driven.trim().split("\n").sort()).toEqual([
+        `${swarmId}-reviewer-1`,
+        `${swarmId}-reviewer-2`,
+        `${swarmId}-verifier`,
+      ]);
+      const rows = Object.fromEntries(
+        laneRows(receipt).map((lane) => [lane["laneId"], lane]),
+      );
+      for (const laneId of ["reviewer-1", "verifier"]) {
+        expect(rows[laneId]).toMatchObject({
+          relaunch: { attempts: 0, refusedReason: null },
+          error: expect.stringMatching(/^lane receipt damaged: /),
+        });
+      }
     }, 180_000);
 
     it("blocks the lane whose assigned file did not fit the pack", async () => {

@@ -470,7 +470,7 @@ const parseJson = (body: string) => {
 };
 
 /**
- * The body of the last JSON block a lane ended with.
+ * The body of the last JSON block a lane opened.
  *
  * A lab that opens the block and never closes the fence still handed over the
  * whole answer - `workers-ai/@cf/deepseek-ai/deepseek-v4-flash-0731` does this
@@ -478,14 +478,24 @@ const parseJson = (body: string) => {
  * The same lab sometimes answers with the bare object and no fence at all
  * (run swarm-mtxj62kn), which is still the whole answer. What
  * rejects a lane that was cut mid-answer is the parse, not the fence.
+ *
+ * The block that counts is the last one opened, not the last one closed: a lane
+ * that reconsiders writes a second fence, and the first fence is the answer it
+ * abandoned. Counting closed fences read that older block back. A label with
+ * nothing parseable behind it - a fence opened as the ceiling hit, or prose
+ * naming the fence - is not a block, so the search walks back to the last one
+ * that parses: losing a complete answer is worse than reading an older one.
  */
 const lastJsonBlock = (finalText: string) => {
-  const fences = [...finalText.matchAll(/```json\s*([\s\S]*?)```/g)];
-  const closed = fences.at(-1)?.[1];
-  if (closed) return parseJson(closed);
-  const opened = finalText.lastIndexOf("```json");
-  if (opened !== -1)
-    return parseJson(finalText.slice(opened + "```json".length));
+  const blocks = [...finalText.matchAll(/```json/g)]
+    .map(({ index }) => {
+      const body = finalText.slice(index + "```json".length);
+      const closed = body.indexOf("```");
+      return parseJson(closed === -1 ? body : body.slice(0, closed));
+    })
+    .reverse();
+  const answer = blocks.find((block) => block.error === null) ?? blocks[0];
+  if (answer) return answer;
   const bare = finalText.trim();
   if (bare.startsWith("{")) return parseJson(bare);
   return { value: undefined, error: "no fenced json block" };
@@ -1956,21 +1966,66 @@ const laneFinalize = async (artifactDir: string) => {
   }
 };
 
-const laneReceipt = (artifactDir: string) =>
-  readLaneReceipt(artifactDir).catch(() => null);
+type LaneReceipt = Awaited<ReturnType<typeof readLaneReceipt>>;
+
+/**
+ * What reading a lane's artifacts found.
+ *
+ * A null receipt with no damage is a lane nothing wrote a receipt for: it
+ * burned nothing and can be repeated. A null receipt with damage is a receipt
+ * that exists and does not parse: the lane ran, and what it spent is unknown
+ * rather than zero.
+ */
+type LaneReceiptEvidence =
+  | { receipt: LaneReceipt; damage: null }
+  | { receipt: null; damage: null }
+  | { receipt: null; damage: string };
+
+const NO_LANE_RECEIPT: LaneReceiptEvidence = { receipt: null, damage: null };
+
+const isMissingFile = (error: unknown) =>
+  typeof error === "object" &&
+  error !== null &&
+  "code" in error &&
+  error.code === "ENOENT";
+
+/**
+ * A lane's receipt, and whether the read that should have produced it failed.
+ *
+ * Only ENOENT is an absent receipt. Any other failure to read one is a lane
+ * that left a record the run cannot judge, and repeating that lane buys a
+ * window the run cannot show was never bought.
+ */
+export const laneReceiptEvidence = async (
+  artifactDir: string,
+): Promise<LaneReceiptEvidence> => {
+  try {
+    return { receipt: await readLaneReceipt(artifactDir), damage: null };
+  } catch (error) {
+    if (isMissingFile(error)) return NO_LANE_RECEIPT;
+    return {
+      receipt: null,
+      damage: `lane receipt damaged: ${error instanceof Error ? error.message : String(error)}`,
+    };
+  }
+};
 
 /**
  * Whether a lane never reached the model: no receipt at all, or one whose run
  * failed before a first request was counted. A container refused at admission
  * (`409 runner_mismatch` during a rollout) leaves `modelRequests: null`, which
  * is as free to repeat as a zero. A lane that completed with an unobserved
- * count is finished, not free.
+ * count is finished, not free, and so is a lane whose receipt is damaged: an
+ * unreadable record is not a record of nothing.
  */
-export const neverReachedModel = (
-  receipt: { outcome: string; modelRequests?: number | null } | null,
-) =>
-  receipt === null ||
-  (receipt.outcome !== "completed" && !receipt.modelRequests);
+export const neverReachedModel = (evidence: {
+  receipt: { outcome: string; modelRequests?: number | null } | null;
+  damage: string | null;
+}) =>
+  evidence.damage === null &&
+  (evidence.receipt === null ||
+    (evidence.receipt.outcome !== "completed" &&
+      !evidence.receipt.modelRequests));
 
 async function main() {
   const options = parseSwarmOptions(process.argv.slice(2));
@@ -2487,7 +2542,9 @@ async function main() {
               }
             })()
         : await launchReviewer(runId);
-    let receipt = skipped ? null : await laneReceipt(artifactDir);
+    let laneEvidence = skipped
+      ? NO_LANE_RECEIPT
+      : await laneReceiptEvidence(artifactDir);
     // A container that died before the lane reached the model burned nothing,
     // so relaunching it costs a run what an infrastructure hiccup already cost
     // it. A lane cut after its first request is not relaunched: its tokens are
@@ -2500,14 +2557,14 @@ async function main() {
       !fastUpstream &&
       relaunch <= LANE_RELAUNCHES &&
       !laneAbort.aborted &&
-      neverReachedModel(receipt);
+      neverReachedModel(laneEvidence);
       relaunch += 1
     ) {
       if (session) {
         await sessions.finish(session.sessionId, {
           status: "relaunched",
           exitCode,
-          outcome: receipt?.outcome ?? null,
+          outcome: laneEvidence.receipt?.outcome ?? null,
           usage: null,
         });
       }
@@ -2526,8 +2583,9 @@ async function main() {
         model: laneConfig.model ?? options.model,
       });
       exitCode = await launchReviewer(runId);
-      receipt = await laneReceipt(artifactDir);
+      laneEvidence = await laneReceiptEvidence(artifactDir);
     }
+    const receipt = laneEvidence.receipt;
     const report = skipped ? null : await laneReport(artifactDir);
     const finalize = skipped ? null : await laneFinalize(artifactDir);
     const finalText = report?.finalText ?? null;
@@ -2650,7 +2708,7 @@ async function main() {
         wallSeconds: receipt?.wallSeconds ?? null,
         teardownSeconds: receipt?.teardownSeconds ?? null,
         truncatedArtifacts: receipt?.truncatedArtifacts ?? [],
-        error: receipt?.error ?? null,
+        error: receipt?.error ?? laneEvidence.damage,
         orcaTerminal: laneTerminalFor(laneId),
         cleanup: laneCleanupFor(laneId),
         piSessionId: session?.sessionId ?? null,
@@ -2830,13 +2888,15 @@ async function main() {
       laneAbort,
     );
     await briefWriter;
-    const receipt = await laneReceipt(artifactDir);
+    const laneEvidence = await laneReceiptEvidence(artifactDir);
+    const receipt = laneEvidence.receipt;
     const report = await laneReport(artifactDir);
     const claimed = laneState.claim;
     // A lane that died before any model answered spent nothing on its claim, so
     // the group goes back to the queue for a fresh sandbox. A claim a model
-    // already read is never briefed twice.
-    if (claimed && neverReachedModel(receipt)) {
+    // already read is never briefed twice, and a damaged receipt is not proof
+    // that no model read it.
+    if (claimed && neverReachedModel(laneEvidence)) {
       laneState.releasedReason = `the lane never reached the model: ${receipt?.error ?? "no lane receipt"}`;
       await verifierQueue.release(claimed);
     }
@@ -2859,7 +2919,7 @@ async function main() {
         report.partialReason ?? "the verifier was cut before it ruled";
     } else if (exitCode !== 0 || receipt?.outcome !== "completed") {
       status = "failed";
-      blockerReason = receipt?.error ?? null;
+      blockerReason = receipt?.error ?? laneEvidence.damage;
     } else {
       const parsed = parseVerdicts(
         report?.finalText ?? "",
@@ -2941,7 +3001,7 @@ async function main() {
         wallSeconds: receipt?.wallSeconds ?? null,
         teardownSeconds: receipt?.teardownSeconds ?? null,
         truncatedArtifacts: receipt?.truncatedArtifacts ?? [],
-        error: receipt?.error ?? null,
+        error: receipt?.error ?? laneEvidence.damage,
         orcaTerminal: laneTerminalFor(laneId),
         cleanup: laneCleanupFor(laneId),
         piSessionId: session.sessionId,
@@ -3041,7 +3101,7 @@ async function main() {
   let verifierFinishReason: string | null = null;
   let verifierCanary: ModelCanary | null = null;
   let verifierStatus: LaneOutcome["status"] = "not_run";
-  let verifierReceipt: Awaited<ReturnType<typeof laneReceipt>> = null;
+  let verifierEvidence: LaneReceiptEvidence = NO_LANE_RECEIPT;
   let verifierReport: Awaited<ReturnType<typeof laneReport>> = null;
   let verifierRelaunchRefused: string | null = null;
   let verifierRelaunchAttempts = 0;
@@ -3202,7 +3262,7 @@ async function main() {
               laneSignal(verifierWindowSeconds),
             );
           })();
-    verifierReceipt = await laneReceipt(verifierDir);
+    verifierEvidence = await laneReceiptEvidence(verifierDir);
     // The verifier is the run's single point of failure: reviewers can lose one
     // lane and still be adjudicated, but a dead verifier leaves every candidate
     // unruled. So it is relaunched on the same terms - only while its container
@@ -3213,14 +3273,14 @@ async function main() {
       !fastUpstream &&
       relaunch <= LANE_RELAUNCHES &&
       !controller.signal.aborted &&
-      neverReachedModel(verifierReceipt);
+      neverReachedModel(verifierEvidence);
       relaunch += 1
     ) {
       if (verifierSession) {
         await sessions.finish(verifierSession.sessionId, {
           status: "relaunched",
           exitCode,
-          outcome: verifierReceipt?.outcome ?? null,
+          outcome: verifierEvidence.receipt?.outcome ?? null,
           usage: null,
         });
       }
@@ -3265,10 +3325,10 @@ async function main() {
         ),
         laneSignal(verifierWindowSeconds),
       );
-      verifierReceipt = await laneReceipt(verifierDir);
+      verifierEvidence = await laneReceiptEvidence(verifierDir);
     }
     verifierReport = await laneReport(verifierDir);
-    if (abortReason || verifierReceipt?.outcome === "interrupted") {
+    if (abortReason || verifierEvidence.receipt?.outcome === "interrupted") {
       verifierStatus = "cancelled";
     } else if (verifierCanaryError) {
       // No lab answered the canary, so no candidate was ever ruled on. That is
@@ -3282,7 +3342,10 @@ async function main() {
       verifierContractError =
         verifierReport.partialReason ??
         "the verifier was cut before it ruled on every candidate";
-    } else if (exitCode !== 0 || verifierReceipt?.outcome !== "completed") {
+    } else if (
+      exitCode !== 0 ||
+      verifierEvidence.receipt?.outcome !== "completed"
+    ) {
       verifierStatus = "failed";
     } else {
       const parsed = parseVerdicts(
@@ -3317,8 +3380,8 @@ async function main() {
     await sessions.finish(verifierSession.sessionId, {
       status: verifierStatus,
       exitCode,
-      outcome: verifierReceipt?.outcome ?? null,
-      usage: verifierReceipt?.usage ?? null,
+      outcome: verifierEvidence.receipt?.outcome ?? null,
+      usage: verifierEvidence.receipt?.usage ?? null,
     });
   } else if (verifierPoolLanes === 0 && abortReason) {
     verifierStatus = "cancelled";
@@ -3361,12 +3424,12 @@ async function main() {
         refusedReason: verifierRelaunchRefused,
       },
       provider:
-        verifierReceipt?.provider ??
+        verifierEvidence.receipt?.provider ??
         verifierLaneConfig.provider ??
         options.provider ??
         null,
       model:
-        verifierReceipt?.model ??
+        verifierEvidence.receipt?.model ??
         verifierLaneConfig.model ??
         options.model ??
         null,
@@ -3374,13 +3437,13 @@ async function main() {
         verifierLaneConfig.thinking ??
         options.thinking ??
         (options.fast ? "low" : "high"),
-      usage: verifierReceipt?.usage ?? null,
-      installSkipped: verifierReceipt?.installSkipped ?? null,
-      installSkipReason: verifierReceipt?.installSkipReason ?? null,
-      wallSeconds: verifierReceipt?.wallSeconds ?? null,
-      teardownSeconds: verifierReceipt?.teardownSeconds ?? null,
-      truncatedArtifacts: verifierReceipt?.truncatedArtifacts ?? [],
-      error: verifierReceipt?.error ?? null,
+      usage: verifierEvidence.receipt?.usage ?? null,
+      installSkipped: verifierEvidence.receipt?.installSkipped ?? null,
+      installSkipReason: verifierEvidence.receipt?.installSkipReason ?? null,
+      wallSeconds: verifierEvidence.receipt?.wallSeconds ?? null,
+      teardownSeconds: verifierEvidence.receipt?.teardownSeconds ?? null,
+      truncatedArtifacts: verifierEvidence.receipt?.truncatedArtifacts ?? [],
+      error: verifierEvidence.receipt?.error ?? verifierEvidence.damage,
       orcaTerminal: laneTerminalFor("verifier"),
       cleanup: laneCleanupFor("verifier"),
       piSessionId: verifierSession?.sessionId ?? null,
