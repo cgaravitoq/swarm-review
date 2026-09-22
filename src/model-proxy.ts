@@ -34,6 +34,8 @@ export type ModelSession = {
   upstreamAccountId?: string;
   caps: ModelCaps;
   totals: ModelTotals;
+  /** Set once an attempt failed the way a client repeats; the next one is a retry. */
+  retryPending?: boolean;
 };
 
 const hex = (buffer: ArrayBuffer) =>
@@ -213,6 +215,14 @@ const jsonError = (status: number, reason: string) =>
   });
 
 /**
+ * A status a client repeats, which makes the attempt that follows it on this
+ * session a retry rather than a new request. The observed attempt is the only
+ * source of that count the container cannot forge.
+ */
+const retryableFailure = (status: number) =>
+  status === 408 || status === 429 || status >= 500;
+
+/**
  * The request body, or null when it is over the session's byte cap.
  *
  * The declared length arrives from the container, which is the untrusted side
@@ -269,7 +279,11 @@ export async function proxyModelFetch(
   ) => Promise<
     { ok: true; session: ModelSession } | { ok: false; reason: string }
   >,
-  recordUsage: (runId: string, usage: ModelUsage | null) => Promise<void>,
+  recordAttempt: (
+    runId: string,
+    usage: ModelUsage | null,
+    retryable: boolean,
+  ) => Promise<void>,
 ): Promise<Response> {
   const segments = url.pathname.split("/").filter(Boolean);
   const runIdRaw = segments[1];
@@ -326,12 +340,16 @@ export async function proxyModelFetch(
     headers,
     body,
     redirect: "manual",
-  } as RequestInit);
+  } as RequestInit).catch(async (error: unknown) => {
+    await recordAttempt(runId, null, true);
+    throw error;
+  });
+  const retryable = retryableFailure(upstream.status);
   const responseHeaders = new Headers(upstream.headers);
   responseHeaders.delete("content-encoding");
   responseHeaders.delete("content-length");
   if (!upstream.body) {
-    await recordUsage(runId, null);
+    await recordAttempt(runId, null, retryable);
     return new Response(null, {
       status: upstream.status,
       headers: responseHeaders,
@@ -344,7 +362,7 @@ export async function proxyModelFetch(
       controller.enqueue(chunk);
     },
     async flush() {
-      await recordUsage(runId, readUsage(tail));
+      await recordAttempt(runId, readUsage(tail), retryable);
     },
   });
   return new Response(upstream.body.pipeThrough(stream), {

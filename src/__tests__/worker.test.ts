@@ -5,9 +5,9 @@ import path from "node:path";
 
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { deployArguments, targetCheckout } from "../../scripts/deploy";
-import type { ReviewSandbox } from "../../worker";
 import { gitCapability } from "../git-proxy";
 import { CONTROL_DIR, MODEL_BROKER, TARGET_UID } from "../isolation";
+import { emptyModelTotals, modelCapability } from "../model-proxy";
 import { MAX_ARTIFACT_BYTES, REVIEW_RUNNER, runDir } from "../protocol";
 
 const getSandbox = vi.hoisted(() => vi.fn());
@@ -17,11 +17,13 @@ vi.mock("@cloudflare/sandbox", () => ({
   getSandbox,
 }));
 
-const { default: handler } = await import("../../worker");
+const { default: handler, ReviewSandbox } = await import("../../worker");
 
 /** The bindings this suite gives the Worker, with the sandbox SDK mocked out. */
 const env = {
-  REVIEW_SANDBOX: {} as DurableObjectNamespace<ReviewSandbox>,
+  REVIEW_SANDBOX: {} as DurableObjectNamespace<
+    InstanceType<typeof ReviewSandbox>
+  >,
   CONTROL_SECRET: "control-secret",
   OPENCODE_API_KEY: "model-secret",
   WORKERS_AI_API_KEY: "workers-ai-secret",
@@ -131,7 +133,7 @@ const sandboxForStart = () => {
     startProcess,
     putModelSession: vi.fn(() => Promise.resolve()),
     consumeModelAttempt: vi.fn(),
-    addModelUsage: vi.fn(),
+    recordModelAttempt: vi.fn(),
     getContainerPlacementId: vi.fn(() => Promise.resolve("placement")),
     destroy: vi.fn(() => Promise.resolve()),
     listProcesses: vi.fn(() => Promise.resolve([])),
@@ -542,5 +544,73 @@ describe("deployed container image", () => {
     ).toEqual(["--var", "TARGET_REPOSITORY:https://github.com/acme/demo.git"]);
     expect(deployArguments(["--var", "X:1"])).toEqual(["--var", "X:1"]);
     expect(deployArguments([])).toEqual([]);
+  });
+});
+
+describe("cloud model session accounting", () => {
+  const storage = () => {
+    const entries = new Map<string, unknown>();
+    return {
+      get: (key: string) => Promise.resolve(entries.get(key)),
+      put: (key: string, value: unknown) => {
+        entries.set(key, value);
+        return Promise.resolve();
+      },
+    };
+  };
+
+  const runningSandbox = async () => {
+    const sandbox = new ReviewSandbox({} as never, env as never);
+    Object.assign(sandbox, { ctx: { storage: storage() } });
+    await sandbox.putModelSession({
+      handle: broker.handle,
+      upstreamBaseUrl: broker.upstreamBaseUrl,
+      upstreamAuthorization: broker.upstreamAuthorization,
+      caps: broker.caps,
+      totals: emptyModelTotals(),
+    });
+    return sandbox;
+  };
+
+  const postModel = async (runId: string) => {
+    const capability = await modelCapability(runId, "control-secret");
+    return handler.fetch(
+      new Request(
+        `https://review.invalid/model/${runId}/${capability}/chat/completions`,
+        {
+          method: "POST",
+          headers: { authorization: `Bearer ${broker.handle}` },
+          body: "{}",
+        },
+      ),
+      env,
+    );
+  };
+
+  it("counts the attempt that follows a retryable failure as a retry", async () => {
+    const sandbox = await runningSandbox();
+    getSandbox.mockReturnValue(sandbox);
+    const upstream = vi
+      .fn<typeof fetch>()
+      .mockResolvedValueOnce(new Response("upstream down", { status: 503 }))
+      .mockResolvedValueOnce(
+        new Response(
+          'data: {"usage":{"prompt_tokens":3,"completion_tokens":1}}',
+        ),
+      );
+    vi.stubGlobal("fetch", upstream);
+
+    const failed = await postModel("retry-run");
+    expect(failed.status).toBe(503);
+    await failed.text();
+
+    const retried = await postModel("retry-run");
+    expect(retried.status).toBe(200);
+    await retried.text();
+
+    expect(upstream).toHaveBeenCalledTimes(2);
+    expect(await sandbox.modelUsage()).toMatchObject({
+      totals: { requests: 2, retries: 1, input: 3, output: 1 },
+    });
   });
 });

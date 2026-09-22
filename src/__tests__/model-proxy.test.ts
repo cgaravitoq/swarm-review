@@ -1,5 +1,6 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import {
+  capViolation,
   emptyModelTotals,
   type ModelCaps,
   type ModelUsage,
@@ -379,5 +380,26 @@ describe("model proxy", () => {
 
     expect(await response.text()).toHaveLength(bytes.byteLength);
     expect(recorded).toEqual([{ input: null, output: 42 }]);
+  });
+
+  it("spends the retry budget behind the request budget that carries it", () => {
+    // A retried attempt is also a request, and `max_requests` is checked first,
+    // so a sequence of reservations reaches the request budget before the retry
+    // budget: the retry branch answers only for totals that sequence cannot
+    // produce. Pinned here so the branch is not mistaken for enforcement the
+    // cloud path does not have.
+    const caps = capsFor({ maxRequests: 8 });
+    const totals = emptyModelTotals();
+    for (let attempt = 0; attempt < 8; attempt += 1) {
+      expect(reserveAttempt(totals, caps, attempt > 0)).toBeNull();
+    }
+    expect(totals).toMatchObject({ requests: 8, retries: 7 });
+    expect(reserveAttempt(totals, caps, true)).toBe("max_requests");
+    expect(
+      capViolation(
+        { requests: 3, retries: 8, input: null, output: null },
+        caps,
+      ),
+    ).toBe("max_retries");
   });
 });
