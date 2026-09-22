@@ -481,18 +481,24 @@ const parseJson = (body: string) => {
  *
  * The block that counts is the last one opened, not the last one closed: a lane
  * that reconsiders writes a second fence, and the first fence is the answer it
- * abandoned. Counting closed fences read that older block back.
+ * abandoned. Counting closed fences read that older block back. A label with
+ * nothing parseable behind it - a fence opened as the ceiling hit, or prose
+ * naming the fence - is not a block, so the search walks back to the last one
+ * that parses: losing a complete answer is worse than reading an older one.
  */
 const lastJsonBlock = (finalText: string) => {
-  const opened = finalText.lastIndexOf("```json");
-  if (opened === -1) {
-    const bare = finalText.trim();
-    if (bare.startsWith("{")) return parseJson(bare);
-    return { value: undefined, error: "no fenced json block" };
-  }
-  const body = finalText.slice(opened + "```json".length);
-  const closed = body.indexOf("```");
-  return parseJson(closed === -1 ? body : body.slice(0, closed));
+  const blocks = [...finalText.matchAll(/```json/g)]
+    .map(({ index }) => {
+      const body = finalText.slice(index + "```json".length);
+      const closed = body.indexOf("```");
+      return parseJson(closed === -1 ? body : body.slice(0, closed));
+    })
+    .reverse();
+  const answer = blocks.find((block) => block.error === null) ?? blocks[0];
+  if (answer) return answer;
+  const bare = finalText.trim();
+  if (bare.startsWith("{")) return parseJson(bare);
+  return { value: undefined, error: "no fenced json block" };
 };
 
 /**

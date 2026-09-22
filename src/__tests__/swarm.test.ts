@@ -993,6 +993,22 @@ describe("candidate contract", () => {
     expect(parsed.candidates[0]).toMatchObject({ line: 77 });
   });
 
+  it("keeps a complete answer when a later label has no block behind it", () => {
+    for (const tail of [
+      "Answering again:\n```json",
+      "The ```json block above is my answer.",
+    ]) {
+      const parsed = parseCandidates(
+        `${answer([finding({ line: 41 })])}\n\n${tail}`,
+        "reviewer-1",
+      );
+
+      expect(parsed.error).toBeNull();
+      expect(parsed.candidates).toHaveLength(1);
+      expect(parsed.candidates[0]).toMatchObject({ line: 41 });
+    }
+  });
+
   it("separates a finished clean lane from a lane that was blocked", () => {
     const clean = parseCandidates(answer([]), "reviewer-2");
     const blocked = parseCandidates(
