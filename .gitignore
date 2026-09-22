@@ -7,3 +7,4 @@ container/context
 .env
 .env.*
 .DS_Store
+.btca
