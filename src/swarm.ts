@@ -470,7 +470,7 @@ const parseJson = (body: string) => {
 };
 
 /**
- * The body of the last JSON block a lane ended with.
+ * The body of the last JSON block a lane opened.
  *
  * A lab that opens the block and never closes the fence still handed over the
  * whole answer - `workers-ai/@cf/deepseek-ai/deepseek-v4-flash-0731` does this
@@ -478,17 +478,21 @@ const parseJson = (body: string) => {
  * The same lab sometimes answers with the bare object and no fence at all
  * (run swarm-mtxj62kn), which is still the whole answer. What
  * rejects a lane that was cut mid-answer is the parse, not the fence.
+ *
+ * The block that counts is the last one opened, not the last one closed: a lane
+ * that reconsiders writes a second fence, and the first fence is the answer it
+ * abandoned. Counting closed fences read that older block back.
  */
 const lastJsonBlock = (finalText: string) => {
-  const fences = [...finalText.matchAll(/```json\s*([\s\S]*?)```/g)];
-  const closed = fences.at(-1)?.[1];
-  if (closed) return parseJson(closed);
   const opened = finalText.lastIndexOf("```json");
-  if (opened !== -1)
-    return parseJson(finalText.slice(opened + "```json".length));
-  const bare = finalText.trim();
-  if (bare.startsWith("{")) return parseJson(bare);
-  return { value: undefined, error: "no fenced json block" };
+  if (opened === -1) {
+    const bare = finalText.trim();
+    if (bare.startsWith("{")) return parseJson(bare);
+    return { value: undefined, error: "no fenced json block" };
+  }
+  const body = finalText.slice(opened + "```json".length);
+  const closed = body.indexOf("```");
+  return parseJson(closed === -1 ? body : body.slice(0, closed));
 };
 
 /**

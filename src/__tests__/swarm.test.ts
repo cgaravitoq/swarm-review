@@ -897,6 +897,46 @@ describe("candidate contract", () => {
     expect(cut.candidates).toEqual([]);
   });
 
+  it("reads the last block the lane opened, not the last one it closed", () => {
+    // The lane wrote a block, reconsidered, and left the second fence open. The
+    // closed fence above is the answer it abandoned, and reading it back turned
+    // a lane that found the defect into one that found nothing.
+    const parsed = parseCandidates(
+      [
+        fenced({ status: "complete", blockerReason: "", findings: [] }),
+        "That block predates the new function. Answering again:",
+        `\`\`\`json\n${JSON.stringify({
+          status: "complete",
+          blockerReason: "",
+          findings: [finding()],
+        })}`,
+      ].join("\n\n"),
+      "reviewer-1",
+    );
+
+    expect(parsed.error).toBeNull();
+    expect(parsed.candidates).toHaveLength(1);
+    expect(parsed.candidates[0]).toMatchObject({ line: 12 });
+  });
+
+  it("reads the last of two closed blocks", () => {
+    const parsed = parseCandidates(
+      [
+        fenced({ status: "complete", blockerReason: "", findings: [] }),
+        fenced({
+          status: "complete",
+          blockerReason: "",
+          findings: [finding({ line: 77 })],
+        }),
+      ].join("\n\n"),
+      "reviewer-1",
+    );
+
+    expect(parsed.error).toBeNull();
+    expect(parsed.candidates).toHaveLength(1);
+    expect(parsed.candidates[0]).toMatchObject({ line: 77 });
+  });
+
   it("separates a finished clean lane from a lane that was blocked", () => {
     const clean = parseCandidates(answer([]), "reviewer-2");
     const blocked = parseCandidates(
