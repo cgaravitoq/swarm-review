@@ -27,6 +27,7 @@ import {
   preparationFailureReceipt,
   reserveWholeTrial,
   sessionLedger,
+  writeAtomic,
   writeTerminalReceipt,
 } from "./attempt";
 import {
@@ -1147,11 +1148,6 @@ export async function pullRequestContext(input: {
     return null;
   }
 }
-
-const writeAtomic = async (path: string, body: string) => {
-  await writeFile(`${path}.tmp`, body);
-  await rename(`${path}.tmp`, path);
-};
 
 /**
  * The work queue the verifier pool claims from.

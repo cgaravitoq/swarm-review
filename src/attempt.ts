@@ -31,7 +31,13 @@ export const PREPARATION_STAGES = [
 
 export type PreparationStage = (typeof PREPARATION_STAGES)[number];
 
-const writeAtomic = async (path: string, body: string) => {
+/**
+ * The one way anything in this tree lands a receipt on disk.
+ *
+ * The destination is only ever created by the rename, so a reader opens the
+ * whole file or finds none there - never a prefix of one.
+ */
+export const writeAtomic = async (path: string, body: string) => {
   await writeFile(`${path}.partial`, body);
   await rename(`${path}.partial`, path);
 };
