@@ -81,7 +81,8 @@ const jsonAnswerText = (body: string): string | null => {
 
 /**
  * Seals one response as it streams through a model hop: sha256 of the answer
- * text it carried, or null for a body this seal cannot be taken over.
+ * text it carried, or null for a body this seal cannot be taken over or one
+ * that carried no answer at all.
  *
  * The answer is what pi renders into report.json's `finalText`: the assistant
  * message's text blocks joined with `"\n"`. Anthropic keeps one block per
@@ -107,6 +108,12 @@ export const responseSealer = () => {
   let anthropicText: number | null = null;
   const responseItems = new Set<number>();
   let responseItem: number | null = null;
+  let answered = false;
+
+  const hashAnswer = (text: string) => {
+    hash.update(text, "utf8");
+    if (text !== "") answered = true;
+  };
 
   const readLine = (rawLine: string): boolean => {
     if (rawLine.length > SSE_LINE_CHARS) return false;
@@ -135,7 +142,7 @@ export const responseSealer = () => {
       family = "chat";
       const choice = objectRecord(record["choices"][0]);
       const content = objectRecord(choice?.["delta"])?.["content"];
-      if (typeof content === "string") hash.update(content, "utf8");
+      if (typeof content === "string") hashAnswer(content);
       return true;
     }
     if (type.startsWith("response.")) {
@@ -157,7 +164,7 @@ export const responseSealer = () => {
         responseItems.add(index);
         responseItem = index;
       }
-      hash.update(delta, "utf8");
+      hashAnswer(delta);
       return true;
     }
     if (!ANTHROPIC_EVENTS.has(type)) return true;
@@ -172,7 +179,7 @@ export const responseSealer = () => {
         if (anthropicText !== null) hash.update("\n", "utf8");
         anthropicText = index;
         const seed = block["text"];
-        if (typeof seed === "string") hash.update(seed, "utf8");
+        if (typeof seed === "string") hashAnswer(seed);
       }
       anthropicBlocks.set(index, isText);
     } else if (type === "content_block_delta") {
@@ -185,7 +192,7 @@ export const responseSealer = () => {
       // A delta whose block never opened as text is text pi never rendered.
       if (anthropicBlocks.get(index) !== true) return true;
       if (index !== anthropicText) return false;
-      hash.update(text, "utf8");
+      hashAnswer(text);
     }
     return true;
   };
@@ -219,11 +226,11 @@ export const responseSealer = () => {
       if (mode === "json") {
         const text =
           total <= RESPONSE_TAIL_CHARS ? jsonAnswerText(tail.trim()) : null;
-        return text === null
-          ? null
-          : createHash("sha256").update(text, "utf8").digest("hex");
+        return text
+          ? createHash("sha256").update(text, "utf8").digest("hex")
+          : null;
       }
-      if (mode !== "sse" || !readLine(pending) || family === null) return null;
+      if (mode !== "sse" || !readLine(pending) || !answered) return null;
       return hash.digest("hex");
     },
   };

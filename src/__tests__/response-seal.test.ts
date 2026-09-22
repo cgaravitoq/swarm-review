@@ -64,6 +64,31 @@ describe("response seal", () => {
     }
   });
 
+  it("seals nothing for a response that carried no answer", () => {
+    const noAnswer = [
+      JSON.stringify({ choices: [] }),
+      JSON.stringify({ choices: [{ message: { content: null } }] }),
+      [
+        'data: {"choices":[{"delta":{"role":"assistant","content":""}}]}',
+        'data: {"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"name":"read"}}]},"finish_reason":"tool_calls"}]}',
+        "data: [DONE]",
+      ].join("\n"),
+      [
+        'data: {"type":"response.created","response":{"output":[]}}',
+        'data: {"type":"response.completed","response":{"output":[{"type":"message","content":[{"type":"output_text","text":"late"}]}]}}',
+      ].join("\n"),
+      [
+        'data: {"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}',
+        'data: {"type":"content_block_start","index":1,"content_block":{"type":"text","text":""}}',
+        'data: {"type":"content_block_start","index":2,"content_block":{"type":"tool_use","name":"read"}}',
+      ].join("\n"),
+    ];
+
+    for (const body of noAnswer) {
+      expect(sealOf(body)).toBeNull();
+    }
+  });
+
   it("hashes a stream as it passes and keeps only a tail and one line of it", () => {
     const long = "x".repeat(RESPONSE_TAIL_CHARS * 4);
     const streamed = Array.from({ length: 64 }, () =>
