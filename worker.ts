@@ -33,6 +33,7 @@ import {
 import {
   emptyModelTotals,
   type ModelSession,
+  type ModelUsage,
   modelCapability,
   modelProxyBaseUrl,
   modelsJsonForProxy,
@@ -59,12 +60,16 @@ export class ReviewSandbox extends Sandbox<ReviewPiEnv> {
     return { ok: true as const, session };
   }
 
-  async addModelUsage(usage: { input: number; output: number } | null) {
+  async addModelUsage(usage: ModelUsage | null) {
     if (!usage) return;
     const session = await this.ctx.storage.get<ModelSession>(MODEL_SESSION_KEY);
     if (!session) return;
-    session.totals.input += usage.input;
-    session.totals.output += usage.output;
+    if (usage.input !== null) {
+      session.totals.input = (session.totals.input ?? 0) + usage.input;
+    }
+    if (usage.output !== null) {
+      session.totals.output = (session.totals.output ?? 0) + usage.output;
+    }
     await this.ctx.storage.put(MODEL_SESSION_KEY, session);
   }
 

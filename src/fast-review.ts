@@ -278,7 +278,12 @@ export async function completeOnce(input: {
       (record?.["response"] as Record<string, unknown> | undefined)?.["usage"],
     ) ??
     (streamed
-      ? { inputTokens: streamed.input, outputTokens: streamed.output }
+      ? {
+          ...(streamed.input === null ? {} : { inputTokens: streamed.input }),
+          ...(streamed.output === null
+            ? {}
+            : { outputTokens: streamed.output }),
+        }
       : null);
   return {
     content,

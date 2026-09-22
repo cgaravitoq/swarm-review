@@ -17,11 +17,14 @@ export type ModelCaps = {
   maxRequestBytes: number;
 };
 
+/** Provider-reported usage. A field the body never carried is null, never zero. */
+export type ModelUsage = { input: number | null; output: number | null };
+
 export type ModelTotals = {
   requests: number;
   retries: number;
-  input: number;
-  output: number;
+  input: number | null;
+  output: number | null;
 };
 
 export type ModelSession = {
@@ -86,8 +89,8 @@ export function modelsJsonForProxy(
 export const emptyModelTotals = (): ModelTotals => ({
   requests: 0,
   retries: 0,
-  input: 0,
-  output: 0,
+  input: null,
+  output: null,
 });
 
 export function publicModelUsage(session: ModelSession | undefined) {
@@ -104,8 +107,13 @@ export const capViolation = (totals: ModelTotals, caps: ModelCaps) => {
   if (totals.retries >= caps.maxRetriesPerRequest * caps.maxRequests) {
     return "max_retries";
   }
-  if (totals.input >= caps.maxCumulativeInputTokens) return "max_input_tokens";
-  if (totals.output >= caps.maxCumulativeOutputTokens) {
+  if (totals.input !== null && totals.input >= caps.maxCumulativeInputTokens) {
+    return "max_input_tokens";
+  }
+  if (
+    totals.output !== null &&
+    totals.output >= caps.maxCumulativeOutputTokens
+  ) {
     return "max_output_tokens";
   }
   return null;
@@ -146,11 +154,8 @@ export function resolveUpstreamTarget(requestUrl: string, baseUrl: string) {
   return target;
 }
 
-export const readUsage = (
-  body: string,
-): { input: number; output: number } | null => {
-  const totals = { input: 0, output: 0 };
-  let seen = false;
+export const readUsage = (body: string): ModelUsage | null => {
+  const totals: ModelUsage = { input: null, output: null };
   const numberAt = (record: Record<string, unknown>, key: string) => {
     const value = record[key];
     return typeof value === "number" ? value : 0;
@@ -165,7 +170,6 @@ export const readUsage = (
       candidate["completion_tokens"] ??
       candidate["outputTokens"];
     if (typeof input !== "number" && typeof output !== "number") return;
-    seen = true;
     if (typeof input === "number") {
       totals.input =
         input +
@@ -199,7 +203,7 @@ export const readUsage = (
       );
     } catch {}
   }
-  return seen ? totals : null;
+  return totals.input === null && totals.output === null ? null : totals;
 };
 
 const jsonError = (status: number, reason: string) =>
@@ -265,10 +269,7 @@ export async function proxyModelFetch(
   ) => Promise<
     { ok: true; session: ModelSession } | { ok: false; reason: string }
   >,
-  recordUsage: (
-    runId: string,
-    usage: { input: number; output: number } | null,
-  ) => Promise<void>,
+  recordUsage: (runId: string, usage: ModelUsage | null) => Promise<void>,
 ): Promise<Response> {
   const segments = url.pathname.split("/").filter(Boolean);
   const runIdRaw = segments[1];

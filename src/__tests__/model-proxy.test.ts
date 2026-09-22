@@ -2,6 +2,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import {
   emptyModelTotals,
   type ModelCaps,
+  type ModelUsage,
   modelCapability,
   modelProxyBaseUrl,
   modelsJsonForProxy,
@@ -111,7 +112,7 @@ describe("model proxy", () => {
       `${modelProxyBaseUrl("https://review.invalid", runId, capability)}/chat/completions`,
     );
     const totals = emptyModelTotals();
-    const recorded: { input: number; output: number }[] = [];
+    const recorded: ModelUsage[] = [];
 
     const response = await proxyModelFetch(
       new Request(url, {
@@ -318,5 +319,65 @@ describe("model proxy", () => {
     );
     expect(understated.status).toBe(413);
     expect(upstream).not.toHaveBeenCalled();
+  });
+
+  it("leaves the input of a usage frame the body never carried unobserved", () => {
+    // Anthropic reports the input on the frame it opens with and the output on
+    // the one it closes with. A reading that answers zero for the half it never
+    // saw prices an unobserved request as a request that spent nothing.
+    expect(readUsage('data: {"usage":{"output_tokens":7}}')).toEqual({
+      input: null,
+      output: 7,
+    });
+    expect(readUsage('data: {"usage":{"input_tokens":11}}')).toEqual({
+      input: 11,
+      output: null,
+    });
+    expect(readUsage("data: [DONE]")).toBeNull();
+  });
+
+  it("records the input as unobserved once the tail no longer carries it", async () => {
+    const body = [
+      'event: message_start\ndata: {"type":"message_start","message":{"usage":{"input_tokens":1200,"output_tokens":1}}}',
+      `event: content_block_delta\ndata: {"type":"content_block_delta","delta":{"type":"text_delta","text":"${"x".repeat(70_000)}"}}`,
+      'event: message_delta\ndata: {"type":"message_delta","usage":{"output_tokens":42}}',
+    ].join("\n\n");
+    expect(body.length).toBeGreaterThan(65_536);
+    const bytes = new TextEncoder().encode(body);
+    vi.stubGlobal(
+      "fetch",
+      vi.fn<typeof fetch>(() =>
+        Promise.resolve(
+          new Response(
+            new ReadableStream<Uint8Array>({
+              start(controller) {
+                controller.enqueue(bytes);
+                controller.close();
+              },
+            }),
+            { status: 200, headers: { "content-type": "text/event-stream" } },
+          ),
+        ),
+      ),
+    );
+    const url = await proxyTarget("run-long-answer");
+    const recorded: (ModelUsage | null)[] = [];
+
+    const response = await proxyModelFetch(
+      new Request(url, {
+        method: "POST",
+        headers: { authorization: "Bearer review-pi-handle" },
+        body: "{}",
+      }),
+      url,
+      "control-secret",
+      sessionConsumer(),
+      async (_runId, usage) => {
+        recorded.push(usage);
+      },
+    );
+
+    expect(await response.text()).toHaveLength(bytes.byteLength);
+    expect(recorded).toEqual([{ input: null, output: 42 }]);
   });
 });
