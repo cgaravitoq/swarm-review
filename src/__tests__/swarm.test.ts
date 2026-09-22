@@ -2,6 +2,7 @@ import { execFileSync, spawn } from "node:child_process";
 import { createHash } from "node:crypto";
 import { readFileSync } from "node:fs";
 import {
+  appendFile,
   chmod,
   cp,
   mkdir,
@@ -2179,6 +2180,37 @@ describe("an answer the model channel never sealed", () => {
     expect(await laneReport(artifactDir, { requireSeal: true })).toEqual({
       attested: false,
       attestationReason: `the answer's seal ${sealOf(forgedAnswer)} matches none of the 1 responses the control side sealed`,
+    });
+  });
+
+  it("keeps every seal a torn ledger line did not take with it", async () => {
+    const artifactDir = await sealedLane();
+    await appendFile(
+      join(artifactDir, "provider-usage.jsonl"),
+      '{"event":"provider_request","seal":"ab',
+    );
+
+    expect(await laneReport(artifactDir, { requireSeal: true })).toMatchObject({
+      attested: true,
+      finalText: honestAnswer,
+    });
+  });
+
+  it("reads the stop receipt beside a ledger that sealed nothing", async () => {
+    const artifactDir = await emptyLane();
+    await writeFile(
+      join(artifactDir, "provider-usage.jsonl"),
+      '{"event":"provider_retry","status":503,"attempt":0}\n',
+    );
+    await writeFile(
+      join(artifactDir, "stop.json"),
+      JSON.stringify({ control: { modelSeals: [sealOf(honestAnswer)] } }),
+    );
+    await writeFile(join(artifactDir, "report.json"), reportOf(honestAnswer));
+
+    expect(await laneReport(artifactDir, { requireSeal: true })).toMatchObject({
+      attested: true,
+      finalText: honestAnswer,
     });
   });
 

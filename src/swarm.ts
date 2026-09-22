@@ -1931,42 +1931,42 @@ const answerSeal = (text: string) =>
 export const laneSeals = async (
   artifactDir: string,
 ): Promise<string[] | null> => {
-  const ledger = await readFile(
-    join(artifactDir, basename(BROKER_LEDGER)),
-    "utf8",
-  ).catch(() => null);
-  if (ledger !== null) {
-    const seals: string[] = [];
-    for (const line of ledger.split("\n")) {
-      if (!line.trim()) continue;
-      try {
-        const entry = JSON.parse(line) as Record<string, unknown>;
-        const seal = entry["seal"];
-        if (entry["event"] === "provider_request" && typeof seal === "string") {
-          seals.push(seal);
-        }
-      } catch {
-        return null;
-      }
+  const [ledger, stop] = await Promise.all([
+    readFile(join(artifactDir, basename(BROKER_LEDGER)), "utf8").catch(
+      () => null,
+    ),
+    readFile(join(artifactDir, "stop.json"), "utf8").catch(() => null),
+  ]);
+  const ledgerSeals = ledger?.split("\n").flatMap((line) => {
+    try {
+      const entry = JSON.parse(line) as Record<string, unknown>;
+      const seal = entry["seal"];
+      return entry["event"] === "provider_request" && typeof seal === "string"
+        ? [seal]
+        : [];
+    } catch {
+      // A lane killed mid-append leaves one torn line; it loses its own seal,
+      // never the ones before it.
+      return [];
     }
-    return seals;
-  }
-  const stop = await readFile(join(artifactDir, "stop.json"), "utf8").catch(
-    () => null,
-  );
-  if (stop === null) return null;
-  try {
-    const receipt = JSON.parse(stop) as Record<string, unknown>;
-    const control = receipt["control"];
-    const seals =
-      typeof control === "object" && control !== null
-        ? (control as Record<string, unknown>)["modelSeals"]
+  });
+  const stopSeals = (() => {
+    if (stop === null) return undefined;
+    try {
+      const control = (JSON.parse(stop) as Record<string, unknown>)["control"];
+      const seals =
+        typeof control === "object" && control !== null
+          ? (control as Record<string, unknown>)["modelSeals"]
+          : undefined;
+      return Array.isArray(seals)
+        ? seals.filter((seal): seal is string => typeof seal === "string")
         : undefined;
-    if (!Array.isArray(seals)) return null;
-    return seals.filter((seal): seal is string => typeof seal === "string");
-  } catch {
-    return null;
-  }
+    } catch {
+      return undefined;
+    }
+  })();
+  if (ledgerSeals === undefined && stopSeals === undefined) return null;
+  return [...(ledgerSeals ?? []), ...(stopSeals ?? [])];
 };
 
 /**
