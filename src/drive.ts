@@ -142,6 +142,16 @@ type RunStart = {
     bunVersion: string;
     gitVersion: string;
   };
+  credentialIsolation: {
+    mode: "worker-proxy";
+    controlUid: number;
+    targetUid: number;
+  };
+  controlApi: {
+    httpStatus: number | null;
+    uid: number | null;
+    reason: string;
+  };
 };
 type RunStop = {
   runId: string;
