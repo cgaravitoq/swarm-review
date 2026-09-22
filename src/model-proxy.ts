@@ -279,6 +279,7 @@ export async function proxyModelFetch(
   request: Request,
   url: URL,
   secret: string,
+  open: (runId: string) => Promise<{ handle: string; caps: ModelCaps } | null>,
   consume: (
     runId: string,
   ) => Promise<
@@ -306,11 +307,19 @@ export async function proxyModelFetch(
   if (capability !== (await modelCapability(runId, secret))) {
     return jsonError(403, "capability_rejected");
   }
-  const consumed = await consume(runId);
-  if (!consumed.ok) return jsonError(429, consumed.reason);
-  if (presentedHandle(request) !== consumed.session.handle) {
+  const opened = await open(runId);
+  if (!opened) return jsonError(429, "no_session");
+  if (presentedHandle(request) !== opened.handle) {
     return jsonError(401, "handle_rejected");
   }
+  const method = request.method;
+  const body =
+    method === "GET" || method === "HEAD"
+      ? null
+      : await readBoundedBody(request, opened.caps.maxRequestBytes);
+  if (body === "max_request_bytes") return jsonError(413, body);
+  const consumed = await consume(runId);
+  if (!consumed.ok) return jsonError(429, consumed.reason);
   let target: URL;
   try {
     target = resolveUpstreamTarget(
@@ -334,12 +343,6 @@ export async function proxyModelFetch(
   if (consumed.session.upstreamAccountId) {
     headers.set("chatgpt-account-id", consumed.session.upstreamAccountId);
   }
-  const method = request.method;
-  const body =
-    method === "GET" || method === "HEAD"
-      ? null
-      : await readBoundedBody(request, consumed.session.caps.maxRequestBytes);
-  if (body === "max_request_bytes") return jsonError(413, body);
   const upstream = await fetch(target, {
     method,
     headers,

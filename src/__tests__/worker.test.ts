@@ -572,7 +572,7 @@ describe("cloud model session accounting", () => {
     return sandbox;
   };
 
-  const postModel = async (runId: string) => {
+  const postModel = async (runId: string, body = "{}") => {
     const capability = await modelCapability(runId, "control-secret");
     return handler.fetch(
       new Request(
@@ -580,7 +580,7 @@ describe("cloud model session accounting", () => {
         {
           method: "POST",
           headers: { authorization: `Bearer ${broker.handle}` },
-          body: "{}",
+          body,
         },
       ),
       env,
@@ -611,6 +611,24 @@ describe("cloud model session accounting", () => {
     expect(upstream).toHaveBeenCalledTimes(2);
     expect(await sandbox.modelUsage()).toMatchObject({
       totals: { requests: 2, retries: 1, input: 3, output: 1 },
+    });
+  });
+
+  it("charges nothing for a body it refuses as over the byte cap", async () => {
+    const sandbox = await runningSandbox();
+    getSandbox.mockReturnValue(sandbox);
+    const upstream = vi.fn<typeof fetch>();
+    vi.stubGlobal("fetch", upstream);
+
+    const refused = await postModel(
+      "oversize-run",
+      "x".repeat(broker.caps.maxRequestBytes + 1),
+    );
+
+    expect(refused.status).toBe(413);
+    expect(upstream).not.toHaveBeenCalled();
+    expect(await sandbox.modelUsage()).toMatchObject({
+      totals: { requests: 0, retries: 0 },
     });
   });
 });

@@ -243,6 +243,7 @@ export default {
         request,
         url0,
         env.CONTROL_SECRET,
+        async (runId) => getSandbox(env.REVIEW_SANDBOX, runId).modelUsage(),
         async (runId) =>
           getSandbox(env.REVIEW_SANDBOX, runId).consumeModelAttempt(),
         async (runId, usage, retryable) =>

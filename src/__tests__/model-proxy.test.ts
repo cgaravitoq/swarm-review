@@ -40,6 +40,10 @@ const sessionConsumer =
     },
   });
 
+const sessionOpener =
+  (caps = capsFor()) =>
+  async () => ({ handle: "review-pi-handle", caps });
+
 const proxyTarget = async (runId: string, secret = "control-secret") => {
   const capability = await modelCapability(runId, secret);
   return new URL(
@@ -85,6 +89,7 @@ describe("model proxy", () => {
       }),
       url,
       secret,
+      async () => null,
       async () => ({ ok: false, reason: "no_session" }),
       async () => undefined,
     );
@@ -126,6 +131,7 @@ describe("model proxy", () => {
       }),
       url,
       secret,
+      sessionOpener(),
       async () => {
         reserveAttempt(
           totals,
@@ -192,6 +198,7 @@ describe("model proxy", () => {
       }),
       url,
       secret,
+      sessionOpener(),
       async () => ({
         ok: true as const,
         session: {
@@ -266,6 +273,7 @@ describe("model proxy", () => {
       }),
       url,
       "control-secret",
+      sessionOpener(),
       sessionConsumer(),
       async () => undefined,
     );
@@ -304,6 +312,7 @@ describe("model proxy", () => {
       oversize(),
       url,
       "control-secret",
+      sessionOpener(),
       sessionConsumer(),
       async () => undefined,
     );
@@ -315,6 +324,7 @@ describe("model proxy", () => {
       oversize("2"),
       url,
       "control-secret",
+      sessionOpener(),
       sessionConsumer(),
       async () => undefined,
     );
@@ -338,6 +348,7 @@ describe("model proxy", () => {
         }),
         url,
         "control-secret",
+        sessionOpener(),
         sessionConsumer(),
         async () => undefined,
       );
@@ -399,6 +410,7 @@ describe("model proxy", () => {
       }),
       url,
       "control-secret",
+      sessionOpener(),
       sessionConsumer(),
       async (_runId, usage) => {
         recorded.push(usage);
