@@ -6,6 +6,7 @@ import {
   cp,
   mkdir,
   mkdtemp,
+  readdir,
   readFile,
   rm,
   writeFile,
@@ -16,6 +17,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath, URL } from "node:url";
 import { afterAll, afterEach, describe, expect, it, vi } from "vitest";
+import { PARTIAL_SUFFIX } from "../attempt";
 import { FINALIZE_REQUEST_RESERVE } from "../drive";
 import { CANARY_PROMPT } from "../fast-review";
 import { TEARDOWN_BUDGET_SECONDS } from "../local";
@@ -1662,6 +1664,21 @@ describe("sandbox verifier pool", () => {
     const retaken = await queue.claim("verifier-8");
     expect(retaken?.file).toBe(released.file);
     expect(retaken?.candidateIds).toEqual(released.candidateIds);
+  });
+
+  it("never claims a group whose publish has not renamed it into place", async () => {
+    const root = await claimRoot();
+    const queue = claimQueue(root);
+    await queue.publish(candidateGroups(deduped([["a.ts", 1]])));
+    // What a publisher killed between its write and its rename leaves behind,
+    // and what a live one holds for the length of the write.
+    const stranded = `02-b.ts.json${PARTIAL_SUFFIX}`;
+    await writeFile(join(root, "pending", stranded), '{"name":"02-b.ts.js');
+
+    expect((await queue.claim("verifier-1"))?.file).toBe("a.ts");
+    expect(await queue.claim("verifier-2")).toBeNull();
+    expect(await queue.remaining()).toBe(0);
+    expect(await readdir(join(root, "pending"))).toEqual([stranded]);
   });
 
   it("waits while the reviewers run and ends on a null brief with no work left", async () => {
