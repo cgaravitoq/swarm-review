@@ -43,11 +43,13 @@ import {
 import { MAX_ARTIFACT_BYTES, REVIEW_RUNNER, runDir } from "./src/protocol";
 
 const MODEL_SESSION_KEY = "modelSession";
+const MODEL_SEALS_KEY = "modelSeals";
 const COMMAND_SEQUENCE_KEY = "commandSequence";
 
 export class ReviewSandbox extends Sandbox<ReviewPiEnv> {
   async putModelSession(session: ModelSession) {
     await this.ctx.storage.put(MODEL_SESSION_KEY, session);
+    await this.ctx.storage.put(MODEL_SEALS_KEY, []);
   }
 
   async consumeModelAttempt() {
@@ -80,13 +82,21 @@ export class ReviewSandbox extends Sandbox<ReviewPiEnv> {
       }
     }
     session.retryPending = retryable;
-    session.seals = [...(session.seals ?? []), seal];
     await this.ctx.storage.put(MODEL_SESSION_KEY, session);
+    await this.ctx.storage.put(MODEL_SEALS_KEY, [
+      ...((await this.modelSeals()) ?? []),
+      seal,
+    ]);
   }
 
+  /**
+   * Kept apart from the session, so clearing the credential at stop leaves
+   * the record a repeated stop has to answer with.
+   */
   async modelSeals() {
-    const session = await this.ctx.storage.get<ModelSession>(MODEL_SESSION_KEY);
-    return session ? (session.seals ?? []) : null;
+    return (
+      (await this.ctx.storage.get<(string | null)[]>(MODEL_SEALS_KEY)) ?? null
+    );
   }
 
   async modelUsage() {
@@ -335,7 +345,6 @@ export default {
               : {}),
             caps: parsed.broker.caps,
             totals: emptyModelTotals(),
-            seals: [],
           }),
         );
         const controlApiHttp = await bounded(
@@ -598,9 +607,9 @@ export default {
     if (request.method === "POST" && segments[2] === "stop") {
       let killed: number | null = null;
       let killError: string | null = null;
-      // The seals leave before the session they live in is cleared: this is
-      // the only control-side record of what the model channel carried, and
-      // the artifacts this response ships beside it are target-writable.
+      // This is the only control-side record of what the model channel
+      // carried, and the artifacts this response ships beside it are
+      // target-writable.
       let modelSeals: (string | null)[] | null = null;
       try {
         modelSeals = await bounded("model seals", sandbox.modelSeals());

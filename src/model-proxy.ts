@@ -37,8 +37,6 @@ export type ModelSession = {
   totals: ModelTotals;
   /** Set once an attempt failed the way a client repeats; the next one is a retry. */
   retryPending?: boolean;
-  /** One seal per response this proxy observed, null where none could be taken. */
-  seals?: (string | null)[];
 };
 
 const hex = (buffer: ArrayBuffer) =>
