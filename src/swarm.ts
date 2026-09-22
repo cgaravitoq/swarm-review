@@ -1978,56 +1978,59 @@ export const laneSeals = async (
  *
  * With `requireSeal`, the answer must also be one the control side sealed
  * over what crossed its own bytes. `report.json` is written by the uid the
- * reviewed repository executes as, so without that seal the host is reading
- * the answer from the one file the target can rewrite.
+ * reviewed repository executes as, so a report whose answer no seal matches
+ * is that uid's word and yields nothing but the reason it was refused.
  */
 export const laneReport = async (
   artifactDir: string,
   options: { requireSeal: boolean },
-) => {
+): Promise<
+  | { attested: false; attestationReason: string }
+  | { attested: true; finalText: string | null; partial: boolean }
+  | null
+> => {
   const raw = await readFile(join(artifactDir, "report.json"), "utf8").catch(
     () => null,
   );
   if (!raw) return null;
+  let record: Record<string, unknown>;
   try {
     const report: unknown = JSON.parse(raw);
     if (typeof report !== "object" || report === null) return null;
-    const record = report as Record<string, unknown>;
-    const finalText = record["finalText"];
-    const completion = record["completion"];
-    const partialReason = record["partialReason"];
-    const text = typeof finalText === "string" ? finalText : null;
-    let attested = true;
-    let attestationReason: string | null = null;
-    if (options.requireSeal) {
-      const seals = await laneSeals(artifactDir);
-      const seal = text === null ? null : answerSeal(text);
-      if (seal === null) {
-        attested = false;
-        attestationReason = "the report carries no finalText to attest";
-      } else if (seals === null) {
-        attested = false;
-        attestationReason =
-          "no control-side seal record was exported for this lane";
-      } else if (!seals.includes(seal)) {
-        attested = false;
-        attestationReason = `the answer's seal ${seal} matches none of the ${seals.length} responses the control side sealed`;
-      }
-    }
-    return {
-      finalText: text,
-      attested,
-      attestationReason,
-      partial: completion === "partial",
-      partialReason:
-        completion === "partial" && typeof partialReason === "string"
-          ? partialReason
-          : null,
-    };
+    record = report as Record<string, unknown>;
   } catch {
     return null;
   }
+  const finalText =
+    typeof record["finalText"] === "string" ? record["finalText"] : null;
+  if (options.requireSeal) {
+    const seals = await laneSeals(artifactDir);
+    const seal = finalText === null ? null : answerSeal(finalText);
+    const attestationReason =
+      seal === null
+        ? "the report carries no finalText to attest"
+        : seals === null
+          ? "no control-side seal record was exported for this lane"
+          : seals.includes(seal)
+            ? null
+            : `the answer's seal ${seal} matches none of the ${seals.length} responses the control side sealed`;
+    if (attestationReason) return { attested: false, attestationReason };
+  }
+  return {
+    attested: true,
+    finalText,
+    partial: record["completion"] === "partial",
+  };
 };
+
+const reportCompletion = (report: Awaited<ReturnType<typeof laneReport>>) =>
+  report === null
+    ? null
+    : !report.attested
+      ? "unattested"
+      : report.partial
+        ? "partial"
+        : "complete";
 
 /**
  * What the driver wrote about the finalize it sent, or null when it sent none.
@@ -2671,7 +2674,6 @@ async function main() {
       ? null
       : await laneReport(artifactDir, { requireSeal: !fastUpstream });
     const finalize = skipped ? null : await laneFinalize(artifactDir);
-    const finalText = report?.finalText ?? null;
     const laneCandidates: Candidate[] = [];
     let status: LaneOutcome["status"];
     let contractError: string | null = null;
@@ -2701,24 +2703,24 @@ async function main() {
       // read nothing; the provider's own words are the reason it did not.
       status = "blocked";
       blockerReason = canaryError;
+    } else if (report && !report.attested) {
+      // report.json is written by the uid the reviewed repository executes as;
+      // an answer no control-side seal matches is that uid's word, not the
+      // model's, and nothing else in that file is read either.
+      status = "malformed";
+      contractError = report.attestationReason;
     } else if (report?.partial) {
       // The runner wrote this report while it was being cut, so the lane judged
       // less than its assignment whichever way its answer parses. This is the
       // deadline, the request cap and the answer that never came, and none of
-      // them is a failed review: the lane read what it could and said so.
+      // them is a failed review: the lane read what it could and said so. The
+      // runner's own reason is not repeated: no seal covers it.
       status = "blocked";
-      blockerReason =
-        report.partialReason ?? "the lane was cut before it finished";
+      blockerReason = "the lane was cut before it finished";
     } else if (exitCode !== 0 || receipt?.outcome !== "completed") {
       status = "failed";
-    } else if (report && !report.attested) {
-      // report.json is written by the uid the reviewed repository executes as;
-      // an answer no control-side seal matches is that uid's word, not the
-      // model's, and it is recorded rather than parsed.
-      status = "malformed";
-      contractError = report.attestationReason;
     } else {
-      const parsed = parseCandidates(finalText ?? "", laneId);
+      const parsed = parseCandidates(report?.finalText ?? "", laneId);
       contractError = parsed.error;
       parseResult = parsed;
       blockerReason = parsed.blockerReason ?? evidenceGap;
@@ -2772,11 +2774,7 @@ async function main() {
         contractError,
         droppedFindings: parseResult?.droppedFindings ?? [],
         blockerReason,
-        reportCompletion: report
-          ? report.partial
-            ? "partial"
-            : "complete"
-          : null,
+        reportCompletion: reportCompletion(report),
         finalize,
         relaunch: {
           attempts: relaunchAttempts,
@@ -3002,16 +3000,15 @@ async function main() {
       status = abortReason ? "cancelled" : "not_run";
     } else if (abortReason || receipt?.outcome === "interrupted") {
       status = "cancelled";
-    } else if (report?.partial) {
-      status = "blocked";
-      blockerReason =
-        report.partialReason ?? "the verifier was cut before it ruled";
-    } else if (exitCode !== 0 || receipt?.outcome !== "completed") {
-      status = "failed";
-      blockerReason = receipt?.error ?? laneEvidence.damage;
     } else if (report && !report.attested) {
       status = "malformed";
       contractError = report.attestationReason;
+    } else if (report?.partial) {
+      status = "blocked";
+      blockerReason = "the verifier was cut before it ruled";
+    } else if (exitCode !== 0 || receipt?.outcome !== "completed") {
+      status = "failed";
+      blockerReason = receipt?.error ?? laneEvidence.damage;
     } else {
       const parsed = parseVerdicts(
         report?.finalText ?? "",
@@ -3072,11 +3069,7 @@ async function main() {
         canary: null,
         finishReason: null,
         image: options.image,
-        reportCompletion: report
-          ? report.partial
-            ? "partial"
-            : "complete"
-          : null,
+        reportCompletion: reportCompletion(report),
         finalize,
         relaunch: { attempts: 0, refusedReason: null },
         provider:
@@ -3429,21 +3422,20 @@ async function main() {
       // the verifier being blocked, not the verifier clearing the change.
       verifierStatus = "blocked";
       verifierContractError = verifierCanaryError;
+    } else if (verifierReport && !verifierReport.attested) {
+      verifierStatus = "malformed";
+      verifierContractError = verifierReport.attestationReason;
     } else if (verifierReport?.partial) {
       // The verifier's own report says it was cut, so its verdicts cover less
       // than the candidate set however they parse.
       verifierStatus = "blocked";
       verifierContractError =
-        verifierReport.partialReason ??
         "the verifier was cut before it ruled on every candidate";
     } else if (
       exitCode !== 0 ||
       verifierEvidence.receipt?.outcome !== "completed"
     ) {
       verifierStatus = "failed";
-    } else if (verifierReport && !verifierReport.attested) {
-      verifierStatus = "malformed";
-      verifierContractError = verifierReport.attestationReason;
     } else {
       const parsed = parseVerdicts(
         verifierReport?.finalText ?? "",
@@ -3510,11 +3502,7 @@ async function main() {
       canary: verifierCanary,
       finishReason: verifierFinishReason,
       image: options.image,
-      reportCompletion: verifierReport
-        ? verifierReport.partial
-          ? "partial"
-          : "complete"
-        : null,
+      reportCompletion: reportCompletion(verifierReport),
       finalize: verifierRan ? await laneFinalize(verifierDir) : null,
       relaunch: {
         attempts: verifierRelaunchAttempts,
