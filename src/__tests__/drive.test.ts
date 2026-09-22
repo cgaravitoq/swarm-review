@@ -1,3 +1,6 @@
+import { mkdtemp, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import {
   brokerCaps,
@@ -9,6 +12,7 @@ import {
   FINALIZE_REPORT_MARGIN_MS,
   FINALIZE_REQUEST_RESERVE,
   type LaneBrief,
+  observedIsolation,
   observedModelRequests,
   promptFailure,
   REPORT_GRACE_MS,
@@ -19,6 +23,7 @@ import { BROKER_LEDGER, parseCloudRunRequest } from "../isolation";
 import {
   MAX_FORMAT_CORRECTIONS,
   planBroker,
+  readLaneReceipt,
   targetProviderEnv,
 } from "../local";
 import { SESSION_CAPS } from "../provider-budget";
@@ -121,6 +126,84 @@ describe("local driver lifecycle", () => {
       observedModelRequests(state({ totals: { requests: "0" } })),
     ).toBeNull();
     expect(observedModelRequests(undefined)).toBeNull();
+  });
+
+  it("carries the escape the control plane reported into the lane receipt", async () => {
+    const started = {
+      runId: "run",
+      processId: "review",
+      startedAt: "2026-09-22T00:00:00.000Z",
+      placementId: "placement",
+      container: {
+        runnerSha: "a".repeat(64),
+        piVersion: "pi 0.85.0",
+        bunVersion: "1.4.0",
+        gitVersion: "git version 2.34.1",
+      },
+      credentialIsolation: {
+        mode: "worker-proxy" as const,
+        controlUid: 1101,
+        targetUid: 1102,
+      },
+      probes: {
+        targetReadBroker: {
+          verdict: null,
+          reason: "broker_config_not_staged",
+        },
+        controlApi: {
+          httpStatus: 200,
+          uid: 0,
+          reason: "control_api_runs_privileged",
+          escaped: true,
+        },
+      },
+    };
+    // A lane that never started measured no isolation at all, and a receipt
+    // that answered "contained" there would report containment out of thin air.
+    expect(observedIsolation(undefined)).toBeNull();
+
+    const directory = await mkdtemp(join(tmpdir(), "review-pi-receipt-"));
+    await writeFile(
+      join(directory, "receipt.json"),
+      JSON.stringify({
+        runId: "run",
+        provider: "openai-codex",
+        model: "gpt-5.4",
+        wallSeconds: 12,
+        isolation: observedIsolation(started),
+      }),
+    );
+
+    await expect(readLaneReceipt(directory)).resolves.toMatchObject({
+      isolation: {
+        controlApi: {
+          uid: 0,
+          reason: "control_api_runs_privileged",
+          escaped: true,
+        },
+        targetReadBroker: {
+          verdict: null,
+          reason: "broker_config_not_staged",
+        },
+      },
+    });
+  });
+
+  it("reads a receipt that recorded no isolation as unobserved", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "review-pi-receipt-"));
+    await writeFile(
+      join(directory, "receipt.json"),
+      JSON.stringify({
+        runId: "run",
+        provider: "openai-codex",
+        model: "gpt-5.4",
+        wallSeconds: 12,
+      }),
+    );
+
+    await expect(readLaneReceipt(directory)).resolves.toMatchObject({
+      isolation: null,
+    });
   });
 
   it("briefs an idle lane once Pi is up and ends it on an empty brief", async () => {

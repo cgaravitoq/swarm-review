@@ -139,6 +139,45 @@ const sandboxForStart = () => {
   return { startProcess, write };
 };
 
+const sandboxForProbeStart = (probe: {
+  status: string;
+  body: string | null;
+}) => {
+  const startProcess = vi.fn((_command: string) =>
+    Promise.resolve({ id: "review" }),
+  );
+  const destroy = vi.fn(() => Promise.resolve());
+  const exec = vi.fn((command: string) => {
+    if (command.includes("sha256sum")) {
+      return Promise.resolve({
+        stdout: `${sha64}\npi 0.85.0\n1.4.0\ngit version 2.34.1\n`,
+      });
+    }
+    if (command.includes("/api/execute")) {
+      return Promise.resolve({ stdout: probe.status });
+    }
+    if (command.includes("control-api-probe")) {
+      if (command.startsWith("stat")) {
+        return Promise.resolve({
+          stdout: probe.body === null ? "-1\n" : `${probe.body.length}\n`,
+        });
+      }
+      return Promise.resolve({ stdout: probe.body ?? "" });
+    }
+    return Promise.resolve({ stdout: "" });
+  });
+  getSandbox.mockReturnValue({
+    exec,
+    startProcess,
+    destroy,
+    mkdir: vi.fn(() => Promise.resolve()),
+    writeFile: vi.fn(() => Promise.resolve()),
+    putModelSession: vi.fn(() => Promise.resolve()),
+    getContainerPlacementId: vi.fn(() => Promise.resolve("placement")),
+  });
+  return { exec, startProcess, destroy };
+};
+
 describe("worker-proxy credential isolation", () => {
   it("keeps the bearer in the DO session and starts the review as 1102", async () => {
     const { startProcess, write } = sandboxForStart();
@@ -228,6 +267,86 @@ describe("worker-proxy credential isolation", () => {
       env,
     );
     expect(response.status).toBe(400);
+  });
+
+  it("records the control API escape it observed and still starts the lane", async () => {
+    const { exec, startProcess, destroy } = sandboxForProbeStart({
+      status: "200",
+      body: JSON.stringify({ stdout: "0\n" }),
+    });
+
+    const response = await handler.fetch(
+      authorized("https://review.invalid/runs", {
+        method: "POST",
+        body: startBody(),
+      }),
+      env,
+    );
+
+    expect(response.status).toBe(200);
+    expect(await response.json()).toMatchObject({
+      probes: {
+        controlApi: {
+          httpStatus: 200,
+          uid: 0,
+          reason: "control_api_runs_privileged",
+          escaped: true,
+        },
+      },
+    });
+    expect(startProcess).toHaveBeenCalledOnce();
+    expect(destroy).not.toHaveBeenCalled();
+    expect(exec).toHaveBeenCalledWith(expect.stringContaining("/api/execute"));
+  });
+
+  it("reports the broker read as unobserved rather than probing for a config it never stages", async () => {
+    const { exec } = sandboxForProbeStart({
+      status: "403",
+      body: null,
+    });
+
+    const response = await handler.fetch(
+      authorized("https://review.invalid/runs", {
+        method: "POST",
+        body: startBody(),
+      }),
+      env,
+    );
+
+    expect(response.status).toBe(200);
+    expect(await response.json()).toMatchObject({
+      probes: {
+        targetReadBroker: { verdict: null, reason: "broker_config_not_staged" },
+      },
+    });
+    expect(exec).not.toHaveBeenCalledWith(
+      expect.stringContaining("broker.json"),
+    );
+  });
+
+  it("starts a non-canary run whose control API answers as the target uid", async () => {
+    const { startProcess, destroy } = sandboxForProbeStart({
+      status: "200",
+      body: JSON.stringify({ stdout: "1102\n" }),
+    });
+
+    const response = await handler.fetch(
+      authorized("https://review.invalid/runs", {
+        method: "POST",
+        body: startBody(),
+      }),
+      env,
+    );
+
+    expect(response.status).toBe(200);
+    expect(await response.json()).toMatchObject({
+      probes: {
+        controlApi: { uid: 1102, reason: "contained", escaped: false },
+      },
+      credentialIsolation: { mode: "worker-proxy" },
+    });
+    expect(startProcess).toHaveBeenCalledOnce();
+    expect(destroy).not.toHaveBeenCalled();
   });
 });
 

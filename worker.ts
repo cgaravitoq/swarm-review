@@ -22,7 +22,6 @@ import {
   parseCloudRunRequest,
   posixQuote,
   TARGET_UID,
-  targetBrokerReadProbe,
   targetCanaryCommand,
   targetChownCommand,
   targetControlApiProbe,
@@ -331,6 +330,23 @@ export default {
           Number.isInteger(controlApiStatus) ? controlApiStatus : 0,
           controlApiBody,
         );
+        const probes = {
+          // The bearer stays in this Durable Object, so no broker config is
+          // ever staged in the container: a probe here would answer DENIED for
+          // the life of the image and report containment nobody measured.
+          targetReadBroker: {
+            verdict: null,
+            reason: "broker_config_not_staged",
+          },
+          controlApi: {
+            httpStatus: Number.isInteger(controlApiStatus)
+              ? controlApiStatus
+              : null,
+            uid: controlApi.uid,
+            reason: controlApi.reason,
+            escaped: controlApi.escaped,
+          },
+        };
         const capability = await modelCapability(job.runId, env.CONTROL_SECRET);
         const modelsJson = modelsJsonForProxy(
           parsed.modelsJson,
@@ -361,20 +377,6 @@ export default {
         );
 
         if (parsed.canary) {
-          const targetRead = await bounded(
-            "target broker read",
-            sandbox.exec(targetBrokerReadProbe),
-          );
-          if (targetRead.stdout.trim() === "READ") {
-            return json(
-              {
-                error: "isolation_failed",
-                targetReadBroker: targetRead.stdout.trim(),
-                shutdown: { destroy: await destroySandbox(sandbox) },
-              },
-              409,
-            );
-          }
           let provider = null;
           if (parsed.canaryRequest) {
             await bounded(
@@ -421,17 +423,7 @@ export default {
               return json(
                 {
                   error: "canary_incomplete",
-                  probes: {
-                    targetReadBroker: targetRead.stdout.trim(),
-                    controlApi: {
-                      httpStatus: Number.isInteger(controlApiStatus)
-                        ? controlApiStatus
-                        : null,
-                      uid: controlApi.uid,
-                      reason: controlApi.reason,
-                    },
-                    provider,
-                  },
+                  probes: { ...probes, provider },
                   shutdown: { destroy: await destroySandbox(sandbox) },
                 },
                 409,
@@ -446,17 +438,7 @@ export default {
             placementId,
             container,
             credentialIsolation: isolation,
-            probes: {
-              targetReadBroker: targetRead.stdout.trim(),
-              controlApi: {
-                httpStatus: Number.isInteger(controlApiStatus)
-                  ? controlApiStatus
-                  : null,
-                uid: controlApi.uid,
-                reason: controlApi.reason,
-              },
-              provider,
-            },
+            probes: { ...probes, provider },
           });
         }
 
@@ -479,13 +461,7 @@ export default {
           placementId,
           container,
           credentialIsolation: isolation,
-          controlApi: {
-            httpStatus: Number.isInteger(controlApiStatus)
-              ? controlApiStatus
-              : null,
-            uid: controlApi.uid,
-            reason: controlApi.reason,
-          },
+          probes,
         });
       } catch (error) {
         return json(

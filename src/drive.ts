@@ -131,16 +131,37 @@ type RunState = {
   control?: { modelUsage?: unknown };
   artifacts: Artifact[];
 };
+/**
+ * Both answers `POST /runs` gives: a started lane and a canary.
+ *
+ * A canary starts no review process, so it names itself and answers with a
+ * null process id; the isolation probes are the same object on both.
+ */
 type RunStart = {
   runId: string;
-  processId: string;
+  processId: string | null;
   startedAt: string;
+  canary?: boolean;
   placementId: string | null;
   container: {
     runnerSha: string;
     piVersion: string;
     bunVersion: string;
     gitVersion: string;
+  };
+  credentialIsolation: {
+    mode: "worker-proxy";
+    controlUid: number;
+    targetUid: number;
+  };
+  probes: {
+    targetReadBroker: { verdict: string | null; reason: string };
+    controlApi: {
+      httpStatus: number | null;
+      uid: number | null;
+      reason: string;
+      escaped: boolean;
+    };
   };
 };
 type RunStop = {
@@ -251,6 +272,21 @@ export const observedModelRequests = (state: RunState | undefined) => {
   const requests = totals?.["requests"];
   return typeof requests === "number" ? requests : null;
 };
+
+/**
+ * The isolation verdicts the control plane reported when the lane started.
+ *
+ * A lane that never started observed nothing, so it reads null: a receipt that
+ * answered with a contained verdict there would report containment the run
+ * never measured.
+ */
+export const observedIsolation = (started: RunStart | undefined) =>
+  started
+    ? {
+        controlApi: started.probes.controlApi,
+        targetReadBroker: started.probes.targetReadBroker,
+      }
+    : null;
 
 const statusRecord = (state: RunState) =>
   asRecord(parseJson(artifactOf(state, "status.json")?.content));
@@ -971,6 +1007,7 @@ async function main() {
     placementId: started?.placementId ?? state?.placementId ?? null,
     processId: started?.processId ?? null,
     container: started?.container ?? null,
+    isolation: observedIsolation(started),
     modelRequests: observedModelRequests(state),
     finalize,
     runError: lifecycle.runError ? messageOf(lifecycle.runError) : null,
