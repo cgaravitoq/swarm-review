@@ -64,7 +64,11 @@ export class ReviewSandbox extends Sandbox<ReviewPiEnv> {
     return { ok: true as const, session };
   }
 
-  async recordModelAttempt(usage: ModelUsage | null, retryable: boolean) {
+  async recordModelAttempt(
+    usage: ModelUsage | null,
+    retryable: boolean,
+    seal: string | null,
+  ) {
     const session = await this.ctx.storage.get<ModelSession>(MODEL_SESSION_KEY);
     if (!session) return;
     if (usage) {
@@ -76,7 +80,13 @@ export class ReviewSandbox extends Sandbox<ReviewPiEnv> {
       }
     }
     session.retryPending = retryable;
+    session.seals = [...(session.seals ?? []), seal];
     await this.ctx.storage.put(MODEL_SESSION_KEY, session);
+  }
+
+  async modelSeals() {
+    const session = await this.ctx.storage.get<ModelSession>(MODEL_SESSION_KEY);
+    return session ? (session.seals ?? []) : null;
   }
 
   async modelUsage() {
@@ -245,10 +255,11 @@ export default {
         async (runId) => getSandbox(env.REVIEW_SANDBOX, runId).modelUsage(),
         async (runId) =>
           getSandbox(env.REVIEW_SANDBOX, runId).consumeModelAttempt(),
-        async (runId, usage, retryable) =>
+        async (runId, usage, retryable, seal) =>
           getSandbox(env.REVIEW_SANDBOX, runId).recordModelAttempt(
             usage,
             retryable,
+            seal,
           ),
       );
     }
@@ -324,6 +335,7 @@ export default {
               : {}),
             caps: parsed.broker.caps,
             totals: emptyModelTotals(),
+            seals: [],
           }),
         );
         const controlApiHttp = await bounded(
@@ -586,6 +598,15 @@ export default {
     if (request.method === "POST" && segments[2] === "stop") {
       let killed: number | null = null;
       let killError: string | null = null;
+      // The seals leave before the session they live in is cleared: this is
+      // the only control-side record of what the model channel carried, and
+      // the artifacts this response ships beside it are target-writable.
+      let modelSeals: (string | null)[] | null = null;
+      try {
+        modelSeals = await bounded("model seals", sandbox.modelSeals());
+      } catch (error) {
+        killError = killError ?? messageOf(error);
+      }
       try {
         killed = await bounded("process cleanup", sandbox.killAllProcesses());
       } catch (error) {
@@ -603,6 +624,7 @@ export default {
         killed,
         killError,
         destroyedAt: destroy.acknowledged ? new Date().toISOString() : null,
+        control: { modelSeals },
         artifacts,
         shutdown: { destroy },
       });
