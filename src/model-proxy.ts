@@ -106,9 +106,6 @@ export function publicModelUsage(session: ModelSession | undefined) {
 
 export const capViolation = (totals: ModelTotals, caps: ModelCaps) => {
   if (totals.requests >= caps.maxRequests) return "max_requests";
-  if (totals.retries >= caps.maxRetriesPerRequest * caps.maxRequests) {
-    return "max_retries";
-  }
   if (totals.input !== null && totals.input >= caps.maxCumulativeInputTokens) {
     return "max_input_tokens";
   }
