@@ -142,7 +142,6 @@ const sandboxForStart = () => {
 const sandboxForProbeStart = (probe: {
   status: string;
   body: string | null;
-  broker: string;
 }) => {
   const startProcess = vi.fn((_command: string) =>
     Promise.resolve({ id: "review" }),
@@ -164,9 +163,6 @@ const sandboxForProbeStart = (probe: {
         });
       }
       return Promise.resolve({ stdout: probe.body ?? "" });
-    }
-    if (command.includes("broker.json")) {
-      return Promise.resolve({ stdout: probe.broker });
     }
     return Promise.resolve({ stdout: "" });
   });
@@ -273,62 +269,10 @@ describe("worker-proxy credential isolation", () => {
     expect(response.status).toBe(400);
   });
 
-  it("ends a non-canary run whose control API answers as a privileged uid", async () => {
+  it("records the control API escape it observed and still starts the lane", async () => {
     const { exec, startProcess, destroy } = sandboxForProbeStart({
       status: "200",
       body: JSON.stringify({ stdout: "0\n" }),
-      broker: "DENIED\n",
-    });
-
-    const response = await handler.fetch(
-      authorized("https://review.invalid/runs", {
-        method: "POST",
-        body: startBody(),
-      }),
-      env,
-    );
-
-    expect(response.status).toBe(409);
-    expect(await response.json()).toMatchObject({
-      error: "isolation_failed",
-      controlApi: { uid: 0, reason: "control_api_runs_privileged" },
-    });
-    expect(destroy).toHaveBeenCalledOnce();
-    expect(startProcess).not.toHaveBeenCalled();
-    expect(exec).toHaveBeenCalledWith(expect.stringContaining("/api/execute"));
-    expect(exec).toHaveBeenCalledWith(expect.stringContaining("broker.json"));
-  });
-
-  it("ends a non-canary run whose target can read the broker", async () => {
-    const { exec, startProcess, destroy } = sandboxForProbeStart({
-      status: "403",
-      body: null,
-      broker: "READ\n",
-    });
-
-    const response = await handler.fetch(
-      authorized("https://review.invalid/runs", {
-        method: "POST",
-        body: startBody(),
-      }),
-      env,
-    );
-
-    expect(response.status).toBe(409);
-    expect(await response.json()).toMatchObject({
-      error: "isolation_failed",
-      targetReadBroker: "READ",
-    });
-    expect(destroy).toHaveBeenCalledOnce();
-    expect(startProcess).not.toHaveBeenCalled();
-    expect(exec).toHaveBeenCalledWith(expect.stringContaining("broker.json"));
-  });
-
-  it("starts a non-canary run whose control API answers as the target uid", async () => {
-    const { exec, startProcess, destroy } = sandboxForProbeStart({
-      status: "200",
-      body: JSON.stringify({ stdout: "1102\n" }),
-      broker: "DENIED\n",
     });
 
     const response = await handler.fetch(
@@ -341,12 +285,68 @@ describe("worker-proxy credential isolation", () => {
 
     expect(response.status).toBe(200);
     expect(await response.json()).toMatchObject({
-      controlApi: { uid: 1102, reason: "contained" },
+      probes: {
+        controlApi: {
+          httpStatus: 200,
+          uid: 0,
+          reason: "control_api_runs_privileged",
+          escaped: true,
+        },
+      },
+    });
+    expect(startProcess).toHaveBeenCalledOnce();
+    expect(destroy).not.toHaveBeenCalled();
+    expect(exec).toHaveBeenCalledWith(expect.stringContaining("/api/execute"));
+  });
+
+  it("reports the broker read as unobserved rather than probing for a config it never stages", async () => {
+    const { exec } = sandboxForProbeStart({
+      status: "403",
+      body: null,
+    });
+
+    const response = await handler.fetch(
+      authorized("https://review.invalid/runs", {
+        method: "POST",
+        body: startBody(),
+      }),
+      env,
+    );
+
+    expect(response.status).toBe(200);
+    expect(await response.json()).toMatchObject({
+      probes: {
+        targetReadBroker: { verdict: null, reason: "broker_config_not_staged" },
+      },
+    });
+    expect(exec).not.toHaveBeenCalledWith(
+      expect.stringContaining("broker.json"),
+    );
+  });
+
+  it("starts a non-canary run whose control API answers as the target uid", async () => {
+    const { startProcess, destroy } = sandboxForProbeStart({
+      status: "200",
+      body: JSON.stringify({ stdout: "1102\n" }),
+    });
+
+    const response = await handler.fetch(
+      authorized("https://review.invalid/runs", {
+        method: "POST",
+        body: startBody(),
+      }),
+      env,
+    );
+
+    expect(response.status).toBe(200);
+    expect(await response.json()).toMatchObject({
+      probes: {
+        controlApi: { uid: 1102, reason: "contained", escaped: false },
+      },
       credentialIsolation: { mode: "worker-proxy" },
     });
     expect(startProcess).toHaveBeenCalledOnce();
     expect(destroy).not.toHaveBeenCalled();
-    expect(exec).toHaveBeenCalledWith(expect.stringContaining("broker.json"));
   });
 });
 
