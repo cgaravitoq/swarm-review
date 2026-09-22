@@ -17,8 +17,9 @@
  */
 
 import { execFileSync, spawn } from "node:child_process";
+import { createHash } from "node:crypto";
 import { mkdir, readdir, readFile, rename, writeFile } from "node:fs/promises";
-import { dirname, join, resolve } from "node:path";
+import { basename, dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import {
   openAttempt,
@@ -41,6 +42,7 @@ import {
   type ModelCanary,
   writeFastLaneArtifacts,
 } from "./fast-review";
+import { BROKER_LEDGER } from "./isolation";
 import {
   assertRunId,
   createBudget,
@@ -1912,14 +1914,77 @@ export const laneArguments = (
   ];
 };
 
+/** The seal both transports take over the answer text they forwarded. */
+const answerSeal = (text: string) =>
+  createHash("sha256").update(text, "utf8").digest("hex");
+
+/**
+ * The seals the control side recorded for this lane, or null when it left no
+ * record the host can read.
+ *
+ * A local lane's ledger is exported from the container's control directory
+ * and a cloud lane's seals ride out on the stop receipt: both are written by
+ * the side that held the credential, while every artifact written inside the
+ * run directory belongs to the uid the reviewed repository executes as.
+ * Absence refuses whatever `report.json` claims rather than passing it.
+ */
+export const laneSeals = async (
+  artifactDir: string,
+): Promise<string[] | null> => {
+  const ledger = await readFile(
+    join(artifactDir, basename(BROKER_LEDGER)),
+    "utf8",
+  ).catch(() => null);
+  if (ledger !== null) {
+    const seals: string[] = [];
+    for (const line of ledger.split("\n")) {
+      if (!line.trim()) continue;
+      try {
+        const entry = JSON.parse(line) as Record<string, unknown>;
+        const seal = entry["seal"];
+        if (entry["event"] === "provider_request" && typeof seal === "string") {
+          seals.push(seal);
+        }
+      } catch {
+        return null;
+      }
+    }
+    return seals;
+  }
+  const stop = await readFile(join(artifactDir, "stop.json"), "utf8").catch(
+    () => null,
+  );
+  if (stop === null) return null;
+  try {
+    const receipt = JSON.parse(stop) as Record<string, unknown>;
+    const control = receipt["control"];
+    const seals =
+      typeof control === "object" && control !== null
+        ? (control as Record<string, unknown>)["modelSeals"]
+        : undefined;
+    if (!Array.isArray(seals)) return null;
+    return seals.filter((seal): seal is string => typeof seal === "string");
+  } catch {
+    return null;
+  }
+};
+
 /**
  * What one finished lane left in its report, or null when it left none.
  *
  * `completion` is the runner's own marking: a lane that was cut writes its
  * report on the way out and marks it partial, so a lane that never answered
  * and a lane that answered "nothing to report" are never the same file.
+ *
+ * With `requireSeal`, the answer must also be one the control side sealed
+ * over what crossed its own bytes. `report.json` is written by the uid the
+ * reviewed repository executes as, so without that seal the host is reading
+ * the answer from the one file the target can rewrite.
  */
-const laneReport = async (artifactDir: string) => {
+export const laneReport = async (
+  artifactDir: string,
+  options: { requireSeal: boolean },
+) => {
   const raw = await readFile(join(artifactDir, "report.json"), "utf8").catch(
     () => null,
   );
@@ -1931,8 +1996,28 @@ const laneReport = async (artifactDir: string) => {
     const finalText = record["finalText"];
     const completion = record["completion"];
     const partialReason = record["partialReason"];
+    const text = typeof finalText === "string" ? finalText : null;
+    let attested = true;
+    let attestationReason: string | null = null;
+    if (options.requireSeal) {
+      const seals = await laneSeals(artifactDir);
+      const seal = text === null ? null : answerSeal(text);
+      if (seal === null) {
+        attested = false;
+        attestationReason = "the report carries no finalText to attest";
+      } else if (seals === null) {
+        attested = false;
+        attestationReason =
+          "no control-side seal record was exported for this lane";
+      } else if (!seals.includes(seal)) {
+        attested = false;
+        attestationReason = `the answer's seal ${seal} matches none of the ${seals.length} responses the control side sealed`;
+      }
+    }
     return {
-      finalText: typeof finalText === "string" ? finalText : null,
+      finalText: text,
+      attested,
+      attestationReason,
       partial: completion === "partial",
       partialReason:
         completion === "partial" && typeof partialReason === "string"
@@ -2582,7 +2667,9 @@ async function main() {
       laneEvidence = await laneReceiptEvidence(artifactDir);
     }
     const receipt = laneEvidence.receipt;
-    const report = skipped ? null : await laneReport(artifactDir);
+    const report = skipped
+      ? null
+      : await laneReport(artifactDir, { requireSeal: !fastUpstream });
     const finalize = skipped ? null : await laneFinalize(artifactDir);
     const finalText = report?.finalText ?? null;
     const laneCandidates: Candidate[] = [];
@@ -2624,6 +2711,12 @@ async function main() {
         report.partialReason ?? "the lane was cut before it finished";
     } else if (exitCode !== 0 || receipt?.outcome !== "completed") {
       status = "failed";
+    } else if (report && !report.attested) {
+      // report.json is written by the uid the reviewed repository executes as;
+      // an answer no control-side seal matches is that uid's word, not the
+      // model's, and it is recorded rather than parsed.
+      status = "malformed";
+      contractError = report.attestationReason;
     } else {
       const parsed = parseCandidates(finalText ?? "", laneId);
       contractError = parsed.error;
@@ -2886,7 +2979,7 @@ async function main() {
     await briefWriter;
     const laneEvidence = await laneReceiptEvidence(artifactDir);
     const receipt = laneEvidence.receipt;
-    const report = await laneReport(artifactDir);
+    const report = await laneReport(artifactDir, { requireSeal: true });
     const claimed = laneState.claim;
     // A lane that died before any model answered spent nothing on its claim, so
     // the group goes back to the queue for a fresh sandbox. A claim a model
@@ -2916,6 +3009,9 @@ async function main() {
     } else if (exitCode !== 0 || receipt?.outcome !== "completed") {
       status = "failed";
       blockerReason = receipt?.error ?? laneEvidence.damage;
+    } else if (report && !report.attested) {
+      status = "malformed";
+      contractError = report.attestationReason;
     } else {
       const parsed = parseVerdicts(
         report?.finalText ?? "",
@@ -3107,7 +3203,7 @@ async function main() {
     // Nothing to rule on: the idle verifier is told so and tears down unused.
     await writeBrief(verifierBriefPath, { prompt: null, candidateIds: [] });
     const exitCode = await warmVerifier;
-    verifierReport = await laneReport(verifierDir);
+    verifierReport = await laneReport(verifierDir, { requireSeal: true });
     if (verifierSession) {
       await sessions.finish(verifierSession.sessionId, {
         status: abortReason ? "cancelled" : "not_run",
@@ -3323,7 +3419,9 @@ async function main() {
       );
       verifierEvidence = await laneReceiptEvidence(verifierDir);
     }
-    verifierReport = await laneReport(verifierDir);
+    verifierReport = await laneReport(verifierDir, {
+      requireSeal: !fastUpstream,
+    });
     if (abortReason || verifierEvidence.receipt?.outcome === "interrupted") {
       verifierStatus = "cancelled";
     } else if (verifierCanaryError) {
@@ -3343,6 +3441,9 @@ async function main() {
       verifierEvidence.receipt?.outcome !== "completed"
     ) {
       verifierStatus = "failed";
+    } else if (verifierReport && !verifierReport.attested) {
+      verifierStatus = "malformed";
+      verifierContractError = verifierReport.attestationReason;
     } else {
       const parsed = parseVerdicts(
         verifierReport?.finalText ?? "",

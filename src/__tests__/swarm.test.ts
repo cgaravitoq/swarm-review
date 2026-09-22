@@ -11,12 +11,13 @@ import {
   rm,
   writeFile,
 } from "node:fs/promises";
-import { createServer } from "node:http";
+import { createServer, type Server } from "node:http";
 import type { AddressInfo } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath, URL } from "node:url";
 import { afterAll, afterEach, describe, expect, it, vi } from "vitest";
+import { createBrokerServer } from "../../container/model-broker";
 import { PARTIAL_SUFFIX } from "../attempt";
 import { FINALIZE_REQUEST_RESERVE } from "../drive";
 import { CANARY_PROMPT } from "../fast-review";
@@ -36,6 +37,7 @@ import {
   laneArguments,
   laneBudgets,
   laneReceiptEvidence,
+  laneReport,
   laneTimeoutSeconds,
   laneWindowSeconds,
   MAX_CONCURRENT_LANES,
@@ -2026,6 +2028,158 @@ describe("recommended check", () => {
   });
 });
 
+const listenOn = (server: Server) =>
+  new Promise<number>((wake) => {
+    server.listen(0, "127.0.0.1", () => {
+      const address = server.address();
+      wake(typeof address === "object" && address ? address.port : 0);
+    });
+  });
+
+const closeServer = (server: Server) =>
+  new Promise<void>((wake) => server.close(() => wake()));
+
+describe("an answer the model channel never sealed", () => {
+  const fence = String.fromCharCode(96).repeat(3);
+  const honestAnswer = [
+    `${fence}json`,
+    JSON.stringify({
+      status: "complete",
+      findings: [
+        {
+          severity: "P2",
+          file: "src/a.ts",
+          line: 3,
+          mechanism: "the mechanism",
+          evidence: "the evidence",
+          affectedBehavior: "the behavior",
+        },
+      ],
+    }),
+    fence,
+  ].join("\n");
+  const forgedAnswer = [
+    `${fence}json`,
+    JSON.stringify({ status: "complete", findings: [] }),
+    fence,
+  ].join("\n");
+
+  const sealOf = (text: string) =>
+    createHash("sha256").update(text, "utf8").digest("hex");
+
+  const reportOf = (finalText: string) =>
+    JSON.stringify({ completion: "complete", finalText });
+
+  const emptyLane = async () => {
+    const root = await mkdtemp(join(tmpdir(), "review-pi-sealed-"));
+    temporaryDirectories.push(root);
+    const artifactDir = join(root, "lane");
+    await mkdir(artifactDir);
+    return artifactDir;
+  };
+
+  /**
+   * A lane as the run leaves it: the real broker, against a stub upstream,
+   * sealed the answer that crossed the channel into the ledger the local
+   * driver exports beside report.json.
+   */
+  const sealedLane = async () => {
+    const artifactDir = await emptyLane();
+    const upstream = createServer((_request, response) => {
+      response.writeHead(200, { "content-type": "text/event-stream" });
+      response.end(
+        `data: ${JSON.stringify({ choices: [{ delta: { content: honestAnswer } }] })}\n\ndata: [DONE]\n\n`,
+      );
+    });
+    const { server: broker } = createBrokerServer({
+      port: 0,
+      handle: "review-pi-handle",
+      upstreamBaseUrl: `http://127.0.0.1:${await listenOn(upstream)}/v1`,
+      upstreamAuthorization: "Bearer upstream-canary",
+      caps: {
+        maxRequests: 4,
+        maxRetriesPerRequest: 1,
+        maxCumulativeInputTokens: 1000,
+        maxCumulativeOutputTokens: 1000,
+        maxRequestBytes: 4096,
+      },
+      ledgerPath: join(artifactDir, "provider-usage.jsonl"),
+    });
+    const brokerPort = await listenOn(broker);
+    const response = await fetch(
+      `http://127.0.0.1:${brokerPort}/chat/completions`,
+      {
+        method: "POST",
+        headers: { authorization: "Bearer review-pi-handle" },
+        body: "{}",
+      },
+    );
+    await response.text();
+    await closeServer(broker);
+    await closeServer(upstream);
+    await writeFile(join(artifactDir, "report.json"), reportOf(honestAnswer));
+    return artifactDir;
+  };
+
+  it("keeps the answer the broker sealed over the channel", async () => {
+    const artifactDir = await sealedLane();
+
+    expect(await laneReport(artifactDir, { requireSeal: true })).toMatchObject({
+      attested: true,
+      attestationReason: null,
+      finalText: honestAnswer,
+    });
+  });
+
+  it("refuses the answer report.json was rewritten to claim after the run", async () => {
+    const artifactDir = await sealedLane();
+    // uid 1102 owns the run directory: it rewrites the report the host reads.
+    await writeFile(join(artifactDir, "report.json"), reportOf(forgedAnswer));
+
+    const lane = await laneReport(artifactDir, { requireSeal: true });
+
+    expect(lane?.attested).toBe(false);
+    expect(lane?.attestationReason).toBe(
+      `the answer's seal ${sealOf(forgedAnswer)} matches none of the 1 responses the control side sealed`,
+    );
+    // Parsing alone would have read the forgery as a clean finished review;
+    // the seal is the only thing that refuses it.
+    expect(parseCandidates(forgedAnswer, "lane-1")).toMatchObject({
+      error: null,
+      candidates: [],
+    });
+  });
+
+  it("refuses an answer no control-side record was exported for", async () => {
+    const artifactDir = await emptyLane();
+    await writeFile(join(artifactDir, "report.json"), reportOf(honestAnswer));
+
+    const lane = await laneReport(artifactDir, { requireSeal: true });
+
+    expect(lane?.attested).toBe(false);
+    expect(lane?.attestationReason).toBe(
+      "no control-side seal record was exported for this lane",
+    );
+  });
+
+  it("reads a cloud lane's seals from the stop receipt the control plane wrote", async () => {
+    const artifactDir = await emptyLane();
+    await writeFile(
+      join(artifactDir, "stop.json"),
+      JSON.stringify({ control: { modelSeals: [sealOf(honestAnswer)] } }),
+    );
+    await writeFile(join(artifactDir, "report.json"), reportOf(honestAnswer));
+    const kept = await laneReport(artifactDir, { requireSeal: true });
+
+    await writeFile(join(artifactDir, "report.json"), reportOf(forgedAnswer));
+    const refused = await laneReport(artifactDir, { requireSeal: true });
+
+    expect(kept).toMatchObject({ attested: true, finalText: honestAnswer });
+    expect(refused?.attested).toBe(false);
+    expect(refused?.attestationReason).toContain(sealOf(forgedAnswer));
+  });
+});
+
 describe("public swarm command", () => {
   const fakeDockerScript = `#!/bin/bash
 set -u
@@ -2164,6 +2318,24 @@ if [[ "$1" == "exec" && "$joined" == *" --send "* ]]; then
       exit 0
       ;;
   esac
+fi
+if [[ "$1" == "exec" && "$joined" == *"cat /opt/review/control/provider-usage.jsonl"* ]]; then
+  # The real ledger lives in the control directory the target cannot write,
+  # and it seals what crossed the broker rather than what any file claims. The
+  # fake one seals the test's own pristine answer the same way - from
+  # FAKE_REPORTS, never from the container's copy of report.json.
+  name="$4"
+  runid="\${name#review-pi-local-}"
+  report="\${FAKE_REPORTS:?}/$runid.json"
+  [[ -f "$report" ]] || exit 1
+  final=$(jq -j '.finalText // ""' "$report") || exit 1
+  if command -v sha256sum >/dev/null 2>&1; then
+    seal=$(printf '%s' "$final" | sha256sum | cut -d' ' -f1)
+  else
+    seal=$(printf '%s' "$final" | shasum -a 256 | cut -d' ' -f1)
+  fi
+  printf '{"event":"provider_request","seal":"%s","totals":{"requests":1,"retries":0,"input":0,"output":0}}\n' "$seal"
+  exit 0
 fi
 if [[ "$1" == "exec" && "\${@: -2:1}" == "cat" ]]; then
   target=$(printf '%s' "\${@: -1}" | /usr/bin/sed "s#/workspace/runs/#$root/#g")
@@ -3698,7 +3870,8 @@ exec /usr/bin/git "$@"
      * answers the candidates it names the way `declaringVerdicts` does, and
      * leaves the report and receipt a real lane would.
      */
-    const fakeDriver = `import { mkdir, readFile, writeFile } from "node:fs/promises";
+    const fakeDriver = `import { createHash } from "node:crypto";
+import { mkdir, readFile, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 const argv = process.argv.slice(2);
 const flag = (name) => argv[argv.indexOf(name) + 1];
@@ -3727,11 +3900,17 @@ const verdicts = Array.from(
 );
 const fence = String.fromCharCode(96).repeat(3);
 await mkdir(artifactDir, { recursive: true });
+const finalText = ["", fence + "json", JSON.stringify({ verdicts }), fence, ""].join("\\n");
 await writeFile(
   join(artifactDir, "report.json"),
+  JSON.stringify({ finalText, usage: { totalTokens: 7 } }),
+);
+await writeFile(
+  join(artifactDir, "stop.json"),
   JSON.stringify({
-    finalText: ["", fence + "json", JSON.stringify({ verdicts }), fence, ""].join("\\n"),
-    usage: { totalTokens: 7 },
+    control: {
+      modelSeals: [createHash("sha256").update(finalText, "utf8").digest("hex")],
+    },
   }),
 );
 await writeFile(
@@ -3884,7 +4063,8 @@ if (
       // would leave a whole one.
       await writeFile(
         join(arranged.repo, "agents/review-pi/src/drive.ts"),
-        `import { appendFile, mkdir, readFile, writeFile } from "node:fs/promises";
+        `import { createHash } from "node:crypto";
+import { appendFile, mkdir, readFile, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 const argv = process.argv.slice(2);
 const flag = (name) => (argv.includes(name) ? argv[argv.indexOf(name) + 1] : null);
@@ -3906,14 +4086,20 @@ const verdicts = Array.from(prompt.matchAll(/"id": "(c\\d+)"/g), ([, id]) => ({
 }));
 const fence = String.fromCharCode(96).repeat(3);
 await mkdir(artifactDir, { recursive: true });
+const finalText =
+  flag("--role") === "verifier"
+    ? ["", fence + "json", JSON.stringify({ verdicts }), fence, ""].join("\\n")
+    : ${JSON.stringify(reviewerAnswer)};
 await writeFile(
   join(artifactDir, "report.json"),
+  JSON.stringify({ finalText, usage: { totalTokens: 7 } }),
+);
+await writeFile(
+  join(artifactDir, "stop.json"),
   JSON.stringify({
-    finalText:
-      flag("--role") === "verifier"
-        ? ["", fence + "json", JSON.stringify({ verdicts }), fence, ""].join("\\n")
-        : ${JSON.stringify(reviewerAnswer)},
-    usage: { totalTokens: 7 },
+    control: {
+      modelSeals: [createHash("sha256").update(finalText, "utf8").digest("hex")],
+    },
   }),
 );
 await writeFile(

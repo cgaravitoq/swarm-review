@@ -1,4 +1,5 @@
 import { spawnSync } from "node:child_process";
+import { createHash } from "node:crypto";
 import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
@@ -465,6 +466,26 @@ describe("review run lifecycle", () => {
     });
   });
 
+  it("ships the control-side seals out with the stop receipt", async () => {
+    getSandbox.mockReturnValue({
+      killAllProcesses: vi.fn(() => Promise.resolve(1)),
+      exec: vi.fn(() => Promise.resolve({ stdout: "-1\n" })),
+      clearModelSession: vi.fn(() => Promise.resolve()),
+      modelSeals: vi.fn(() => Promise.resolve(["cafe", null])),
+      destroy: vi.fn(() => Promise.resolve()),
+    });
+
+    const response = await handler.fetch(
+      authorized("https://review.invalid/runs/run/stop", { method: "POST" }),
+      env,
+    );
+
+    expect(response.status).toBe(200);
+    expect(await response.json()).toMatchObject({
+      control: { modelSeals: ["cafe", null] },
+    });
+  });
+
   it("forwards an accept command as the target uid and rejects restart", async () => {
     const exec = vi.fn((_command: string) =>
       Promise.resolve({
@@ -749,5 +770,37 @@ describe("cloud model session accounting", () => {
     expect(await sandbox.modelUsage()).toMatchObject({
       totals: { requests: 0, retries: 0 },
     });
+  });
+
+  it("seals every response the target can read but never write", async () => {
+    const sandbox = await runningSandbox();
+    getSandbox.mockReturnValue(sandbox);
+    const body = [
+      'data: {"type":"message_start","message":{"content":[]}}',
+      'data: {"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}',
+      'data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"sealed answer"}}',
+      'data: {"type":"message_delta","delta":{"stop_reason":"end_turn"}}',
+      "data: [DONE]",
+    ].join("\n\n");
+    vi.stubGlobal(
+      "fetch",
+      vi.fn<typeof fetch>(() =>
+        Promise.resolve(
+          new Response(body, {
+            status: 200,
+            headers: { "content-type": "text/event-stream" },
+          }),
+        ),
+      ),
+    );
+
+    const answered = await postModel("seal-run");
+    await answered.text();
+    const refused = await postModel("seal-run", "x".repeat(2048));
+    expect(refused.status).toBe(413);
+
+    expect(await sandbox.modelSeals()).toEqual([
+      createHash("sha256").update("sealed answer", "utf8").digest("hex"),
+    ]);
   });
 });

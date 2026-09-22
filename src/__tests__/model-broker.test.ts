@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import { mkdtemp, readFile, rm } from "node:fs/promises";
 import { createServer, type IncomingMessage, type Server } from "node:http";
 import { connect } from "node:net";
@@ -186,6 +187,57 @@ describe("model broker", () => {
       input: 1200,
       output: 300,
     });
+  });
+
+  const requestEntry = async () =>
+    (await readFile(ledgerPath, "utf8"))
+      .split("\n")
+      .filter(Boolean)
+      .map((line) => JSON.parse(line) as Record<string, unknown>)
+      .find((entry) => entry["event"] === "provider_request");
+
+  const sha256 = (text: string) =>
+    createHash("sha256").update(text, "utf8").digest("hex");
+
+  it("seals the answer text that crossed the broker, which report.json cannot rewrite", async () => {
+    await call();
+
+    expect((await requestEntry())?.["seal"]).toBe(sha256("ok"));
+  });
+
+  it("seals Anthropic blocks exactly as pi joins them into finalText", async () => {
+    upstreamBody = [
+      'data: {"type":"message_start","message":{"content":[]}}',
+      'data: {"type":"content_block_start","index":0,"content_block":{"type":"thinking","thinking":""}}',
+      'data: {"type":"content_block_delta","index":0,"delta":{"type":"thinking_delta","thinking":"secret reasoning"}}',
+      'data: {"type":"content_block_stop","index":0}',
+      'data: {"type":"content_block_start","index":1,"content_block":{"type":"text","text":""}}',
+      'data: {"type":"content_block_delta","index":1,"delta":{"type":"text_delta","text":"alpha one"}}',
+      'data: {"type":"content_block_delta","index":1,"delta":{"type":"text_delta","text":" more"}}',
+      'data: {"type":"content_block_stop","index":1}',
+      'data: {"type":"content_block_start","index":2,"content_block":{"type":"text","text":""}}',
+      'data: {"type":"content_block_delta","index":2,"delta":{"type":"text_delta","text":"beta two"}}',
+      'data: {"type":"content_block_stop","index":2}',
+      'data: {"type":"message_delta","delta":{"stop_reason":"end_turn"}}',
+      "data: [DONE]",
+    ].join("\n\n");
+
+    const response = await call();
+    const text = await response.text();
+
+    expect(text).toBe(upstreamBody);
+    expect((await requestEntry())?.["seal"]).toBe(
+      sha256("alpha one more\nbeta two"),
+    );
+  });
+
+  it("seals nothing over a body whose shape it cannot place", async () => {
+    upstreamBody = "Unauthorized";
+
+    const response = await call();
+
+    expect(response.status).toBe(200);
+    expect((await requestEntry())?.["seal"]).toBeNull();
   });
 
   it("stops calling the provider once a cumulative token cap is reached", async () => {
