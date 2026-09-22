@@ -332,6 +332,32 @@ describe("model proxy", () => {
     expect(upstream).not.toHaveBeenCalled();
   });
 
+  it("measures a body against the cap its own session carries", async () => {
+    const upstream = vi.fn<typeof fetch>(() =>
+      Promise.resolve(new Response("ok")),
+    );
+    vi.stubGlobal("fetch", upstream);
+    const url = await proxyTarget("run-session-cap");
+    const caps = capsFor({ maxRequestBytes: 8 });
+    const send = (body: string) =>
+      proxyModelFetch(
+        new Request(url, {
+          method: "POST",
+          headers: { authorization: "Bearer review-pi-handle" },
+          body,
+        }),
+        url,
+        "control-secret",
+        sessionOpener(caps),
+        sessionConsumer(emptyModelTotals(), caps),
+        async () => undefined,
+      );
+
+    expect((await send("x".repeat(8))).status).toBe(200);
+    expect((await send("x".repeat(9))).status).toBe(413);
+    expect(upstream).toHaveBeenCalledOnce();
+  });
+
   it.each(["GET", "HEAD"])(
     "forwards a %s, which carries no body, instead of refusing it",
     async (method) => {
