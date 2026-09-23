@@ -325,6 +325,106 @@ describe("Pi event boundary", () => {
     expect(report.completion).toBe("complete");
   });
 
+  it("keeps how the review ended in the runner's last word, from main or the window", async () => {
+    // The bridge writes a review it never handed back as an answer and exits;
+    // whichever of the runner's two last words comes after it, it must not
+    // say the lane completed.
+    const runner = fileURLToPath(
+      new URL("../../container/review-run.sh", import.meta.url),
+    );
+    const endings = [
+      ["failed", "model_error"],
+      ["failed", "process_spawn_error"],
+      ["failed", "stdin_error"],
+      ["failed", "process_exit"],
+      ["blocked", "auth_blocked"],
+      ["blocked", "quota_blocked"],
+      ["blocked", "budget_exhausted"],
+      ["cancelled", "no_candidates"],
+    ] as const;
+    for (const lastWord of ["on_window_spent", "write_final_status"]) {
+      for (const [state, reason] of endings) {
+        const root = await prepareReportRun(`${state}-${reason}`);
+        await writeFile(join(root, "pi-raw.jsonl"), "");
+        await writeFile(join(root, "steps.jsonl"), "");
+        // Main speaks after the review step recorded its exit; the window
+        // handler can cut the step before it does.
+        if (lastWord === "write_final_status") {
+          await writeFile(join(root, "review.exit"), "1\n");
+        }
+        await writeFile(
+          join(root, "status.json"),
+          JSON.stringify({ phase: "review", state, terminalReason: reason }),
+        );
+
+        const result = spawnSync(
+          "bash",
+          ["-c", `source "$1" "$2"; ${lastWord}`, "runner-test", runner, root],
+          { encoding: "utf8", env: { ...process.env, SUPERVISED: "1" } },
+        );
+        const status = JSON.parse(
+          await readFile(join(root, "status.json"), "utf8"),
+        );
+
+        expect(result.status, `${lastWord} ${reason}`).toBe(0);
+        expect(status, `${lastWord} ${reason}`).toMatchObject({
+          phase: "finished",
+          state,
+          terminalReason: reason,
+          process: { alive: false },
+        });
+      }
+    }
+  });
+
+  it("fails a review step that ended without a word from the bridge", async () => {
+    // A bridge that dies without writing leaves the step's own running status
+    // behind; its exit code is the only witness, and it is not a success.
+    const runner = fileURLToPath(
+      new URL("../../container/review-run.sh", import.meta.url),
+    );
+    const cases = [
+      [null, "exit 137"],
+      [{ reason: "auth_blocked" }, "auth_blocked"],
+    ] as const;
+    for (const [reviewError, reason] of cases) {
+      const root = await prepareReportRun("bridge-died");
+      await writeFile(join(root, "review.exit"), "137\n");
+      await writeFile(
+        join(root, "status.json"),
+        JSON.stringify({ phase: "review", state: "running" }),
+      );
+      if (reviewError) {
+        await writeFile(
+          join(root, "review-error.json"),
+          JSON.stringify(reviewError),
+        );
+      }
+
+      const result = spawnSync(
+        "bash",
+        [
+          "-c",
+          'source "$1" "$2"; write_final_status',
+          "runner-test",
+          runner,
+          root,
+        ],
+        { encoding: "utf8", env: { ...process.env, SUPERVISED: "1" } },
+      );
+      const status = JSON.parse(
+        await readFile(join(root, "status.json"), "utf8"),
+      );
+
+      expect(result.status).toBe(0);
+      expect(status).toMatchObject({
+        phase: "finished",
+        state: "failed",
+        terminalReason: reason,
+      });
+    }
+  });
+
   it("rejects a JSON-mode model error and preserves bounded evidence", async () => {
     const root = await mkdtemp(join(tmpdir(), "review-pi-events-"));
     temporaryDirectories.push(root);
@@ -878,10 +978,13 @@ describe("supervised native Pi RPC lifecycle", { timeout: 120_000 }, () => {
     provider = "openai-codex",
     jobExtra: Record<string, unknown> = {},
     piEnv: Record<string, string> = {},
+    entry: "bridge" | "main" = "bridge",
   ) => {
     const root = await mkdtemp(join(tmpdir(), "review-pi-supervised-"));
     temporaryDirectories.push(root);
-    const repo = join(root, "work/repo");
+    // The runner's own main clones its checkout, so it is handed a remote
+    // instead of a checkout already in place.
+    const repo = join(root, entry === "main" ? "source" : "work/repo");
     await mkdir(repo, { recursive: true });
     execFileSync("git", ["init", "-q", repo]);
     await writeFile(join(repo, "tracked.txt"), "base\n");
@@ -902,6 +1005,10 @@ describe("supervised native Pi RPC lifecycle", { timeout: 120_000 }, () => {
     const sha = execFileSync("git", ["-C", repo, "rev-parse", "HEAD"], {
       encoding: "utf8",
     }).trim();
+    const remote = join(root, "origin.git");
+    if (entry === "main") {
+      execFileSync("git", ["clone", "-q", "--bare", repo, remote]);
+    }
 
     const binDir = join(root, "bin");
     await mkdir(binDir, { recursive: true });
@@ -1335,6 +1442,7 @@ process.stdin.on("data", (chunk) => {
         model: "gpt-5.6-sol",
         ...(initialPrompt === null ? {} : { prompt: initialPrompt }),
         checkCommand: "git --no-pager diff --stat base..HEAD",
+        ...(entry === "main" ? { gitRemote: remote } : {}),
         ...jobExtra,
       }),
     );
@@ -1349,7 +1457,8 @@ process.stdin.on("data", (chunk) => {
       new URL("../../container/review-run.sh", import.meta.url),
     );
 
-    const runnerProc = spawn("bash", [runner, root, "--bridge"], {
+    const argv = entry === "main" ? [runner, root] : [runner, root, "--bridge"];
+    const runnerProc = spawn("bash", argv, {
       env: {
         ...process.env,
         PATH: `${binDir}:${process.env.PATH}`,
@@ -1379,7 +1488,9 @@ process.stdin.on("data", (chunk) => {
     });
 
     const sockPath = join(root, "rpc.sock");
-    await waitForSocket(sockPath);
+    // Main clones and checks before the socket exists, and a lane that fails
+    // its first turn closes it again before a poll could see it.
+    if (entry === "bridge") await waitForSocket(sockPath);
 
     return { root, sockPath, runnerProc };
   };
@@ -2406,6 +2517,53 @@ process.stdin.on("data", (chunk) => {
       });
     } finally {
       modelError.runnerProc.kill();
+    }
+  });
+
+  it("leaves a review that ended in error failed in the runner's last status", async () => {
+    // The real lane: pi's first turn ended 402, the bridge wrote model_error
+    // and exited, and the steps after it left finished/done/completed, which
+    // no driver believes and none could end on.
+    const lane = await prepareSupervisedRun(
+      "model-error-main",
+      "model error then exit",
+      "openai-codex",
+      {},
+      {},
+      "main",
+    );
+    try {
+      expect(await waitForExit(lane.runnerProc, SUPERVISED_WAIT_MS)).toBe(0);
+      const steps = (await readFile(join(lane.root, "steps.jsonl"), "utf8"))
+        .split("\n")
+        .filter(Boolean)
+        .map((line) => JSON.parse(line) as Record<string, unknown>);
+      expect(steps.map((step) => step["step"])).toEqual([
+        "clone",
+        "install",
+        "check",
+        "review",
+        "checkout_delta",
+        "trace",
+        "report",
+      ]);
+      expect(steps[3]).toMatchObject({ step: "review", exit: 1 });
+      const report = JSON.parse(
+        await readFile(join(lane.root, "report.json"), "utf8"),
+      );
+      expect(report).toMatchObject({ completion: "partial" });
+      expect(report.partialReason).toContain("model_error");
+      const status = JSON.parse(
+        await readFile(join(lane.root, "status.json"), "utf8"),
+      );
+      expect(status).toMatchObject({
+        phase: "finished",
+        state: "failed",
+        terminalReason: "model_error",
+        process: { alive: false },
+      });
+    } finally {
+      lane.runnerProc.kill();
     }
   });
 
