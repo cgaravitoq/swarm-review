@@ -57,7 +57,7 @@ write_status() {
       detail:$detail, inFlightTool:(if $inFlightTool == "" then null else $inFlightTool end),
       lastEvent:(if $lastEvent == "" then null else $lastEvent end),
       terminalReason:(if $terminalReason == "" then null else $terminalReason end),
-      process:{alive:(if $state == "done" or $state == "cancelled" or $state == "failed" then false else true end), pid:$pid}}' \
+      process:{alive:(if $state == "done" or $state == "cancelled" or $state == "failed" or $state == "blocked" then false else true end), pid:$pid}}' \
     > "$STATUS.tmp"
   mv "$STATUS.tmp" "$STATUS"
 }
@@ -1412,6 +1412,43 @@ do_partial_report() {
   write_report partial "${1:-$(partial_reason)}"
 }
 
+REVIEW_STATE=""
+REVIEW_REASON=""
+
+# How the review itself ended, kept before the steps after it rewrite
+# status.json. The bridge writes a review it never handed back as an answer
+# as failed, blocked or cancelled and then exits; a review step that failed
+# without a word from the bridge failed all the same.
+keep_review_ending() {
+  [ -z "$REVIEW_STATE" ] || return 0
+  if [ "$(jq -r '.phase' "$STATUS" 2>/dev/null)" = review ]; then
+    case "$(jq -r '.state' "$STATUS" 2>/dev/null)" in
+      failed|blocked|cancelled)
+        REVIEW_STATE=$(jq -r '.state' "$STATUS")
+        REVIEW_REASON=$(jq -r '.terminalReason // .state' "$STATUS")
+        return 0
+        ;;
+    esac
+  fi
+  local code
+  code=$(cat "$RUN_DIR/review.exit" 2>/dev/null) || return 0
+  if [ "$code" != 0 ]; then
+    REVIEW_STATE=failed
+    REVIEW_REASON=$(jq -r '.reason // empty' "$REVIEW_ERROR" 2>/dev/null)
+    REVIEW_REASON=${REVIEW_REASON:-exit $code}
+  fi
+}
+
+# The runner's last word, and a failed review is still failed in it.
+write_final_status() {
+  keep_review_ending
+  if [ -n "$REVIEW_STATE" ]; then
+    write_status finished "$REVIEW_STATE" "" "" "" "$REVIEW_REASON"
+  else
+    write_status finished done "" "" "" "completed"
+  fi
+}
+
 # The outer `timeout` cuts this whole process group at the lane's window and
 # gives it 15 s more before the KILL. Writing the report from the handler is
 # what makes a lane cut at its deadline leave evidence instead of nothing.
@@ -1420,7 +1457,7 @@ on_window_spent() {
     write_report partial "$(partial_reason)"
     record report 0 0 "cut at the lane's window"
   fi
-  write_status finished done "" "" "" "completed"
+  write_final_status
   exit 0
 }
 
@@ -1441,6 +1478,7 @@ main() {
   # A review that ended without a report - the provider refused, the cap was
   # reached, the child died - is reported as a cut lane, not as no lane.
   step_soft review do_review
+  keep_review_ending
   step_soft checkout_delta do_checkout_delta
   # Soft on purpose: a lane killed mid-line leaves a truncated raw stream, and
   # a trace that cannot be cut is not a reason to lose the report as well.
@@ -1449,11 +1487,7 @@ main() {
     step_soft report do_report
   fi
   [ -s "$REPORT" ] || step report do_partial_report
-  if ! is_supervised; then
-    write_status finished done
-  else
-    write_status finished done "" "" "" "completed"
-  fi
+  write_final_status
 }
 
 if [ "${BASH_SOURCE[0]}" = "$0" ]; then
