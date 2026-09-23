@@ -64,6 +64,27 @@ describe("response seal", () => {
     }
   });
 
+  it("seals a stream an SSE comment opens", () => {
+    const answer = "answer after a keep-alive";
+    for (const opening of [
+      ": keep-alive\n\n",
+      ": OPENROUTER PROCESSING\n\n",
+      ": a comment\r\n\r\n",
+    ]) {
+      expect(sealOf(`${opening}${chatBody(answer)}`)).toBe(sha256(answer));
+    }
+    // A comment does not establish the wire format, so what follows it still
+    // has to be one rather than an attested answer.
+    expect(sealOf(": keep-alive\n\nUnauthorized")).toBeNull();
+  });
+
+  it("ignores a comment between events and seals nothing for comments alone", () => {
+    expect(
+      sealOf(`${chatBody("before")}: keep-alive\n\n${chatBody("after")}`),
+    ).toBe(sha256("beforeafter"));
+    expect(sealOf(": keep-alive\n\n: OPENROUTER PROCESSING\n\n")).toBeNull();
+  });
+
   it("seals nothing for a response that carried no answer", () => {
     const noAnswer = [
       JSON.stringify({ choices: [] }),

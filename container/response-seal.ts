@@ -120,6 +120,10 @@ export const responseSealer = () => {
     const line = rawLine.replace(/\r$/, "");
     if (!sawLine) {
       if (line.trim() === "") return true;
+      // A comment carries no event, so a provider's keep-alive may open the
+      // stream. It does not establish the format either: what follows it still
+      // has to be one.
+      if (line.startsWith(":")) return true;
       sawLine = true;
       if (!/^(?:data|event|id|retry):/.test(line.trim())) return false;
     }
