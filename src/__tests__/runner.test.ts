@@ -702,6 +702,53 @@ exit 0
 `,
     );
     await chmod(join(bin, "bun"), 0o755);
+    // The runner bounds the install, the check and Pi with the image's
+    // coreutils `timeout`, which macOS does not carry. Without it every one of
+    // those steps exits 127 on this host, so the double stands in for that one
+    // host tool: it takes the option shape the runner uses, cuts the child's
+    // own process group at the limit, and reports the 124 coreutils reports.
+    await writeFile(
+      join(bin, "timeout"),
+      `#!/usr/bin/env node
+const { spawn } = require("node:child_process");
+
+const argv = process.argv.slice(2);
+let killAfter = null;
+if (argv[0] === "-k") {
+  killAfter = Number(argv[1]);
+  argv.splice(0, 2);
+}
+const limit = Number(argv[0]);
+if (!Number.isFinite(limit) || !argv[1]) {
+  process.stderr.write("timeout: expected a duration and a command\\n");
+  process.exit(125);
+}
+const child = spawn(argv[1], argv.slice(2), {
+  stdio: "inherit",
+  detached: true,
+});
+let expired = false;
+const limitTimer = setTimeout(() => {
+  expired = true;
+  try {
+    process.kill(-child.pid, "SIGTERM");
+  } catch {}
+  if (killAfter !== null) {
+    setTimeout(() => {
+      try {
+        process.kill(-child.pid, "SIGKILL");
+      } catch {}
+    }, killAfter * 1000);
+  }
+}, limit * 1000);
+child.on("exit", (code) => {
+  clearTimeout(limitTimer);
+  const status = code ?? 1;
+  process.exit(expired ? 124 : status);
+});
+`,
+    );
+    await chmod(join(bin, "timeout"), 0o755);
     return {
       root,
       run,
