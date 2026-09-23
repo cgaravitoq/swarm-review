@@ -388,7 +388,7 @@ export async function writeFastLaneArtifacts(input: {
     model: input.model,
     wallSeconds: input.wallSeconds,
     teardownSeconds: 0,
-    usage: input.usage ?? {},
+    usage: input.usage ?? null,
     error: input.error ?? null,
     shutdown: { truncatedArtifacts: [] },
   });

@@ -5545,8 +5545,9 @@ await writeFile(
       expect(String(refusedLane?.["error"])).toContain("model not found");
       expect(String(refusedLane?.["error"])).toContain("404");
       expect(String(refusedLane?.["blockerReason"])).toContain(refused);
-      // No pack was sent and no tokens were spent on it.
-      expect(refusedLane?.["usage"]).toEqual({});
+      // No pack was sent, so the row has no usage to report, and the provider's
+      // own record shows no tokens were spent on it.
+      expect(refusedLane?.["usage"]).toBeNull();
       expect(
         provider.requests.filter(
           (request) =>

@@ -9,6 +9,7 @@ import {
   packedRequestBody,
   writeFastLaneArtifacts,
 } from "../fast-review";
+import { readLaneReceipt } from "../local";
 
 afterEach(() => {
   vi.unstubAllGlobals();
@@ -514,6 +515,28 @@ describe("canaryModel", () => {
 });
 
 describe("writeFastLaneArtifacts", () => {
+  it("records a lane whose call never answered as spending an unobserved count", async () => {
+    const artifactDir = await mkdtemp(join(tmpdir(), "review-pi-receipt-"));
+
+    await writeFastLaneArtifacts({
+      artifactDir,
+      runId: "run-1",
+      attemptId: "attempt-1",
+      provider: "grok",
+      model: "grok-4.6",
+      finalText: "",
+      wallSeconds: 7,
+      error: "fast review 503: upstream unavailable",
+    });
+
+    // No answer came back, so no usage was observed: an empty record in the
+    // row would read as a lane that was measured and spent nothing.
+    await expect(readLaneReceipt(artifactDir)).resolves.toMatchObject({
+      usage: null,
+    });
+    await rm(artifactDir, { recursive: true, force: true });
+  });
+
   it("never lets a reader observe a partial receipt", async () => {
     const artifactDir = await mkdtemp(join(tmpdir(), "review-pi-receipt-"));
     const path = join(artifactDir, "local-receipt.json");
