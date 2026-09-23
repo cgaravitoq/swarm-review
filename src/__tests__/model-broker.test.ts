@@ -269,6 +269,29 @@ describe("model broker", () => {
     await rm(unendedScratch, { recursive: true, force: true });
   });
 
+  it("pairs every admission with its own end across the lane's requests", async () => {
+    // Two requests in one lane, sent together. An id that restarts with each
+    // request names both admissions and both ends alike, and no reader can
+    // say which end closed which admission.
+    await Promise.all(
+      [call(), call()].map((pending) =>
+        pending.then((response) => response.text()),
+      ),
+    );
+
+    const entries = (await readFile(ledgerPath, "utf8"))
+      .split("\n")
+      .filter(Boolean)
+      .map((line) => JSON.parse(line) as Record<string, unknown>);
+    const ids = (event: string) =>
+      entries
+        .filter((entry) => entry["event"] === event)
+        .map((entry) => entry["attemptId"])
+        .sort();
+    expect(ids("provider_admitted")).toEqual([1, 2]);
+    expect(ids("provider_request")).toEqual([1, 2]);
+  });
+
   const requestEntry = async () =>
     (await readFile(ledgerPath, "utf8"))
       .split("\n")

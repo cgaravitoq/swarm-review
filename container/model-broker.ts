@@ -211,6 +211,9 @@ export function createBrokerServer(config: BrokerConfig) {
   const caps = config.caps;
   const ledgerPath = config.ledgerPath;
   const totals = { requests: 0, retries: 0, input: 0, output: 0, unended: 0 };
+  // Numbered across the broker's whole run, not per HTTP request: the id is
+  // what pairs an admission with its end, and pi sends many requests a lane.
+  let admitted = 0;
 
   const record = (entry: Record<string, unknown>) => {
     appendFileSync(
@@ -292,7 +295,6 @@ export function createBrokerServer(config: BrokerConfig) {
 
     let attempt = 0;
     let lastError = "";
-    let admitted = 0;
     while (attempt <= caps.maxRetriesPerRequest) {
       // The slot is taken here, synchronously, in the same tick it is tested:
       // the caps bound what is actually sent, not what was intended when the
