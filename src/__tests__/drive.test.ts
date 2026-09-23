@@ -27,7 +27,12 @@ import {
   readLaneReceipt,
   targetProviderEnv,
 } from "../local";
+import { IMAGE_SOURCES } from "../protocol";
 import { SESSION_CAPS } from "../provider-budget";
+
+const expectedSources = Object.fromEntries(
+  Object.keys(IMAGE_SOURCES).map((path) => [path, "b".repeat(64)]),
+);
 
 afterEach(() => {
   vi.unstubAllGlobals();
@@ -1082,6 +1087,7 @@ describe("local driver lifecycle", () => {
       job: {
         runId: "run-1",
         expectedRunnerSha: "b".repeat(64),
+        expectedSources: expectedSources,
         head: { sha: "a".repeat(40) },
         base: { sha: "c".repeat(40) },
         provider: "xai",
@@ -1122,6 +1128,7 @@ describe("local driver lifecycle", () => {
       job: {
         runId: "run-1",
         expectedRunnerSha: "b".repeat(64),
+        expectedSources: expectedSources,
         head: { sha: "a".repeat(40) },
         base: { sha: "c".repeat(40) },
         provider: "cloudflare-workers-ai",

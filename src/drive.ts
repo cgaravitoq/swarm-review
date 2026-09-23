@@ -24,6 +24,7 @@ import {
   parseCandidateIds,
   parseSingleVerdict,
   planBroker,
+  readImageSources,
   resolveRunCredentials,
   targetProviderEnv,
 } from "./local";
@@ -771,6 +772,7 @@ async function main() {
   const job: ReviewJob = {
     runId,
     expectedRunnerSha: createHash("sha256").update(runner).digest("hex"),
+    expectedSources: await readImageSources(join(packageRoot, "container")),
     head,
     base,
     ...(Object.keys(targetEnv).length > 0 ? { targetEnv } : {}),

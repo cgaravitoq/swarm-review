@@ -14,9 +14,13 @@ import {
   targetSendCommand,
   targetSendFileCommand,
 } from "../isolation";
+import { IMAGE_SOURCES } from "../protocol";
 
 const sha40 = "a".repeat(40);
 const sha64 = "b".repeat(64);
+const expectedSources = Object.fromEntries(
+  Object.keys(IMAGE_SOURCES).map((path) => [path, sha64]),
+);
 
 const broker = {
   port: 8317,
@@ -36,6 +40,7 @@ const broker = {
 const job = {
   runId: "run-1",
   expectedRunnerSha: sha64,
+  expectedSources,
   head: { sha: sha40 },
   base: { sha: sha40 },
   provider: "xai",

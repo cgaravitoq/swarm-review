@@ -42,7 +42,16 @@ import {
   RUN_ID_PATTERN,
   TARGET_UID,
 } from "./isolation";
-import { MAX_ARTIFACT_BYTES, REVIEW_RUNNER, type ReviewJob } from "./protocol";
+import {
+  firstSourceMismatch,
+  IMAGE_SOURCES,
+  MAX_ARTIFACT_BYTES,
+  parseSourceFingerprint,
+  REVIEW_RUNNER,
+  type ReviewJob,
+  sourceFingerprintCommand,
+  sourceMismatchDetail,
+} from "./protocol";
 import {
   PROVIDER_UPSTREAM,
   readLedgerUsage,
@@ -265,6 +274,9 @@ export type RunMetadata = {
   revisions: { head: { sha: string }; base: { sha: string } };
   runnerSha: string;
   containerRunnerSha?: string | null;
+  /** What the driver expected of the image's sources and what the container held at start. */
+  expectedSources: Record<string, string>;
+  observedSources: Record<string, string>;
   provider: string;
   credentialIsolation: {
     mode: "brokered";
@@ -329,6 +341,27 @@ export type BridgeResponse = {
   error?: string;
   data?: unknown;
 };
+
+/**
+ * The host's own copy of every file the lane image executes or reads, keyed
+ * by the container path the image runs it from.
+ */
+export async function readImageSources(
+  containerDir: string,
+): Promise<Record<string, string>> {
+  const entries = await Promise.all(
+    Object.entries(IMAGE_SOURCES).map(
+      async ([path, name]) =>
+        [
+          path,
+          createHash("sha256")
+            .update(await readFile(join(containerDir, name)))
+            .digest("hex"),
+        ] as const,
+    ),
+  );
+  return Object.fromEntries(entries);
+}
 
 export async function sendBridgeCommand(
   containerName: string,
@@ -2251,30 +2284,29 @@ async function main() {
         );
       }
 
-      const containerRunnerShaActual = (
-        await docker(
-          [
-            "exec",
-            metadata.containerName,
-            "sh",
-            "-c",
-            `sha256sum ${REVIEW_RUNNER} | cut -d' ' -f1`,
-          ],
-          budget,
-          "runner hash check",
-          controller.signal,
-        )
-      ).trim();
-      const expectedRunnerSha =
-        metadata.containerRunnerSha ?? metadata.runnerSha;
-      if (
-        expectedRunnerSha &&
-        containerRunnerShaActual &&
-        containerRunnerShaActual !== expectedRunnerSha
-      ) {
+      if (!metadata.observedSources) {
         throw new Error(
-          `container runner mismatch: ${containerRunnerShaActual} !== ${expectedRunnerSha}`,
+          `lane metadata for ${metadata.containerName} carries no source fingerprints and cannot be verified for resume`,
         );
+      }
+      const resumeFingerprint = await docker(
+        [
+          "exec",
+          metadata.containerName,
+          "sh",
+          "-c",
+          sourceFingerprintCommand(),
+        ],
+        budget,
+        "source fingerprint check",
+        controller.signal,
+      );
+      const resumeMismatch = firstSourceMismatch(
+        metadata.observedSources,
+        parseSourceFingerprint(resumeFingerprint).sources,
+      );
+      if (resumeMismatch) {
+        throw new Error(sourceMismatchDetail(resumeMismatch));
       }
 
       const containerJobJson = await docker(
@@ -2299,10 +2331,13 @@ async function main() {
       if (
         parsedJob.head.sha !== metadata.revisions.head.sha ||
         parsedJob.base.sha !== metadata.revisions.base.sha ||
-        parsedJob.expectedRunnerSha !== metadata.runnerSha
+        firstSourceMismatch(
+          metadata.expectedSources,
+          parsedJob.expectedSources ?? {},
+        ) !== null
       ) {
         throw new Error(
-          `job revision or runner mismatch in container ${metadata.containerName}`,
+          `job revision or source mismatch in container ${metadata.containerName}`,
         );
       }
 
@@ -2605,10 +2640,8 @@ async function main() {
         options.pullRequest,
         controller.signal,
       );
-      const runner = await readFile(runnerPath, "utf8");
-      const currentRunnerSha = createHash("sha256")
-        .update(runner)
-        .digest("hex");
+      const expectedSources = await readImageSources(dirname(runnerPath));
+      const currentRunnerSha = expectedSources[REVIEW_RUNNER] ?? "";
       runnerSha = currentRunnerSha;
       const prompt = options.briefPath
         ? ""
@@ -2636,6 +2669,7 @@ async function main() {
       } = {
         runId: options.runId,
         expectedRunnerSha: currentRunnerSha,
+        expectedSources,
         head: resolvedRevisions.head,
         base: resolvedRevisions.base,
         gitRemote: `file://${containerRunDir}/origin.git`,
@@ -2820,25 +2854,18 @@ async function main() {
         controller.signal,
       );
 
-      containerRunnerSha = (
-        await docker(
-          [
-            "exec",
-            containerName,
-            "sh",
-            "-c",
-            `sha256sum ${REVIEW_RUNNER} | cut -d' ' -f1`,
-          ],
-          budget,
-          "runner fingerprint",
-          controller.signal,
-        )
-      ).trim();
-      if (containerRunnerSha !== job.expectedRunnerSha) {
-        throw new Error(
-          `runner mismatch: container ${containerRunnerSha}, expected ${runnerSha}`,
-        );
+      const fingerprint = await docker(
+        ["exec", containerName, "sh", "-c", sourceFingerprintCommand()],
+        budget,
+        "source fingerprint",
+        controller.signal,
+      );
+      const observedSources = parseSourceFingerprint(fingerprint).sources;
+      const mismatch = firstSourceMismatch(expectedSources, observedSources);
+      if (mismatch) {
+        throw new Error(sourceMismatchDetail(mismatch));
       }
+      containerRunnerSha = observedSources[REVIEW_RUNNER] ?? null;
 
       const metadata: RunMetadata = {
         runId: options.runId,
@@ -2852,6 +2879,8 @@ async function main() {
         revisions: resolvedRevisions,
         runnerSha: currentRunnerSha,
         containerRunnerSha,
+        expectedSources,
+        observedSources,
         provider: options.provider,
         credentialIsolation: {
           mode: "brokered",

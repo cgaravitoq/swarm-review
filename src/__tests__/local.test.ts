@@ -48,6 +48,7 @@ import {
   targetProviderEnv,
   writeLocalReceipt,
 } from "../local";
+import { IMAGE_SOURCES } from "../protocol";
 import { SESSION_CAPS } from "../provider-budget";
 import { neverReachedModel } from "../swarm";
 
@@ -102,9 +103,14 @@ execFileSync("git", ["-C", repoRoot, "add", "."]);
 commit(repoRoot, "base");
 const localScript = join(packageRoot, "src/local.ts");
 const promptPath = join(packageRoot, "prompts", "review-prompt-local.txt");
-const runnerSha = createHash("sha256")
-  .update(readFileSync(join(packageRoot, "container/review-run.sh")))
-  .digest("hex");
+const imageSources = Object.fromEntries(
+  Object.entries(IMAGE_SOURCES).map(([path, name]) => [
+    path,
+    createHash("sha256")
+      .update(readFileSync(join(packageRoot, "container", name)))
+      .digest("hex"),
+  ]),
+);
 
 const installedOpenaiCodexAdapter = () => {
   const tried: string[] = [];
@@ -312,7 +318,7 @@ if [[ "$joined" == *" mkdir -p "* || "$joined" == *" chmod "* || "$joined" == *"
   exit 0
 fi
 if [[ "$joined" == *" sha256sum "* ]]; then
-  echo "\${FAKE_RUNNER_SHA:?}"
+  jq -r 'to_entries[] | "\\(.value)  \\(.key)"' <<< "\${FAKE_IMAGE_SOURCES:?}"
   exit 0
 fi
 if [[ "$joined" == *" --detach "* ]]; then
@@ -1373,7 +1379,7 @@ describe("public local CLI lifecycle", {
     FAKE_CONTAINER_ROOT: arranged.container,
     FAKE_RUN_ID: runId,
     FAKE_MODE: mode,
-    FAKE_RUNNER_SHA: runnerSha,
+    FAKE_IMAGE_SOURCES: JSON.stringify(imageSources),
     FAKE_HEAD_SHA: revision("%H"),
     FAKE_BASE_SHA: revision("%H"),
     WORKERS_AI_API_KEY: "public-cli-secret",
@@ -1836,6 +1842,37 @@ describe("public local CLI lifecycle", {
     );
     expect(receipt).not.toContain('"outcome": "cancelled"');
     expect(receipt).not.toContain("interrupted");
+  });
+
+  it("refuses an image whose broker copy differs before the review ever starts", async () => {
+    const root = await mkdtemp(join(tmpdir(), "review-pi-cli-"));
+    temporaryDirectories.push(root);
+    const arranged = await arrangeFakeDocker(root);
+    const runId = "stale-broker-image";
+    const out = join(root, "out");
+
+    const result = await runLocalCli(localArguments(out, runId), {
+      ...fakeEnvironment(arranged, runId, "success"),
+      FAKE_IMAGE_SOURCES: JSON.stringify({
+        ...imageSources,
+        "/opt/review/model-broker.ts": "c".repeat(64),
+      }),
+    });
+
+    expect(result.code, result.output).toBe(1);
+    const receipt = JSON.parse(
+      await readFile(join(out, runId, "local-receipt.json"), "utf8"),
+    ) as Record<string, unknown>;
+    expect(receipt["outcome"]).toBe("failed");
+    expect(receipt["error"]).toMatch(
+      /^image source \/opt\/review\/model-broker\.ts differs/,
+    );
+    // Refused before any model request: the review process was never started.
+    const dockerLog = await readFile(
+      join(arranged.state, "docker.log"),
+      "utf8",
+    );
+    expect(dockerLog).not.toMatch(/--detach.*review-run\.sh/);
   });
 
   it("keeps waiting when the bridge is briefly unreachable but the run is alive", async () => {
