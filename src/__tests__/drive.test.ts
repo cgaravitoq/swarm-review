@@ -12,6 +12,7 @@ import {
   FINALIZE_REPORT_MARGIN_MS,
   FINALIZE_REQUEST_RESERVE,
   type LaneBrief,
+  observedControl,
   observedIsolation,
   observedModelRequests,
   observedModelUsage,
@@ -189,6 +190,44 @@ describe("local driver lifecycle", () => {
     expect(observedModelUsage(state({ totals: {} }))).toBeNull();
     expect(observedModelUsage(state({}))).toBeNull();
     expect(observedModelUsage(undefined)).toBeNull();
+  });
+
+  it("hands a row the Worker session's usage through the cloud receipt", async () => {
+    const totals = {
+      requests: 2,
+      retries: 0,
+      input: null,
+      output: null,
+      unended: 1,
+    };
+    const directory = await mkdtemp(join(tmpdir(), "review-pi-receipt-"));
+    await writeCloudReceipt(directory, {
+      runId: "run",
+      provider: "openai-codex",
+      model: "gpt-5.4",
+      wallSeconds: 12,
+      ...observedControl(undefined, {
+        runId: "run",
+        observedAt: "2026-09-10T00:00:00.000Z",
+        placementId: null,
+        control: { modelUsage: { totals } },
+        artifacts: [],
+      }),
+    });
+
+    // The receipt is the only way the session's count reaches the row, so it
+    // is read back through the reader the row uses, not off the helper.
+    await expect(readLaneReceipt(directory)).resolves.toMatchObject({
+      modelRequests: 2,
+      usage: {
+        requests: 2,
+        retries: 0,
+        inputTokens: null,
+        outputTokens: null,
+        unended: 1,
+      },
+    });
+    await rm(directory, { recursive: true, force: true });
   });
 
   it("carries the escape the control plane reported into the lane receipt", async () => {
