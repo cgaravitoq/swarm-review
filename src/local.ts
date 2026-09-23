@@ -1581,14 +1581,16 @@ export async function readLaneReceipt(directory: string) {
     provider: stringAt(receipt, "provider", "receipt.json"),
     model: stringAt(receipt, "model", "receipt.json"),
     wallSeconds: numberAt(receipt, "wallSeconds", "receipt.json"),
-    teardownSeconds: 0,
+    // The cloud driver times no teardown and lists no truncated artifact, and
+    // a zero or an empty list here would be a measurement nobody took.
+    teardownSeconds: null,
     // The Worker's session totals, which is the only side that held the
     // credential. A lane whose session was never observed spent nothing the
     // host can price, which is unobserved and not zero.
     usage: numberRecord(receipt, "usage"),
     installSkipped: install?.skipped ?? null,
     installSkipReason: install?.reason ?? null,
-    truncatedArtifacts: [],
+    truncatedArtifacts: null,
     modelRequests: optionalNumber(receipt, "modelRequests"),
     isolation: readIsolationEvidence(receipt),
     error: runError,

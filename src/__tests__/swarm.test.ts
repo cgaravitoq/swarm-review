@@ -4283,6 +4283,50 @@ await writeFile(
       expect(pool.map((lane) => lane["usage"])).toEqual([usage]);
     }, 180_000);
 
+    it("records a cloud lane's teardown and truncation as unobserved in its row", async () => {
+      const arranged = await arrange("success");
+      const swarmId = "swarm-pool-teardown";
+      const provider = await fakeProvider((_prompt, path) =>
+        path.startsWith("/repos/")
+          ? pullAnswer(arranged)
+          : completion(answer([finding({ file: "changed-a.ts", line: 1 })])),
+      );
+      await pointUpstream(arranged, {
+        "https://api.x.ai/v1": provider.baseUrl,
+      });
+      await pointGitHub(arranged, provider.baseUrl);
+      await writeFile(
+        join(arranged.repo, "agents/review-pi/src/drive.ts"),
+        fakeDriver,
+      );
+
+      const result = await runSwarm(
+        packedArguments(arranged, swarmId, [
+          "--fast",
+          "--pr",
+          "6567",
+          "--worker",
+          "https://review.invalid",
+        ]),
+        arranged,
+        { ...arranged.env, GITHUB_TOKEN: "test-token" },
+      );
+      const receipt = await readReceipt(arranged.out, swarmId);
+      const pool = laneRows(receipt).filter(
+        (lane) => lane["role"] === "verifier" && lane["claimedFile"],
+      );
+
+      expect(result.code, result.output).toBe(0);
+      // The cloud driver's receipt times no teardown and lists no truncation,
+      // so a zero or an empty list there is a measurement nobody took.
+      expect(pool).toEqual([
+        expect.objectContaining({
+          teardownSeconds: null,
+          truncatedArtifacts: null,
+        }),
+      ]);
+    }, 180_000);
+
     it("keeps only a verbatim declared intent on a pool lane's findings", async () => {
       const arranged = await arrange("success");
       const swarmId = "swarm-pool-declared";
