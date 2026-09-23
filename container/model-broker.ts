@@ -32,6 +32,15 @@ export type BrokerTotals = {
   retries: number;
   input: number;
   output: number;
+  /**
+   * Attempts admitted whose end this broker has not seen.
+   *
+   * The slot is spent the moment the attempt is reserved, so an attempt that
+   * never ends - an upgrade this HTTP-only hop cannot complete, a provider that
+   * accepts and never answers - is counted here and nowhere else. A reader that
+   * only saw the settled lines would read a request no record names.
+   */
+  unended: number;
 };
 
 export type BrokerConfig = {
@@ -74,6 +83,7 @@ export function reserveAttempt(
   const violation = capViolation(totals, caps);
   if (violation) return violation;
   totals.requests += 1;
+  totals.unended += 1;
   if (isRetry) totals.retries += 1;
   return null;
 }
@@ -200,7 +210,7 @@ const readBody = (stream: IncomingMessage) =>
 export function createBrokerServer(config: BrokerConfig) {
   const caps = config.caps;
   const ledgerPath = config.ledgerPath;
-  const totals = { requests: 0, retries: 0, input: 0, output: 0 };
+  const totals = { requests: 0, retries: 0, input: 0, output: 0, unended: 0 };
 
   const record = (entry: Record<string, unknown>) => {
     appendFileSync(
@@ -282,6 +292,7 @@ export function createBrokerServer(config: BrokerConfig) {
 
     let attempt = 0;
     let lastError = "";
+    let admitted = 0;
     while (attempt <= caps.maxRetriesPerRequest) {
       // The slot is taken here, synchronously, in the same tick it is tested:
       // the caps bound what is actually sent, not what was intended when the
@@ -291,6 +302,22 @@ export function createBrokerServer(config: BrokerConfig) {
         deny(res, 429, refusal);
         return;
       }
+      // The admission is written before the attempt is sent, so the ledger
+      // names every request the caps counted. What follows the admission is
+      // this attempt's outcome, and one that never arrives leaves the request
+      // recorded as admitted and unended rather than as nothing at all.
+      admitted += 1;
+      const attemptId = admitted;
+      record({
+        event: "provider_admitted",
+        attemptId,
+        attempt,
+        path: target.pathname,
+        totals: { ...totals },
+      });
+      const ended = () => {
+        totals.unended -= 1;
+      };
       try {
         const upstream = await fetch(target, {
           method: req.method ?? "POST",
@@ -305,7 +332,14 @@ export function createBrokerServer(config: BrokerConfig) {
         if (upstream.status >= 500 && attempt < caps.maxRetriesPerRequest) {
           attempt += 1;
           lastError = `upstream ${upstream.status}`;
-          record({ event: "provider_retry", status: upstream.status, attempt });
+          ended();
+          record({
+            event: "provider_retry",
+            attemptId,
+            status: upstream.status,
+            attempt,
+            totals: { ...totals },
+          });
           continue;
         }
         for (const [name, value] of upstream.headers) {
@@ -335,8 +369,10 @@ export function createBrokerServer(config: BrokerConfig) {
           totals.input += usage.input;
           totals.output += usage.output;
         }
+        ended();
         record({
           event: "provider_request",
+          attemptId,
           status: upstream.status,
           attempt,
           path: target.pathname,
@@ -347,7 +383,14 @@ export function createBrokerServer(config: BrokerConfig) {
         return;
       } catch (error) {
         lastError = error instanceof Error ? error.message : String(error);
-        record({ event: "provider_error", attempt, message: lastError });
+        ended();
+        record({
+          event: "provider_error",
+          attemptId,
+          attempt,
+          message: lastError,
+          totals: { ...totals },
+        });
         attempt += 1;
       }
     }

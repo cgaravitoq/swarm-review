@@ -4,7 +4,7 @@ import { createServer, type IncomingMessage, type Server } from "node:http";
 import { connect } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
   createBrokerServer,
   readUsage,
@@ -190,7 +190,83 @@ describe("model broker", () => {
       retries: 0,
       input: 1200,
       output: 300,
+      unended: 0,
     });
+  });
+
+  it("records a request it admitted and never saw end", async () => {
+    // A provider that accepts the attempt and never answers: this is the shape
+    // the Codex provider's WebSocket transport takes through this hop. The
+    // handshake reaches a broker that speaks HTTP only, the slot is spent, and
+    // the upstream never completes an upgrade the broker cannot make. The
+    // ledger has to name the request even though no response ever closes it.
+    const silent = createServer(() => {});
+    const silentPort = await listen(silent);
+    const unendedScratch = await mkdtemp(join(tmpdir(), "broker-unended-"));
+    const unendedLedger = join(unendedScratch, "provider-usage.jsonl");
+    const { server } = createBrokerServer({
+      port: 0,
+      handle: "h",
+      upstreamBaseUrl: `http://127.0.0.1:${silentPort}/v1`,
+      upstreamAuthorization: `Bearer ${CANARY}`,
+      caps: {
+        maxRequests: 5,
+        maxRetriesPerRequest: 1,
+        maxCumulativeInputTokens: 1000,
+        maxCumulativeOutputTokens: 1000,
+        maxRequestBytes: 4096,
+      },
+      ledgerPath: unendedLedger,
+    });
+    const port = await listen(server);
+    const controller = new AbortController();
+
+    const pending = fetch(`http://127.0.0.1:${port}/codex/responses`, {
+      method: "POST",
+      headers: {
+        authorization: "Bearer h",
+        "content-type": "application/json",
+      },
+      body: "{}",
+      signal: controller.signal,
+    }).catch(() => undefined);
+
+    const ledgerEntries = async () =>
+      (await readFile(unendedLedger, "utf8"))
+        .split("\n")
+        .filter(Boolean)
+        .map((line) => JSON.parse(line) as Record<string, unknown>);
+    // The admission is written before the attempt is sent, so the request is
+    // named while the response it waits for is still open.
+    await vi.waitFor(async () => {
+      expect(
+        (await ledgerEntries()).some(
+          (entry) => entry["event"] === "provider_admitted",
+        ),
+      ).toBe(true);
+    });
+
+    const entries = await ledgerEntries();
+    const admitted = entries.filter(
+      (entry) => entry["event"] === "provider_admitted",
+    );
+    expect(admitted).toHaveLength(1);
+    // Nothing about this attempt ever ended, so nothing may read as an outcome.
+    expect(entries.some((entry) => entry["event"] === "provider_request")).toBe(
+      false,
+    );
+    expect(admitted[0]?.["totals"]).toMatchObject({
+      requests: 1,
+      retries: 0,
+      unended: 1,
+    });
+
+    controller.abort();
+    await pending;
+    await close(server);
+    silent.closeAllConnections();
+    await close(silent);
+    await rm(unendedScratch, { recursive: true, force: true });
   });
 
   const requestEntry = async () =>
@@ -566,12 +642,24 @@ describe("attempt reservation", () => {
   };
 
   it("spends the slot in the same tick it tests it", () => {
-    const totals = { requests: 0, retries: 0, input: 0, output: 0 };
+    const totals = {
+      requests: 0,
+      retries: 0,
+      input: 0,
+      output: 0,
+      unended: 0,
+    };
 
     expect(reserveAttempt(totals, caps, false)).toBeNull();
     expect(totals.requests).toBe(1);
     expect(reserveAttempt(totals, caps, true)).toBeNull();
-    expect(totals).toEqual({ requests: 2, retries: 1, input: 0, output: 0 });
+    expect(totals).toEqual({
+      requests: 2,
+      retries: 1,
+      input: 0,
+      output: 0,
+      unended: 2,
+    });
     // The third attempt is refused instead of being counted after the fact.
     expect(reserveAttempt(totals, caps, false)).toBe("max_requests");
     expect(totals.requests).toBe(2);
@@ -580,14 +668,14 @@ describe("attempt reservation", () => {
   it("refuses once the cumulative token totals are already spent", () => {
     expect(
       reserveAttempt(
-        { requests: 0, retries: 0, input: 100, output: 0 },
+        { requests: 0, retries: 0, input: 100, output: 0, unended: 0 },
         caps,
         false,
       ),
     ).toBe("max_input_tokens");
     expect(
       reserveAttempt(
-        { requests: 0, retries: 0, input: 0, output: 100 },
+        { requests: 0, retries: 0, input: 0, output: 100, unended: 0 },
         caps,
         false,
       ),

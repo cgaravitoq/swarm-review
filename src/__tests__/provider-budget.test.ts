@@ -169,7 +169,7 @@ describe("actual usage accounting", () => {
       event: "provider_request",
       status: 200,
       usage: { input: 2000, output: 300 },
-      totals: { requests: 3, retries: 1, input: 3000, output: 400 },
+      totals: { requests: 3, retries: 1, input: 3000, output: 400, unended: 1 },
     }),
     JSON.stringify({ event: "denied", reason: "max_requests" }),
   ].join("\n");
@@ -181,6 +181,10 @@ describe("actual usage accounting", () => {
       inputTokens: 3000,
       outputTokens: 400,
       denials: 1,
+      // Three slots were spent and the ledger's last totals say one of them was
+      // never seen to end: the tokens beside it are one request short, and the
+      // row has to say so rather than price a request it never read.
+      unended: 1,
     });
   });
 

@@ -250,7 +250,13 @@ export type LedgerEntry = {
   event: string;
   status?: number;
   usage?: { input: number; output: number } | null;
-  totals?: { requests: number; retries: number; input: number; output: number };
+  totals?: {
+    requests: number;
+    retries: number;
+    input: number;
+    output: number;
+    unended?: number;
+  };
 };
 
 /** Actual provider activity as the broker recorded it, never as Pi reported it. */
@@ -268,6 +274,10 @@ export function readLedgerUsage(ledger: string) {
     inputTokens: last?.totals?.input ?? 0,
     outputTokens: last?.totals?.output ?? 0,
     denials: entries.filter((entry) => entry.event === "denied").length,
+    // A request the broker admitted and never saw end: its slot is counted and
+    // its usage was never observed, so the count is the only field that can
+    // say the row's totals are missing one request's worth of tokens.
+    unended: last?.totals?.unended ?? 0,
   };
 }
 
