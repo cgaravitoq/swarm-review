@@ -26,6 +26,15 @@ export type ModelTotals = {
   retries: number;
   input: number | null;
   output: number | null;
+  /**
+   * Attempts admitted whose end this session has not seen.
+   *
+   * `recordAttempt` runs at the stream's flush, so a client that walks away
+   * from a response leaves its slot spent and its end unobserved. The count is
+   * the control side's own statement of that, and the totals a row reads from
+   * it carry one request's tokens less than the requests it names.
+   */
+  unended: number;
 };
 
 export type ModelSession = {
@@ -94,6 +103,7 @@ export const emptyModelTotals = (): ModelTotals => ({
   retries: 0,
   input: null,
   output: null,
+  unended: 0,
 });
 
 export function publicModelUsage(session: ModelSession | undefined) {
@@ -127,6 +137,7 @@ export function reserveAttempt(
   const violation = capViolation(totals, caps);
   if (violation) return violation;
   totals.requests += 1;
+  totals.unended += 1;
   if (isRetry) totals.retries += 1;
   return null;
 }

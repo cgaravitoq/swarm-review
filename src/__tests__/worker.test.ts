@@ -752,8 +752,36 @@ describe("cloud model session accounting", () => {
 
     expect(upstream).toHaveBeenCalledTimes(2);
     expect(await sandbox.modelUsage()).toMatchObject({
-      totals: { requests: 2, retries: 1, input: 3, output: 1 },
+      totals: { requests: 2, retries: 1, input: 3, output: 1, unended: 0 },
     });
+  });
+
+  it("keeps an attempt unended when the client walks away before the stream closes", async () => {
+    const sandbox = await runningSandbox();
+    getSandbox.mockReturnValue(sandbox);
+    // A provider that opens a body and never closes it: the flush that records
+    // the attempt never runs, so the slot is spent with no end observed.
+    vi.stubGlobal(
+      "fetch",
+      vi.fn<typeof fetch>(() =>
+        Promise.resolve(
+          new Response(new ReadableStream({ start() {} }), {
+            status: 200,
+            headers: { "content-type": "text/event-stream" },
+          }),
+        ),
+      ),
+    );
+
+    const response = await postModel("abandoned-run");
+    await response.body?.cancel();
+
+    // The request is counted and the record says it never ended, so a row that
+    // reads these totals cannot read its tokens as an observed zero.
+    expect(await sandbox.modelUsage()).toMatchObject({
+      totals: { requests: 1, unended: 1 },
+    });
+    expect(await sandbox.modelSeals()).toEqual([]);
   });
 
   it("charges nothing for a body it refuses as over the byte cap", async () => {
