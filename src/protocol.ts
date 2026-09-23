@@ -3,9 +3,12 @@ const RUN_ROOT = "/workspace/runs";
 export const REVIEW_RUNNER = "/opt/review/review-run.sh";
 
 /**
- * Every file the image copies out of `container/` and the lane executes or
- * reads: container path to build-context name. The freshness gate compares
- * exactly this set, so a new COPY in the Dockerfile belongs here first.
+ * Every file in `container/` the image is built from: container path to
+ * build-context name. The Dockerfile is one of them, because it pins what the
+ * image installs - pi, bun, the Claude Code extension, the base - and no other
+ * source records that. The freshness gate compares exactly this set, so a new
+ * file in `container/` belongs here first; only the generated `context/` is
+ * not a source.
  */
 export const IMAGE_SOURCES = {
   [REVIEW_RUNNER]: "review-run.sh",
@@ -13,6 +16,7 @@ export const IMAGE_SOURCES = {
   "/opt/review/response-seal.ts": "response-seal.ts",
   "/opt/review/extensions/claude-code-provider.js": "claude-code-provider.js",
   "/opt/review/pi-config/models.json": "models.json",
+  "/opt/review/Dockerfile": "Dockerfile",
 } satisfies Readonly<Record<string, string>>;
 
 const SHA_64 = /^[0-9a-f]{64}$/;
@@ -117,7 +121,7 @@ export type ReviewJob = {
   runId: string;
   /** sha256 of the runner the driver built this job for; a rollout mismatch must fail loudly. */
   expectedRunnerSha: string;
-  /** sha256 of every file the image executes or reads, keyed by container path; the freshness gate refuses a differing one by name before the first model request. */
+  /** sha256 of every source the image is built from, keyed by container path; the freshness gate refuses a differing one by name before the first model request. */
   expectedSources: Readonly<Record<string, string>>;
   head: { sha: string };
   base: { sha: string };

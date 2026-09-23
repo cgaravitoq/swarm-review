@@ -740,6 +740,7 @@ describe("deployed container image", () => {
       ["review-run.sh", REVIEW_RUNNER],
       ["model-broker.ts", MODEL_BROKER],
       ["response-seal.ts", "/opt/review/response-seal.ts"],
+      ["Dockerfile", "/opt/review/Dockerfile"],
     ]);
   });
 
