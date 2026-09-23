@@ -1259,6 +1259,9 @@ process.stdin.on("data", (chunk) => {
             { type: "message_start" },
             { type: "message_update" },
             { type: "bash_execution_update", id: "req-1", delta: "total 0" },
+            { type: "auto_retry_start", attempt: 1, maxAttempts: 3, delayMs: 0, errorMessage: "429 rate_limit_error" },
+            { type: "auto_retry_end", success: true, attempt: 1 },
+            { type: "extension_error", extensionPath: "/opt/review/extensions/claude-code-provider.js", event: "tool_call", error: "401 unauthorized" },
             { type: "message_end" },
             {
               type: "turn_end",
@@ -1274,9 +1277,6 @@ process.stdin.on("data", (chunk) => {
             { type: "summarization_retry_attempt_start", source: "compaction", reason: "threshold" },
             { type: "summarization_retry_finished" },
             { type: "compaction_end", reason: "threshold", result: null, aborted: false, willRetry: false },
-            { type: "auto_retry_start", attempt: 1, maxAttempts: 3, delayMs: 0, errorMessage: "529 overloaded_error: Overloaded" },
-            { type: "auto_retry_end", success: true, attempt: 1 },
-            { type: "extension_error", extensionPath: "/opt/review/extensions/claude-code-provider.js", event: "tool_call", error: "extension threw" },
           ]) {
             process.stdout.write(JSON.stringify(event) + "\\n");
           }
@@ -2059,10 +2059,13 @@ process.stdin.on("data", (chunk) => {
       const statusPath = join(root, "status.json");
       // The table in pi 0.85.1's own docs/rpc.md: a retry, a compaction and an
       // extension error are what a healthy lane can see, not a broken stream.
+      // The retry and the extension error name a 429 and a 401 before the
+      // turn ends, so a runner that read their text into the stderr it
+      // classifies a turn by would block this lane instead of idling it.
       const unsettled = await waitForStatus(
         statusPath,
         (s) =>
-          s["lastEvent"] === "extension_error" &&
+          s["lastEvent"] === "compaction_end" &&
           s["lastCandidateResult"] === "DOCUMENTED_FINAL",
       );
       expect(unsettled["detail"]).toBe("");
