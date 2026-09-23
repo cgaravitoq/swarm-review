@@ -276,8 +276,10 @@ export function readLedgerUsage(ledger: string) {
     denials: entries.filter((entry) => entry.event === "denied").length,
     // A request the broker admitted and never saw end: its slot is counted and
     // its usage was never observed, so the count is the only field that can
-    // say the row's totals are missing one request's worth of tokens.
-    unended: last?.totals?.unended ?? 0,
+    // say the row's totals are missing one request's worth of tokens. Every
+    // admission writes totals, so a ledger without them admitted nothing, and
+    // totals from a broker that predates the count never observed it.
+    unended: last === undefined ? 0 : (last.totals?.unended ?? null),
   };
 }
 

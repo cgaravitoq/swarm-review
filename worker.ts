@@ -81,7 +81,7 @@ export class ReviewSandbox extends Sandbox<ReviewPiEnv> {
         session.totals.output = (session.totals.output ?? 0) + usage.output;
       }
     }
-    session.totals.unended -= 1;
+    if (session.totals.unended !== undefined) session.totals.unended -= 1;
     session.retryPending = retryable;
     await this.ctx.storage.put(MODEL_SESSION_KEY, session);
     await this.ctx.storage.put(MODEL_SEALS_KEY, [

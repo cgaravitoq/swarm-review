@@ -188,6 +188,23 @@ describe("actual usage accounting", () => {
     });
   });
 
+  it("reads an unended count the ledger never carried as unobserved", () => {
+    // A broker built before the count existed wrote totals without it.
+    const before = [
+      JSON.stringify({ event: "broker_start" }),
+      JSON.stringify({
+        event: "provider_request",
+        totals: { requests: 2, retries: 0, input: 10, output: 4 },
+      }),
+    ].join("\n");
+    expect(readLedgerUsage(before).unended).toBeNull();
+    // A broker that admitted nothing wrote no totals, and no admission is
+    // exactly what it observed.
+    expect(
+      readLedgerUsage(JSON.stringify({ event: "broker_start" })),
+    ).toMatchObject({ requests: 0, unended: 0 });
+  });
+
   it("keeps the reservation beside the settled actual cost", () => {
     const reserved = reserveTrial({
       trialId: "trial-5",

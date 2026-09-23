@@ -33,8 +33,12 @@ export type ModelTotals = {
    * from a response leaves its slot spent and its end unobserved. The count is
    * the control side's own statement of that, and the totals a row reads from
    * it carry one request's tokens less than the requests it names.
+   *
+   * Absent on a session a Worker stored before the count existed: Durable
+   * Object storage outlives a redeploy, and admissions nobody counted cannot
+   * be counted down.
    */
-  unended: number;
+  unended?: number;
 };
 
 export type ModelSession = {
@@ -137,7 +141,7 @@ export function reserveAttempt(
   const violation = capViolation(totals, caps);
   if (violation) return violation;
   totals.requests += 1;
-  totals.unended += 1;
+  if (totals.unended !== undefined) totals.unended += 1;
   if (isRetry) totals.retries += 1;
   return null;
 }

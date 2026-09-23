@@ -784,6 +784,40 @@ describe("cloud model session accounting", () => {
     expect(await sandbox.modelSeals()).toEqual([]);
   });
 
+  it("leaves unended unobserved on a session stored before it was counted", async () => {
+    const sandbox = new ReviewSandbox({} as never, env as never);
+    Object.assign(sandbox, { ctx: { storage: storage() } });
+    // Durable Object storage outlives a redeploy, so a session an older Worker
+    // opened reaches this one without the count.
+    await sandbox.putModelSession({
+      handle: broker.handle,
+      upstreamBaseUrl: broker.upstreamBaseUrl,
+      upstreamAuthorization: broker.upstreamAuthorization,
+      caps: broker.caps,
+      totals: { requests: 1, retries: 0, input: 5, output: 1 },
+    });
+    getSandbox.mockReturnValue(sandbox);
+    vi.stubGlobal(
+      "fetch",
+      vi.fn<typeof fetch>(() =>
+        Promise.resolve(
+          new Response(
+            'data: {"usage":{"prompt_tokens":3,"completion_tokens":1}}',
+          ),
+        ),
+      ),
+    );
+
+    await (await postModel("stored-before-run")).text();
+
+    expect((await sandbox.modelUsage())?.totals).toEqual({
+      requests: 2,
+      retries: 0,
+      input: 8,
+      output: 2,
+    });
+  });
+
   it("charges nothing for a body it refuses as over the byte cap", async () => {
     const sandbox = await runningSandbox();
     getSandbox.mockReturnValue(sandbox);

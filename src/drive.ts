@@ -280,10 +280,10 @@ export const observedModelUsage = (state: RunState | undefined) => {
     typeof value === "number" ? value : null;
   return {
     requests,
-    retries: numberOrNull(totals["retries"]) ?? 0,
+    retries: numberOrNull(totals["retries"]),
     inputTokens: numberOrNull(totals["input"]),
     outputTokens: numberOrNull(totals["output"]),
-    unended: numberOrNull(totals["unended"]) ?? 0,
+    unended: numberOrNull(totals["unended"]),
   };
 };
 

@@ -171,7 +171,20 @@ describe("local driver lifecycle", () => {
       retries: 0,
       inputTokens: null,
       outputTokens: null,
-      unended: 0,
+      unended: null,
+    });
+    // A Worker deployed before a count existed never reports it, and a count
+    // nobody reported is unobserved, not a zero that reads as measured.
+    expect(
+      observedModelUsage(
+        state({ totals: { requests: 3, input: 40, output: 8 } }),
+      ),
+    ).toEqual({
+      requests: 3,
+      retries: null,
+      inputTokens: 40,
+      outputTokens: 8,
+      unended: null,
     });
     expect(observedModelUsage(state({ totals: {} }))).toBeNull();
     expect(observedModelUsage(state({}))).toBeNull();
