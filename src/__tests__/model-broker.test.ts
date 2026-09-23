@@ -1,6 +1,11 @@
 import { createHash } from "node:crypto";
-import { mkdtemp, readFile, rm } from "node:fs/promises";
-import { createServer, type IncomingMessage, type Server } from "node:http";
+import { mkdir, mkdtemp, readFile, rm } from "node:fs/promises";
+import {
+  createServer,
+  type IncomingMessage,
+  type Server,
+  type ServerResponse,
+} from "node:http";
 import { connect } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -290,6 +295,64 @@ describe("model broker", () => {
         .sort();
     expect(ids("provider_admitted")).toEqual([1, 2]);
     expect(ids("provider_request")).toEqual([1, 2]);
+  });
+
+  it("ends an attempt once when the line recording its end cannot be written", async () => {
+    const endScratch = await mkdtemp(join(tmpdir(), "broker-ledger-"));
+    const ledger = join(endScratch, "provider-usage.jsonl");
+    let sent = 0;
+    // The ledger turns into a directory while the attempt is in flight, so the
+    // append that records this attempt's end throws after the answer is out.
+    const provider = createServer(async (_request, response) => {
+      sent += 1;
+      await rm(ledger);
+      await mkdir(ledger);
+      response
+        .writeHead(200, { "content-type": "application/json" })
+        .end(upstreamBody);
+    });
+    const providerPort = await listen(provider);
+    const { server, totals } = createBrokerServer({
+      port: 0,
+      handle: "h",
+      upstreamBaseUrl: `http://127.0.0.1:${providerPort}/v1`,
+      upstreamAuthorization: `Bearer ${CANARY}`,
+      caps,
+      ledgerPath: ledger,
+    });
+    const [handle] = server.listeners("request") as ((
+      request: IncomingMessage,
+      response: ServerResponse,
+    ) => Promise<void>)[];
+    const failures: unknown[] = [];
+    server.removeAllListeners("request");
+    server.on("request", (request, response) => {
+      handle?.(request, response).catch((error: unknown) => {
+        failures.push(error);
+      });
+    });
+    const port = await listen(server);
+
+    const response = await fetch(`http://127.0.0.1:${port}/messages`, {
+      method: "POST",
+      headers: { authorization: "Bearer h" },
+      body: "{}",
+    });
+    const text = await response.text();
+    await vi.waitFor(() => {
+      expect(failures).toHaveLength(1);
+    });
+    await close(server);
+    await close(provider);
+    await rm(endScratch, { recursive: true, force: true });
+
+    expect(response.status).toBe(200);
+    expect(text).toBe(upstreamBody);
+    expect(failures).toEqual([expect.objectContaining({ code: "EISDIR" })]);
+    // The append is all that failed: the attempt ended once, and the answer
+    // the lane already holds is never asked for a second time.
+    expect(totals).toMatchObject({ requests: 1, unended: 0 });
+    expect(sent).toBe(1);
   });
 
   const requestEntry = async () =>

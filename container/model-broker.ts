@@ -199,6 +199,19 @@ export const readUsage = (
   return seen ? totals : null;
 };
 
+/** The ledger line that ends one admitted attempt, before its id and totals. */
+type AttemptEnd =
+  | { event: "provider_retry"; status: number; attempt: number }
+  | {
+      event: "provider_request";
+      status: number;
+      attempt: number;
+      path: string;
+      usage: ReturnType<typeof readUsage>;
+      seal: string | null;
+    }
+  | { event: "provider_error"; attempt: number; message: string };
+
 const readBody = (stream: IncomingMessage) =>
   new Promise<Buffer>((resolve, reject) => {
     const chunks: Buffer[] = [];
@@ -317,9 +330,10 @@ export function createBrokerServer(config: BrokerConfig) {
         path: target.pathname,
         totals: { ...totals },
       });
-      const ended = () => {
-        totals.unended -= 1;
-      };
+      // What the attempt came to is recorded once, after the try: a ledger
+      // write that throws there cannot end the attempt a second time, or send
+      // a request the lane already holds the answer to again.
+      let outcome: AttemptEnd;
       try {
         const upstream = await fetch(target, {
           method: req.method ?? "POST",
@@ -332,69 +346,58 @@ export function createBrokerServer(config: BrokerConfig) {
             : { body, duplex: "half" }),
         });
         if (upstream.status >= 500 && attempt < caps.maxRetriesPerRequest) {
-          attempt += 1;
           lastError = `upstream ${upstream.status}`;
-          ended();
-          record({
+          outcome = {
             event: "provider_retry",
-            attemptId,
+            status: upstream.status,
+            attempt: attempt + 1,
+          };
+        } else {
+          for (const [name, value] of upstream.headers) {
+            if (name !== "content-encoding" && name !== "content-length") {
+              res.setHeader(name, value);
+            }
+          }
+          res.writeHead(upstream.status);
+          // Pi streams, so the answer is forwarded chunk by chunk. Buffering
+          // the whole body here would turn a streamed review into one long
+          // silence and break the activity the run is watched through. The
+          // sealer hashes the answer as it passes and keeps only the tail the
+          // usage frame is in.
+          const decoder = new TextDecoder();
+          const sealer = responseSealer({
+            lineChars: CONTAINER_SSE_LINE_CHARS,
+          });
+          if (upstream.body) {
+            for await (const chunk of upstream.body) {
+              sealer.write(decoder.decode(chunk, { stream: true }));
+              res.write(Buffer.from(chunk));
+            }
+            sealer.write(decoder.decode());
+          }
+          res.end();
+          const usage = readUsage(sealer.tail());
+          if (usage) {
+            totals.input += usage.input;
+            totals.output += usage.output;
+          }
+          outcome = {
+            event: "provider_request",
             status: upstream.status,
             attempt,
-            totals: { ...totals },
-          });
-          continue;
+            path: target.pathname,
+            usage,
+            seal: upstream.body ? sealer.seal() : null,
+          };
         }
-        for (const [name, value] of upstream.headers) {
-          if (name !== "content-encoding" && name !== "content-length") {
-            res.setHeader(name, value);
-          }
-        }
-        res.writeHead(upstream.status);
-        // Pi streams, so the answer is forwarded chunk by chunk. Buffering the
-        // whole body here would turn a streamed review into one long silence
-        // and break the activity the run is watched through. The sealer hashes
-        // the answer as it passes and keeps only the tail the usage frame is in.
-        const decoder = new TextDecoder();
-        const sealer = responseSealer({
-          lineChars: CONTAINER_SSE_LINE_CHARS,
-        });
-        if (upstream.body) {
-          for await (const chunk of upstream.body) {
-            sealer.write(decoder.decode(chunk, { stream: true }));
-            res.write(Buffer.from(chunk));
-          }
-          sealer.write(decoder.decode());
-        }
-        res.end();
-        const usage = readUsage(sealer.tail());
-        if (usage) {
-          totals.input += usage.input;
-          totals.output += usage.output;
-        }
-        ended();
-        record({
-          event: "provider_request",
-          attemptId,
-          status: upstream.status,
-          attempt,
-          path: target.pathname,
-          usage,
-          seal: upstream.body ? sealer.seal() : null,
-          totals: { ...totals },
-        });
-        return;
       } catch (error) {
         lastError = error instanceof Error ? error.message : String(error);
-        ended();
-        record({
-          event: "provider_error",
-          attemptId,
-          attempt,
-          message: lastError,
-          totals: { ...totals },
-        });
-        attempt += 1;
+        outcome = { event: "provider_error", attempt, message: lastError };
       }
+      totals.unended -= 1;
+      record({ ...outcome, attemptId, totals: { ...totals } });
+      if (outcome.event === "provider_request") return;
+      attempt += 1;
     }
     deny(res, 502, `upstream_unreachable: ${lastError}`);
   });
