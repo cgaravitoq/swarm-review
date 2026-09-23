@@ -1,6 +1,9 @@
 import { createHash } from "node:crypto";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { RESPONSE_TAIL_CHARS } from "../../container/response-seal";
+import {
+  RESPONSE_TAIL_CHARS,
+  WORKER_SSE_LINE_CHARS,
+} from "../../container/response-seal";
 import {
   emptyModelTotals,
   type ModelCaps,
@@ -246,7 +249,7 @@ describe("model proxy", () => {
         maxCumulativeOutputTokens: 1000,
         maxRequestBytes: 1024,
       },
-      totals: { requests: 1, retries: 0, input: 4, output: 2 },
+      totals: { requests: 1, retries: 0, input: 4, output: 2, unended: 0 },
     });
     expect(JSON.stringify(usage)).not.toContain("real-secret");
     expect(usage).toMatchObject({
@@ -537,6 +540,56 @@ describe("model proxy", () => {
 
     expect(seals).toEqual([
       createHash("sha256").update(long, "utf8").digest("hex"),
+      null,
+    ]);
+  });
+
+  it("holds a line to the Worker hop's own bound, never the container's", async () => {
+    // This proxy is the only hop a cloud lane's model bytes cross, and the
+    // bound it can hold is the isolate's. The container's larger bound belongs
+    // to the broker, which runs beside the lane's own memory; taking it here
+    // would hold a line this isolate cannot read and seal over a guess.
+    const head = 'data: {"choices":[{"delta":{"content":"';
+    const tail = '"}}]}';
+    const lineOf = (chars: number) => {
+      const answer = "x".repeat(chars - head.length - tail.length);
+      return { answer, frame: `${head}${answer}${tail}\n\n` };
+    };
+    const atBound = lineOf(WORKER_SSE_LINE_CHARS);
+    const pastBound = lineOf(WORKER_SSE_LINE_CHARS + 1);
+    const bodies = [atBound.frame, pastBound.frame];
+    vi.stubGlobal(
+      "fetch",
+      vi.fn<typeof fetch>(() =>
+        Promise.resolve(new Response(bodies.shift() ?? "", { status: 200 })),
+      ),
+    );
+    const url = await proxyTarget("run-worker-bound");
+    const seals: (string | null)[] = [];
+
+    for (let call = 0; call < 2; call += 1) {
+      const response = await proxyModelFetch(
+        new Request(url, {
+          method: "POST",
+          headers: { authorization: "Bearer review-pi-handle" },
+          body: "{}",
+        }),
+        url,
+        "control-secret",
+        sessionOpener(),
+        sessionConsumer(),
+        async (_runId, _usage, _retryable, seal) => {
+          seals.push(seal);
+        },
+      );
+      await response.text();
+    }
+
+    // The line at the bound is read and sealed; the one past it is a line this
+    // hop cannot hold, so the response answers null rather than a digest of a
+    // guess. A proxy that took the container's bound would seal both.
+    expect(seals).toEqual([
+      createHash("sha256").update(atBound.answer, "utf8").digest("hex"),
       null,
     ]);
   });
