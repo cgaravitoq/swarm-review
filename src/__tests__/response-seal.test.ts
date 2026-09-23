@@ -156,9 +156,8 @@ describe("response seal", () => {
       sealOfLine(WORKER_SSE_LINE_CHARS, WORKER_SSE_LINE_CHARS + 1),
     ).toBeNull();
 
-    // The container hop reads a line the Worker hop cannot: the most a provider
-    // may echo back is the request cap a lane sends under, and the lane keeps
-    // the seal of whichever hop read its answer.
+    // The container hop, which only a local lane crosses, reads a line the
+    // Worker hop cannot: up to the larger request cap a lane sends under.
     expect(CONTAINER_SSE_LINE_CHARS).toBe(SESSION_CAPS.t1b.maxRequestBytes);
     expect(
       sealOfLine(CONTAINER_SSE_LINE_CHARS, WORKER_SSE_LINE_CHARS + 1),

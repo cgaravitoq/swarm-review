@@ -4,30 +4,38 @@ import { createHash } from "node:crypto";
 export const RESPONSE_TAIL_CHARS = 65_536;
 
 /**
- * The longest SSE line the Worker hop reads, in UTF-16 code units.
+ * The longest SSE line the Worker proxy reads, in UTF-16 code units. A cloud
+ * lane's model bytes cross that proxy and no other sealing hop, so this is the
+ * longest line a cloud lane's seal can stand on.
  *
  * The number is the isolate's, not the request's. A line is materialized as a
  * string and parsed, so it costs the isolate two to three bytes per character,
- * six for text that is not Latin-1. Driving this module in V8 under a 128 MB
- * heap cap, the isolate's ceiling, a line of this bound peaks at 32 MB (ASCII)
- * and 59 to 61 MB (two-byte), while the t1b request cap a provider could echo
- * whole peaks at 72 to 117 MB and 205 MB - most of the isolate, or past its
+ * six for text that is not Latin-1. Driving this module in V8 under
+ * `--max-old-space-size=128`, the isolate's ceiling, a line of this bound peaks
+ * at 32 MB of heap (ASCII) and 61 MB (two-byte), while a line of the t1b
+ * request cap peaks at 104 MB and 136 MB: most of the isolate, or past its
  * ceiling on its own once the text is not Latin-1. A line past the bound is one
- * this hop cannot read, and the seal answers null rather than a digest of a
- * guess.
+ * this hop cannot read, so a cloud lane's seal answers null for it rather than
+ * a digest of a guess, and the lane is refused.
  */
 export const WORKER_SSE_LINE_CHARS = 8 * 1024 * 1024;
 
 /**
- * The longest SSE line the container hop reads, in UTF-16 code units.
+ * The longest SSE line the container broker reads, in UTF-16 code units. Only
+ * a local lane runs the broker, so this bound never reads a cloud lane's bytes.
  *
- * A provider may echo back the request it was given in a single event, so the
- * most a lane can legally put on one line is the request cap it sends under:
- * 32 MiB for the t1b kind every lane runs. This hop has the lane's own
- * container memory behind it rather than an isolate's, so it reads a whole one
- * - 205 MB of peak for text that is not Latin-1 - where the Worker hop can only
- * read its own bound, and the lane keeps the seal of whichever hop read its
- * answer.
+ * A Responses event echoes the request's instructions, so the line a lane can
+ * provoke follows the request cap it sends under, and this is the larger cap:
+ * t1b's 32 MiB. The cap counts bytes and the line counts code units, and a
+ * string's UTF-8 bytes are never fewer than its code units, so an echo in the
+ * request's own encoding is no longer than the request was. The event wraps
+ * its own fields around the echo, and a provider may re-escape it, a character
+ * as a six-character `\uXXXX`, up to six times the request's bytes: a line
+ * that grows past the bound that way answers null. The bound is the cap and
+ * not six times it, because six times it holds 580 MB of heap for one ASCII
+ * line (V8 under `--max-old-space-size=2048`), where the cap peaks at 205 MB
+ * for text that is not Latin-1 (under `--max-old-space-size=512`), which the
+ * lane's container memory pays for.
  */
 export const CONTAINER_SSE_LINE_CHARS = 32 * 1024 * 1024;
 
@@ -118,9 +126,10 @@ const jsonAnswerText = (body: string): string | null => {
  * the bounded tail the usage frame is read from. A JSON body is read from
  * that tail, and one longer than the tail answers null.
  *
- * `lineChars` is the longest line the calling hop will hold: the Worker hop
- * leaves it at its isolate's bound and the container broker passes the
- * container's, so a line only one of them can hold still seals the lane there.
+ * `lineChars` is the longest line the calling hop will hold. A sealed lane's
+ * model bytes cross one of the two hops, never both: a cloud lane's cross the
+ * Worker proxy, which leaves it at its isolate's bound, and a local lane's
+ * cross the container broker, which passes the container's.
  */
 export const responseSealer = ({
   lineChars = WORKER_SSE_LINE_CHARS,
