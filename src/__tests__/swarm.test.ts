@@ -2310,9 +2310,9 @@ if [[ "$joined" == *"cat /opt/review/pi-config/models.json"* ]]; then
   printf '{"providers":{"cloudflare-workers-ai":{"modelOverrides":{"@cf/deepseek-ai/deepseek-v4-flash-0731":{"contextWindow":1048576}}}}}\\n'
   exit 0
 fi
+if [[ "$joined" == *" sha256sum "* ]]; then jq -r 'to_entries[] | "\\(.value)  \\(.key)"' <<< "\${FAKE_IMAGE_SOURCES:?}"; exit 0; fi
 if [[ "$1" == "cp" || "$joined" == *" /opt/review/pi-config/models.json "* || "$joined" == *" mkdir -p "* || "$joined" == *" chmod "* || "$joined" == *" chown "* ]]; then exit 0; fi
 if [[ "$joined" == *" id -u; id -g "* ]]; then printf '1000\\n1000\\n'; exit 0; fi
-if [[ "$joined" == *" sha256sum "* ]]; then jq -r 'to_entries[] | "\\(.value)  \\(.key)"' <<< "\${FAKE_IMAGE_SOURCES:?}"; exit 0; fi
 if [[ "$joined" == *" --detach "* ]]; then
   rundir=$(printf '%s' "$joined" | grep -o '/workspace/runs/[A-Za-z0-9._-]*' | head -1)
   runid="\${rundir##*/}"
