@@ -80,6 +80,12 @@ describe("response seal", () => {
     expect(sealOf(": keep-alive\n\nUnauthorized")).toBeNull();
   });
 
+  it("refuses a line that is not SSE after an opening comment, whatever follows it", () => {
+    // Were the comment to establish the format, the junk would read as a line
+    // with no data and the event after it would seal.
+    expect(sealOf(`: keep-alive\n\nnope\n\n${chatBody("x")}`)).toBeNull();
+  });
+
   it("ignores a comment between events and seals nothing for comments alone", () => {
     expect(
       sealOf(`${chatBody("before")}: keep-alive\n\n${chatBody("after")}`),
