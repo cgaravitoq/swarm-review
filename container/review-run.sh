@@ -806,6 +806,26 @@ function handlePiEvent(child, rawLine) {
     return;
   }
 
+  // The rest of the event table pi 0.85.1 documents for rpc mode. None of
+  // them ends a turn or settles the agent, so each is only the last thing pi
+  // said. The stderr a turn is classified by never hears of them.
+  if ([
+    "bash_execution_update",
+    "queue_update",
+    "compaction_start",
+    "compaction_end",
+    "auto_retry_start",
+    "auto_retry_end",
+    "summarization_retry_scheduled",
+    "summarization_retry_attempt_start",
+    "summarization_retry_finished",
+    "extension_error",
+  ].includes(event.type)) {
+    lastEvent = event.type;
+    writeStatus();
+    return;
+  }
+
   appendStderr(`unknown event type from pi: ${event.type}\n`);
   lastEvent = "protocol_error";
   detail = `unknown event type from pi: ${event.type}`;
