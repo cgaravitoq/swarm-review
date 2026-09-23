@@ -1369,6 +1369,7 @@ const recordAt = (
   return value as Readonly<Record<string, unknown>>;
 };
 
+/** Numeric fields, keeping the null a writer recorded for a count it never observed. */
 const numberRecord = (
   object: Readonly<Record<string, unknown>>,
   key: string,
@@ -1377,7 +1378,9 @@ const numberRecord = (
   if (typeof value !== "object" || value === null) return null;
   return Object.fromEntries(
     Object.entries(value).flatMap(([field, entry]) =>
-      typeof entry === "number" ? [[field, entry] as const] : [],
+      typeof entry === "number" || entry === null
+        ? [[field, entry] as const]
+        : [],
     ),
   );
 };

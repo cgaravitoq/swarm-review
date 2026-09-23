@@ -4224,9 +4224,64 @@ await writeFile(
     model: "grok-4.6",
     wallSeconds: 1,
     modelRequests: brief.prompt ? 3 : 0,
+    ...(process.env.FAKE_CLOUD_USAGE
+      ? { usage: JSON.parse(process.env.FAKE_CLOUD_USAGE) }
+      : {}),
   }),
 );
 `;
+
+    it("carries a cloud lane's unobserved token counts into its row as null", async () => {
+      const arranged = await arrange("success");
+      const swarmId = "swarm-pool-usage";
+      const provider = await fakeProvider((_prompt, path) =>
+        path.startsWith("/repos/")
+          ? pullAnswer(arranged)
+          : completion(answer([finding({ file: "changed-a.ts", line: 1 })])),
+      );
+      await pointUpstream(arranged, {
+        "https://api.x.ai/v1": provider.baseUrl,
+      });
+      await pointGitHub(arranged, provider.baseUrl);
+      await writeFile(
+        join(arranged.repo, "agents/review-pi/src/drive.ts"),
+        fakeDriver,
+      );
+      // The Worker session admitted three requests and no response carried a
+      // usage frame, so its tokens were never observed.
+      const usage = {
+        requests: 3,
+        retries: 0,
+        inputTokens: null,
+        outputTokens: null,
+        unended: 1,
+      };
+
+      const result = await runSwarm(
+        packedArguments(arranged, swarmId, [
+          "--fast",
+          "--pr",
+          "6567",
+          "--worker",
+          "https://review.invalid",
+        ]),
+        arranged,
+        {
+          ...arranged.env,
+          GITHUB_TOKEN: "test-token",
+          FAKE_CLOUD_USAGE: JSON.stringify(usage),
+        },
+      );
+      const receipt = await readReceipt(arranged.out, swarmId);
+      const pool = laneRows(receipt).filter(
+        (lane) => lane["role"] === "verifier" && lane["claimedFile"],
+      );
+
+      expect(result.code, result.output).toBe(0);
+      // A dropped field reads as nothing to a reader that sums the row, so the
+      // row keeps the null the session reported.
+      expect(pool.map((lane) => lane["usage"])).toEqual([usage]);
+    }, 180_000);
 
     it("keeps only a verbatim declared intent on a pool lane's findings", async () => {
       const arranged = await arrange("success");
