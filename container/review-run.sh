@@ -775,8 +775,6 @@ function handlePiEvent(child, rawLine) {
     lastEvent = "agent_end";
     inFlightTool = null;
     inFlightToolName = "";
-    childIdle = true;
-    isStreaming = false;
     let candidateText = "";
     if (Array.isArray(event.messages)) {
       const assistantMsgs = event.messages.filter(m => m.role === "assistant");
@@ -788,6 +786,19 @@ function handlePiEvent(child, rawLine) {
       }
     }
     lastCandidateResult = candidateText;
+    writeStatus();
+    return;
+  }
+
+  // Automatic work - a retry, overflow recovery, a queued message - can still
+  // follow agent_end and replace the candidate it carried. agent_settled is
+  // pi's own word that none of it is left, so the lane goes idle only there.
+  if (event.type === "agent_settled") {
+    lastEvent = "agent_settled";
+    inFlightTool = null;
+    inFlightToolName = "";
+    childIdle = true;
+    isStreaming = false;
     if (state === "running") {
       state = "idle";
     }

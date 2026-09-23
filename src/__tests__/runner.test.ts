@@ -1079,6 +1079,7 @@ process.stdin.on("data", (chunk) => {
             type: "agent_end",
             messages: [{ role: "assistant", content: [{ type: "text", text: "RAPID_FINAL" }] }],
           }),
+          JSON.stringify({ type: "agent_settled" }),
         ].join("\\n") + "\\n");
         continue;
       }
@@ -1102,6 +1103,7 @@ process.stdin.on("data", (chunk) => {
             type: "agent_end",
             messages: [{ role: "assistant", content: [{ type: "text", text: "UNICODE_FINAL" }] }],
           }) + "\\n");
+          process.stdout.write(JSON.stringify({ type: "agent_settled" }) + "\\n");
         }, 20);
         continue;
       }
@@ -1130,6 +1132,7 @@ process.stdin.on("data", (chunk) => {
             type: "agent_end",
             messages: [{ role: "assistant", content: [{ type: "text", text: "Tool review finished" }] }],
           }) + "\\n");
+          process.stdout.write(JSON.stringify({ type: "agent_settled" }) + "\\n");
         }, 80);
       } else if (cmd.message.includes("crash now")) {
         process.stderr.write("fatal model failure in pi child\\n");
@@ -1147,6 +1150,7 @@ process.stdin.on("data", (chunk) => {
             type: "agent_end",
             messages: [],
           }) + "\\n");
+          process.stdout.write(JSON.stringify({ type: "agent_settled" }) + "\\n");
           setTimeout(() => process.exit(1), 10);
         }, 30);
       } else if (cmd.message.includes("simulate quota blocked")) {
@@ -1160,6 +1164,7 @@ process.stdin.on("data", (chunk) => {
             type: "agent_end",
             messages: [],
           }) + "\\n");
+          process.stdout.write(JSON.stringify({ type: "agent_settled" }) + "\\n");
           setTimeout(() => process.exit(1), 10);
         }, 30);
       } else if (cmd.message.includes("simulate budget exhausted")) {
@@ -1172,6 +1177,7 @@ process.stdin.on("data", (chunk) => {
             type: "agent_end",
             messages: [],
           }) + "\\n");
+          process.stdout.write(JSON.stringify({ type: "agent_settled" }) + "\\n");
           setTimeout(() => process.exit(1), 10);
         }, 30);
       } else if (cmd.message.includes("simulate oauth 403")) {
@@ -1187,6 +1193,7 @@ process.stdin.on("data", (chunk) => {
             type: "agent_end",
             messages: [],
           }) + "\\n");
+          process.stdout.write(JSON.stringify({ type: "agent_settled" }) + "\\n");
         }, 30);
       } else if (cmd.message.includes("model error then exit")) {
         setTimeout(() => {
@@ -1198,6 +1205,7 @@ process.stdin.on("data", (chunk) => {
             type: "agent_end",
             messages: [],
           }) + "\\n");
+          process.stdout.write(JSON.stringify({ type: "agent_settled" }) + "\\n");
           setTimeout(() => process.exit(1), 10);
         }, 30);
       } else if (cmd.message.includes("active descendant")) {
@@ -1221,6 +1229,7 @@ process.stdin.on("data", (chunk) => {
             type: "agent_end",
             messages: [{ role: "assistant", content: [{ type: "text", text: "candidate partial review" }] }],
           }) + "\\n");
+          process.stdout.write(JSON.stringify({ type: "agent_settled" }) + "\\n");
         }, 30);
       } else if (cmd.message.includes("provide final conclusion")) {
         setTimeout(() => {
@@ -1232,6 +1241,21 @@ process.stdin.on("data", (chunk) => {
             type: "agent_end",
             messages: [{ role: "assistant", content: [{ type: "text", text: "ACCEPTED_FINAL_CONCLUSION" }] }],
           }) + "\\n");
+          process.stdout.write(JSON.stringify({ type: "agent_settled" }) + "\\n");
+        }, 30);
+      } else if (cmd.message.includes("settle later")) {
+        setTimeout(() => {
+          process.stdout.write(JSON.stringify({
+            type: "turn_end",
+            message: { stopReason: "stop", usage: { input: 4, output: 4, totalTokens: 8 } },
+          }) + "\\n");
+          process.stdout.write(JSON.stringify({
+            type: "agent_end",
+            messages: [{ role: "assistant", content: [{ type: "text", text: "SETTLE_LATER" }] }],
+          }) + "\\n");
+          setTimeout(() => {
+            process.stdout.write(JSON.stringify({ type: "agent_settled" }) + "\\n");
+          }, 750);
         }, 30);
       } else {
         setTimeout(() => {
@@ -1248,6 +1272,7 @@ process.stdin.on("data", (chunk) => {
             type: "agent_end",
             messages: [{ role: "assistant", content: [{ type: "text", text: "standby ready" }] }],
           }) + "\\n");
+          process.stdout.write(JSON.stringify({ type: "agent_settled" }) + "\\n");
         }, 30);
       }
     }
@@ -1663,7 +1688,7 @@ process.stdin.on("data", (chunk) => {
       );
       await waitForStatus(
         statusPath,
-        (s) => s["state"] === "idle" && s["lastEvent"] === "agent_end",
+        (s) => s["state"] === "idle" && s["lastEvent"] === "agent_settled",
       );
 
       const traceContent = await readFile(join(root, "trace.jsonl"), "utf8");
@@ -1729,7 +1754,7 @@ process.stdin.on("data", (chunk) => {
         });
         await waitForStatus(
           statusPath,
-          (s) => s["state"] === "idle" && s["lastEvent"] === "agent_end",
+          (s) => s["state"] === "idle" && s["lastEvent"] === "agent_settled",
         );
       }
       await waitForTrace(
@@ -1796,7 +1821,7 @@ process.stdin.on("data", (chunk) => {
 
       await waitForStatus(
         statusPath,
-        (s) => s["state"] === "idle" && s["lastEvent"] === "agent_end",
+        (s) => s["state"] === "idle" && s["lastEvent"] === "agent_settled",
       );
       await sendCommand(sockPath, { type: "accept" });
       await waitForExit(runnerProc);
@@ -1944,6 +1969,62 @@ process.stdin.on("data", (chunk) => {
     }
   });
 
+  it("ends the review where pi settled, not at its last spoken event", async () => {
+    const { root, sockPath, runnerProc } = await prepareSupervisedRun(
+      "settle-gate",
+      "settle later",
+    );
+    try {
+      const statusPath = join(root, "status.json");
+      await waitForStatus(
+        statusPath,
+        (s) =>
+          s["lastEvent"] === "agent_end" &&
+          s["lastCandidateResult"] === "SETTLE_LATER",
+      );
+      const premature = await sendCommand(sockPath, { type: "accept" });
+      expect(premature["success"]).toBe(false);
+      expect(String(premature["error"])).toContain("not idle");
+
+      await waitForStatus(
+        statusPath,
+        (s) =>
+          s["state"] === "idle" &&
+          s["lastEvent"] === "agent_settled" &&
+          s["childIdle"] === true,
+      );
+      const accepted = await sendCommand(sockPath, { type: "accept" });
+      expect(accepted["success"]).toBe(true);
+      expect(await waitForExit(runnerProc)).toBe(0);
+    } finally {
+      runnerProc.kill();
+    }
+  });
+
+  it("records pi's settled event instead of calling it a protocol error", async () => {
+    const { root, sockPath, runnerProc } = await prepareSupervisedRun(
+      "settled-quiet",
+      "standby",
+    );
+    try {
+      const statusPath = join(root, "status.json");
+      const settled = await waitForStatus(
+        statusPath,
+        (s) =>
+          s["state"] === "idle" &&
+          s["lastEvent"] === "agent_settled" &&
+          s["lastCandidateResult"] === "standby ready",
+      );
+      expect(settled["detail"]).toBe("");
+      const stderr = await readFile(join(root, "pi.stderr"), "utf8");
+      expect(stderr).not.toContain("unknown event type");
+      await sendCommand(sockPath, { type: "accept" });
+      expect(await waitForExit(runnerProc)).toBe(0);
+    } finally {
+      runnerProc.kill();
+    }
+  });
+
   it("distinguishes explicit cancellation from process failure with distinct terminal reasons", async () => {
     const cancelSetup = await prepareSupervisedRun("cancel-run");
     try {
@@ -2010,7 +2091,7 @@ process.stdin.on("data", (chunk) => {
 
       await waitForStatus(
         statusPath,
-        (s) => s["state"] === "idle" && s["lastEvent"] === "agent_end",
+        (s) => s["state"] === "idle" && s["lastEvent"] === "agent_settled",
       );
       const inspect1 = await sendCommand(sockPath, { type: "inspect" });
       const inspect1Data = objectValue(inspect1["data"]);
@@ -2035,7 +2116,7 @@ process.stdin.on("data", (chunk) => {
         statusPath,
         (s) =>
           s["state"] === "idle" &&
-          s["lastEvent"] === "agent_end" &&
+          s["lastEvent"] === "agent_settled" &&
           !s["inFlightTool"],
       );
       const inspect2 = await sendCommand(sockPath, { type: "inspect" });
