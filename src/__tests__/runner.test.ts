@@ -1250,6 +1250,40 @@ process.stdin.on("data", (chunk) => {
           }) + "\\n");
           process.stdout.write(JSON.stringify({ type: "agent_settled" }) + "\\n");
         }, 30);
+      } else if (cmd.message.includes("documented events")) {
+        setTimeout(() => {
+          for (const event of [
+            { type: "agent_start" },
+            { type: "turn_start" },
+            { type: "queue_update", steering: [], followUp: [] },
+            { type: "message_start" },
+            { type: "message_update" },
+            { type: "bash_execution_update", id: "req-1", delta: "total 0" },
+            { type: "message_end" },
+            {
+              type: "turn_end",
+              message: { stopReason: "stop", usage: { input: 2, output: 2, totalTokens: 4 } },
+            },
+            {
+              type: "agent_end",
+              messages: [{ role: "assistant", content: [{ type: "text", text: "DOCUMENTED_FINAL" }] }],
+              willRetry: false,
+            },
+            { type: "compaction_start", reason: "threshold" },
+            { type: "summarization_retry_scheduled", attempt: 1, maxAttempts: 3, delayMs: 0, errorMessage: "terminated" },
+            { type: "summarization_retry_attempt_start", source: "compaction", reason: "threshold" },
+            { type: "summarization_retry_finished" },
+            { type: "compaction_end", reason: "threshold", result: null, aborted: false, willRetry: false },
+            { type: "auto_retry_start", attempt: 1, maxAttempts: 3, delayMs: 0, errorMessage: "529 overloaded_error: Overloaded" },
+            { type: "auto_retry_end", success: true, attempt: 1 },
+            { type: "extension_error", extensionPath: "/opt/review/extensions/claude-code-provider.js", event: "tool_call", error: "extension threw" },
+          ]) {
+            process.stdout.write(JSON.stringify(event) + "\\n");
+          }
+          setTimeout(() => {
+            process.stdout.write(JSON.stringify({ type: "agent_settled" }) + "\\n");
+          }, 750);
+        }, 30);
       } else if (cmd.message.includes("settle later")) {
         setTimeout(() => {
           process.stdout.write(JSON.stringify({
@@ -2008,6 +2042,41 @@ process.stdin.on("data", (chunk) => {
           s["lastEvent"] === "agent_settled" &&
           s["childIdle"] === true,
       );
+      const accepted = await sendCommand(sockPath, { type: "accept" });
+      expect(accepted["success"]).toBe(true);
+      expect(await waitForExit(runnerProc)).toBe(0);
+    } finally {
+      runnerProc.kill();
+    }
+  });
+
+  it("admits every event pi documents and still ends the review where pi settled", async () => {
+    const { root, sockPath, runnerProc } = await prepareSupervisedRun(
+      "documented-events",
+      "documented events",
+    );
+    try {
+      const statusPath = join(root, "status.json");
+      // The table in pi 0.85.1's own docs/rpc.md: a retry, a compaction and an
+      // extension error are what a healthy lane can see, not a broken stream.
+      const unsettled = await waitForStatus(
+        statusPath,
+        (s) =>
+          s["lastEvent"] === "extension_error" &&
+          s["lastCandidateResult"] === "DOCUMENTED_FINAL",
+      );
+      expect(unsettled["detail"]).toBe("");
+      expect(unsettled["childIdle"]).toBe(false);
+      const premature = await sendCommand(sockPath, { type: "accept" });
+      expect(premature["success"]).toBe(false);
+
+      const settled = await waitForStatus(
+        statusPath,
+        (s) => s["state"] === "idle" && s["lastEvent"] === "agent_settled",
+      );
+      expect(settled["detail"]).toBe("");
+      const stderr = await readFile(join(root, "pi.stderr"), "utf8");
+      expect(stderr).not.toContain("unknown event type");
       const accepted = await sendCommand(sockPath, { type: "accept" });
       expect(accepted["success"]).toBe(true);
       expect(await waitForExit(runnerProc)).toBe(0);
