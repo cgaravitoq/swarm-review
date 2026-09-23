@@ -2075,6 +2075,39 @@ describe("public local CLI lifecycle", {
     expect(result.output).toContain("install/running");
   });
 
+  it("never takes a status file's done for the lane's end while the bridge is gone", async () => {
+    // The run directory belongs to the target's uid, so anything the install
+    // or the check runs can write status.json. A failure it claims only ends
+    // its own review; a success it claims would end the review for it.
+    const root = await mkdtemp(join(tmpdir(), "review-pi-cli-"));
+    temporaryDirectories.push(root);
+    const arranged = await arrangeFakeDocker(root);
+    const runId = "claimed-done";
+    const out = join(root, "out");
+
+    const result = await runLocalCli(localArguments(out, runId), {
+      ...fakeEnvironment(arranged, runId, "success"),
+      FAKE_BRIDGE_FLAKY: "2",
+      FAKE_BRIDGE_STATES: "running,done",
+      FAKE_PREPARATION_STATUS: JSON.stringify({
+        runId,
+        phase: "install",
+        state: "done",
+        detail: "",
+        process: { alive: false, pid: 50 },
+      }),
+    });
+
+    expect(result.code, result.output).toBe(0);
+    expect(result.output).toContain("status observation uncertain");
+    expect(result.output).not.toContain("install/done");
+    // The lane ended where the bridge said it did, after it said running.
+    expect(result.output).toContain("review/running");
+    expect(await readFile(join(arranged.state, "bridge-step"), "utf8")).toBe(
+      "2\n",
+    );
+  });
+
   it("keeps waiting when the bridge is briefly unreachable but the run is alive", async () => {
     const root = await mkdtemp(join(tmpdir(), "review-pi-cli-"));
     temporaryDirectories.push(root);
