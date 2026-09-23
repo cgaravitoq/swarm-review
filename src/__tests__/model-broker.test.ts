@@ -11,7 +11,10 @@ import {
   reserveAttempt,
   resolveUpstreamTarget,
 } from "../../container/model-broker";
-import { RESPONSE_TAIL_CHARS } from "../../container/response-seal";
+import {
+  RESPONSE_TAIL_CHARS,
+  WORKER_SSE_LINE_CHARS,
+} from "../../container/response-seal";
 
 const CANARY = "canary-bearer-do-not-log-9f3c";
 
@@ -265,6 +268,18 @@ describe("model broker", () => {
       .filter((entry) => entry["event"] === "provider_request")
       .map((entry) => entry["seal"]);
     expect(seals).toEqual([sha256(long), null]);
+  });
+
+  it("seals a line past the Worker hop's bound, because this hop holds the lane's own memory", async () => {
+    const head = 'data: {"choices":[{"delta":{"content":"';
+    const tail = '"}}]}';
+    const line = WORKER_SSE_LINE_CHARS + 1;
+    const answer = "x".repeat(line - head.length - tail.length);
+    upstreamBody = `${head}${answer}${tail}\n\n`;
+
+    await call().then((response) => response.text());
+
+    expect((await requestEntry())?.["seal"]).toBe(sha256(answer));
   });
 
   it("stops calling the provider once a cumulative token cap is reached", async () => {

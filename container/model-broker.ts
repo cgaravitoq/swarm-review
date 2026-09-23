@@ -16,7 +16,7 @@
 import { appendFileSync, readFileSync } from "node:fs";
 import type { IncomingMessage, ServerResponse } from "node:http";
 import { createServer } from "node:http";
-import { responseSealer } from "./response-seal";
+import { CONTAINER_SSE_LINE_CHARS, responseSealer } from "./response-seal";
 
 /** The cap that would be broken by admitting one more request, or null. */
 export type BrokerCaps = {
@@ -319,7 +319,9 @@ export function createBrokerServer(config: BrokerConfig) {
         // and break the activity the run is watched through. The sealer hashes
         // the answer as it passes and keeps only the tail the usage frame is in.
         const decoder = new TextDecoder();
-        const sealer = responseSealer();
+        const sealer = responseSealer({
+          lineChars: CONTAINER_SSE_LINE_CHARS,
+        });
         if (upstream.body) {
           for await (const chunk of upstream.body) {
             sealer.write(decoder.decode(chunk, { stream: true }));
