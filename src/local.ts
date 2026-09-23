@@ -2967,6 +2967,8 @@ async function main() {
         // No bridge yet, or no bridge any more. The runner's status file is the
         // only witness for a run that died before Pi came up, and a lane that
         // has already failed must not be waited on for the rest of the run.
+        // Its done is never believed: the target's uid can write this file,
+        // and only the bridge may say that a review ended well.
         const runnerStatus = await readContainerStatus(
           containerName,
           containerRunDir,
