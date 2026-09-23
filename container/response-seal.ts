@@ -4,10 +4,32 @@ import { createHash } from "node:crypto";
 export const RESPONSE_TAIL_CHARS = 65_536;
 
 /**
- * The longest SSE line the seal reads. A line is one event, and a Responses
- * event echoes the request's instructions, so it is bounded like a request.
+ * The longest SSE line the Worker hop reads, in UTF-16 code units.
+ *
+ * The number is the isolate's, not the request's. A line is materialized as a
+ * string and parsed, so it costs the isolate two to three bytes per character,
+ * six for text that is not Latin-1. Driving this module in V8 under a 128 MB
+ * heap cap, the isolate's ceiling, a line of this bound peaks at 32 MB (ASCII)
+ * and 59 to 61 MB (two-byte), while the t1b request cap a provider could echo
+ * whole peaks at 72 to 117 MB and 205 MB - most of the isolate, or past its
+ * ceiling on its own once the text is not Latin-1. A line past the bound is one
+ * this hop cannot read, and the seal answers null rather than a digest of a
+ * guess.
  */
-export const SSE_LINE_CHARS = 8 * 1024 * 1024;
+export const WORKER_SSE_LINE_CHARS = 8 * 1024 * 1024;
+
+/**
+ * The longest SSE line the container hop reads, in UTF-16 code units.
+ *
+ * A provider may echo back the request it was given in a single event, so the
+ * most a lane can legally put on one line is the request cap it sends under:
+ * 32 MiB for the t1b kind every lane runs. This hop has the lane's own
+ * container memory behind it rather than an isolate's, so it reads a whole one
+ * - 205 MB of peak for text that is not Latin-1 - where the Worker hop can only
+ * read its own bound, and the lane keeps the seal of whichever hop read its
+ * answer.
+ */
+export const CONTAINER_SSE_LINE_CHARS = 32 * 1024 * 1024;
 
 const ANTHROPIC_EVENTS = new Set([
   "content_block_start",
@@ -95,8 +117,16 @@ const jsonAnswerText = (body: string): string | null => {
  * The text is hashed as it arrives, so what is retained is one SSE line and
  * the bounded tail the usage frame is read from. A JSON body is read from
  * that tail, and one longer than the tail answers null.
+ *
+ * `lineChars` is the longest line the calling hop will hold: the Worker hop
+ * leaves it at its isolate's bound and the container broker passes the
+ * container's, so a line only one of them can hold still seals the lane there.
  */
-export const responseSealer = () => {
+export const responseSealer = ({
+  lineChars = WORKER_SSE_LINE_CHARS,
+}: {
+  lineChars?: number;
+} = {}) => {
   const hash = createHash("sha256");
   let tail = "";
   let total = 0;
@@ -116,7 +146,7 @@ export const responseSealer = () => {
   };
 
   const readLine = (rawLine: string): boolean => {
-    if (rawLine.length > SSE_LINE_CHARS) return false;
+    if (rawLine.length > lineChars) return false;
     const line = rawLine.replace(/\r$/, "");
     if (!sawLine) {
       if (line.trim() === "") return true;
@@ -220,7 +250,7 @@ export const responseSealer = () => {
         pending = lines.pop() ?? "";
         if (!lines.every(readLine)) mode = "unsealable";
       }
-      if (mode === "unsealable" || pending.length > SSE_LINE_CHARS) {
+      if (mode === "unsealable" || pending.length > lineChars) {
         mode = "unsealable";
         pending = "";
       }

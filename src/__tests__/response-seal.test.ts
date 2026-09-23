@@ -4,10 +4,12 @@ import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { describe, expect, it } from "vitest";
 import {
+  CONTAINER_SSE_LINE_CHARS,
   RESPONSE_TAIL_CHARS,
   responseSealer,
-  SSE_LINE_CHARS,
+  WORKER_SSE_LINE_CHARS,
 } from "../../container/response-seal";
+import { SESSION_CAPS } from "../provider-budget";
 
 const containerDir = fileURLToPath(
   new URL("../../container", import.meta.url).href,
@@ -125,7 +127,48 @@ describe("response seal", () => {
     expect(
       sealOf(JSON.stringify({ choices: [{ message: { content: long } }] })),
     ).toBeNull();
-    expect(sealOf(chatBody("x".repeat(SSE_LINE_CHARS)), 1 << 20)).toBeNull();
+    expect(
+      sealOf(chatBody("x".repeat(WORKER_SSE_LINE_CHARS)), 1 << 20),
+    ).toBeNull();
+  });
+
+  it("reads a line at each hop's bound and answers null one character past it", () => {
+    // The frame is one data line of exactly `chars` characters, so the length
+    // under test is the line the hop is asked to hold and nothing else.
+    const head = 'data: {"choices":[{"delta":{"content":"';
+    const tail = '"}}]}';
+    const lineOf = (chars: number) => {
+      const answer = "x".repeat(chars - head.length - tail.length);
+      return { answer, frame: `${head}${answer}${tail}\n\n` };
+    };
+    const sealOfLine = (lineChars: number, chars: number) => {
+      const sealer = responseSealer({ lineChars });
+      sealer.write(lineOf(chars).frame);
+      return sealer.seal();
+    };
+    const answerSeal = (chars: number) => sha256(lineOf(chars).answer);
+
+    expect(WORKER_SSE_LINE_CHARS).toBe(8 * 1024 * 1024);
+    expect(sealOfLine(WORKER_SSE_LINE_CHARS, WORKER_SSE_LINE_CHARS)).toBe(
+      answerSeal(WORKER_SSE_LINE_CHARS),
+    );
+    expect(
+      sealOfLine(WORKER_SSE_LINE_CHARS, WORKER_SSE_LINE_CHARS + 1),
+    ).toBeNull();
+
+    // The container hop reads a line the Worker hop cannot: the most a provider
+    // may echo back is the request cap a lane sends under, and the lane keeps
+    // the seal of whichever hop read its answer.
+    expect(CONTAINER_SSE_LINE_CHARS).toBe(SESSION_CAPS.t1b.maxRequestBytes);
+    expect(
+      sealOfLine(CONTAINER_SSE_LINE_CHARS, WORKER_SSE_LINE_CHARS + 1),
+    ).toBe(answerSeal(WORKER_SSE_LINE_CHARS + 1));
+    expect(sealOfLine(CONTAINER_SSE_LINE_CHARS, CONTAINER_SSE_LINE_CHARS)).toBe(
+      answerSeal(CONTAINER_SSE_LINE_CHARS),
+    );
+    expect(
+      sealOfLine(CONTAINER_SSE_LINE_CHARS, CONTAINER_SSE_LINE_CHARS + 1),
+    ).toBeNull();
   });
 
   it("ships in the image beside every broker that imports it", async () => {
