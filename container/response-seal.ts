@@ -4,10 +4,40 @@ import { createHash } from "node:crypto";
 export const RESPONSE_TAIL_CHARS = 65_536;
 
 /**
- * The longest SSE line the seal reads. A line is one event, and a Responses
- * event echoes the request's instructions, so it is bounded like a request.
+ * The longest SSE line the Worker proxy reads, in UTF-16 code units. A cloud
+ * lane's model bytes cross that proxy and no other sealing hop, so this is the
+ * longest line a cloud lane's seal can stand on.
+ *
+ * The number is the isolate's, not the request's. A line is materialized as a
+ * string and parsed, so it costs the isolate two to three bytes per character,
+ * six for text that is not Latin-1. Driving this module in V8 under
+ * `--max-old-space-size=128`, the isolate's ceiling, a line of this bound peaks
+ * at 32 MB of heap (ASCII) and 61 MB (two-byte), while a line of the t1b
+ * request cap peaks at 104 MB and 136 MB: most of the isolate, or past its
+ * ceiling on its own once the text is not Latin-1. A line past the bound is one
+ * this hop cannot read, so a cloud lane's seal answers null for it rather than
+ * a digest of a guess, and the lane is refused.
  */
-export const SSE_LINE_CHARS = 8 * 1024 * 1024;
+export const WORKER_SSE_LINE_CHARS = 8 * 1024 * 1024;
+
+/**
+ * The longest SSE line the container broker reads, in UTF-16 code units. Only
+ * a local lane runs the broker, so this bound never reads a cloud lane's bytes.
+ *
+ * A Responses event echoes the request's instructions, so the line a lane can
+ * provoke follows the request cap it sends under, and this is the larger cap:
+ * t1b's 32 MiB. The cap counts bytes and the line counts code units, and a
+ * string's UTF-8 bytes are never fewer than its code units, so an echo in the
+ * request's own encoding is no longer than the request was. The event wraps
+ * its own fields around the echo, and a provider may re-escape it, a character
+ * as a six-character `\uXXXX`, up to six times the request's bytes: a line
+ * that grows past the bound that way answers null. The bound is the cap and
+ * not six times it, because six times it holds 580 MB of heap for one ASCII
+ * line (V8 under `--max-old-space-size=2048`), where the cap peaks at 205 MB
+ * for text that is not Latin-1 (under `--max-old-space-size=512`), which the
+ * lane's container memory pays for.
+ */
+export const CONTAINER_SSE_LINE_CHARS = 32 * 1024 * 1024;
 
 const ANTHROPIC_EVENTS = new Set([
   "content_block_start",
@@ -95,8 +125,17 @@ const jsonAnswerText = (body: string): string | null => {
  * The text is hashed as it arrives, so what is retained is one SSE line and
  * the bounded tail the usage frame is read from. A JSON body is read from
  * that tail, and one longer than the tail answers null.
+ *
+ * `lineChars` is the longest line the calling hop will hold. A sealed lane's
+ * model bytes cross one of the two hops, never both: a cloud lane's cross the
+ * Worker proxy, which leaves it at its isolate's bound, and a local lane's
+ * cross the container broker, which passes the container's.
  */
-export const responseSealer = () => {
+export const responseSealer = ({
+  lineChars = WORKER_SSE_LINE_CHARS,
+}: {
+  lineChars?: number;
+} = {}) => {
   const hash = createHash("sha256");
   let tail = "";
   let total = 0;
@@ -116,10 +155,14 @@ export const responseSealer = () => {
   };
 
   const readLine = (rawLine: string): boolean => {
-    if (rawLine.length > SSE_LINE_CHARS) return false;
+    if (rawLine.length > lineChars) return false;
     const line = rawLine.replace(/\r$/, "");
     if (!sawLine) {
       if (line.trim() === "") return true;
+      // A comment carries no event, so a provider's keep-alive may open the
+      // stream. It does not establish the format either: what follows it still
+      // has to be one.
+      if (line.startsWith(":")) return true;
       sawLine = true;
       if (!/^(?:data|event|id|retry):/.test(line.trim())) return false;
     }
@@ -216,7 +259,7 @@ export const responseSealer = () => {
         pending = lines.pop() ?? "";
         if (!lines.every(readLine)) mode = "unsealable";
       }
-      if (mode === "unsealable" || pending.length > SSE_LINE_CHARS) {
+      if (mode === "unsealable" || pending.length > lineChars) {
         mode = "unsealable";
         pending = "";
       }
