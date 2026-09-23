@@ -176,6 +176,20 @@ describe("response seal", () => {
     ).toBeNull();
   });
 
+  it("holds a line still arriving at the bound until its end is read", () => {
+    const head = 'data: {"choices":[{"delta":{"content":"';
+    const tail = '"}}]}';
+    const answer = "x".repeat(
+      WORKER_SSE_LINE_CHARS - head.length - tail.length,
+    );
+    const piece = 1 << 16;
+
+    // The pieces divide the bound, so the line's last piece leaves the hop
+    // holding exactly the bound's characters before the next one ends it.
+    expect(WORKER_SSE_LINE_CHARS % piece).toBe(0);
+    expect(sealOf(`${head}${answer}${tail}\n\n`, piece)).toBe(sha256(answer));
+  });
+
   it("ships in the image beside every broker that imports it", async () => {
     // The broker runs from the image, never from this tree, so a module it
     // imports but the image lacks fails only inside a real lane.
