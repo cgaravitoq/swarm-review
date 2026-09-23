@@ -65,10 +65,11 @@ A push has no path through it even with the capability in hand.
 **A deployed Worker serves exactly one repository.** `TARGET_REPOSITORY` is unset in `wrangler.jsonc` on purpose, and a Worker deployed without it refuses every run rather than falling back.
 Do not give it a default.
 
-**The image and the SDK move together.** `SANDBOX_VERSION` in `container/Dockerfile` must equal `@cloudflare/sandbox` in `package.json`.
+**The image and the SDK move together.** The `cloudflare/sandbox` tag in `container/Dockerfile` must equal `@cloudflare/sandbox` in `package.json`.
 They speak a versioned protocol and a mismatch fails at runtime, not at build time.
 
-**A stale image fails loudly.** The driver hashes `container/review-run.sh` into the job and the container compares its own copy, so an image built from an older runner ends the run with `container runner mismatch`.
+**A stale image fails loudly.** The driver hashes every file in `container/` the image is built from into the job, the Dockerfile among them, and both transports compare the image's own copies before the first model request, so an image built from other sources ends the run naming the file that differs.
+The Dockerfile pins every version as a literal, because a build argument would move what the image installs without moving the bytes compared.
 
 **A subscription lane's provider is the one extension a job names.** `claude-code` reaches Anthropic through `container/claude-code-provider.js`, which registers the provider with neither a base URL nor a model list so the run's own `models.json` points it at the broker.
 Extension discovery stays off, and the provider's own registration would send the request straight to Anthropic with a handle instead of a bearer, which is what the broker exists to prevent.
