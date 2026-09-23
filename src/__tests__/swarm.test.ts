@@ -2393,7 +2393,8 @@ if [[ "$1" == "exec" && "$joined" == *"cat /opt/review/control/provider-usage.js
   else
     seal=$(printf '%s' "$final" | shasum -a 256 | cut -d' ' -f1)
   fi
-  printf '{"event":"provider_request","seal":"%s","totals":{"requests":1,"retries":0,"input":0,"output":0}}\n' "$seal"
+  if [[ -n "\${FAKE_LEDGER_TOTALS:-}" ]]; then ledger_totals="$FAKE_LEDGER_TOTALS"; else ledger_totals='{"requests":1,"retries":0,"input":0,"output":0,"unended":0}'; fi
+  printf '{"event":"provider_request","seal":"%s","totals":%s}\n' "$seal" "$ledger_totals"
   exit 0
 fi
 if [[ "$1" == "exec" && "\${@: -2:1}" == "cat" ]]; then
@@ -2839,6 +2840,55 @@ exec /usr/bin/git "$@"
     expect(lane("verifier")).toMatchObject({
       installSkipped: false,
       installSkipReason: null,
+    });
+  }, 120_000);
+
+  it("prices a lane from the broker ledger, not from the report the target wrote", async () => {
+    const arranged = await arrange("success");
+    const swarmId = "swarm-ledger-usage";
+    await writeReport(arranged, `${swarmId}-reviewer-1`, answer([finding()]));
+    await writeReport(arranged, `${swarmId}-reviewer-2`, answer([]));
+    await writeReport(
+      arranged,
+      `${swarmId}-verifier`,
+      fenced({
+        verdicts: [
+          {
+            id: "c1",
+            status: "confirmed",
+            evidenceStrength: "static",
+            reason: "the source matches",
+          },
+        ],
+      }),
+    );
+
+    // Every report the harness writes claims `usage: { totalTokens: 7 }`, and
+    // the ledger says something else. The row has to carry the ledger's count:
+    // the report is written by the uid the checkout runs as.
+    const result = await runSwarm(swarmArguments(arranged, swarmId), arranged, {
+      ...arranged.env,
+      FAKE_LEDGER_TOTALS: JSON.stringify({
+        requests: 4,
+        retries: 1,
+        input: 111,
+        output: 222,
+        unended: 1,
+      }),
+    });
+    const receipt = await readReceipt(arranged.out, swarmId);
+    const lane = (receipt["lanes"] as Record<string, unknown>[]).find(
+      (entry) => entry["laneId"] === "reviewer-1",
+    );
+
+    expect(result.code, result.output).toBe(0);
+    expect(lane?.["usage"]).toEqual({
+      requests: 4,
+      retries: 1,
+      inputTokens: 111,
+      outputTokens: 222,
+      denials: 0,
+      unended: 1,
     });
   }, 120_000);
 

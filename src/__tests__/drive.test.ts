@@ -14,6 +14,7 @@ import {
   type LaneBrief,
   observedIsolation,
   observedModelRequests,
+  observedModelUsage,
   promptFailure,
   REPORT_GRACE_MS,
   requestControl,
@@ -127,6 +128,54 @@ describe("local driver lifecycle", () => {
       observedModelRequests(state({ totals: { requests: "0" } })),
     ).toBeNull();
     expect(observedModelRequests(undefined)).toBeNull();
+  });
+
+  it("reads a lane's usage from the control side's session totals", () => {
+    const state = (modelUsage: unknown) => ({
+      runId: "run",
+      observedAt: "2026-09-10T00:00:00.000Z",
+      placementId: null,
+      control: { modelUsage },
+      artifacts: [],
+    });
+
+    expect(
+      observedModelUsage(
+        state({
+          totals: {
+            requests: 2,
+            retries: 0,
+            input: 40,
+            output: 8,
+            unended: 1,
+          },
+        }),
+      ),
+    ).toEqual({
+      requests: 2,
+      retries: 0,
+      inputTokens: 40,
+      outputTokens: 8,
+      unended: 1,
+    });
+    // A session whose responses carried no usage frame has no token count: the
+    // row records that as unobserved rather than as tokens measured at zero.
+    expect(
+      observedModelUsage(
+        state({
+          totals: { requests: 1, retries: 0, input: null, output: null },
+        }),
+      ),
+    ).toEqual({
+      requests: 1,
+      retries: 0,
+      inputTokens: null,
+      outputTokens: null,
+      unended: 0,
+    });
+    expect(observedModelUsage(state({ totals: {} }))).toBeNull();
+    expect(observedModelUsage(state({}))).toBeNull();
+    expect(observedModelUsage(undefined)).toBeNull();
   });
 
   it("carries the escape the control plane reported into the lane receipt", async () => {
