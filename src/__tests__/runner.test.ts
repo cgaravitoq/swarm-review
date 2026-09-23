@@ -1330,6 +1330,7 @@ process.stdin.on("data", (chunk) => {
       new URL("../../container/review-run.sh", import.meta.url),
     );
 
+    const spawnedAt = Date.now();
     const runnerProc = spawn("bash", [runner, root, "--bridge"], {
       env: {
         ...process.env,
@@ -1362,7 +1363,7 @@ process.stdin.on("data", (chunk) => {
     const sockPath = join(root, "rpc.sock");
     await waitForSocket(sockPath);
 
-    return { root, sockPath, runnerProc };
+    return { root, sockPath, runnerProc, spawnedAt };
   };
 
   /** The arguments of the first Pi this run spawned, as it logged them. */
@@ -1503,6 +1504,38 @@ process.stdin.on("data", (chunk) => {
       await new Promise((r) => setTimeout(r, 20));
     }
     throw new Error(`Predicate on ${tracePath} not met after ${timeoutMs}ms`);
+  };
+
+  /**
+   * The seconds the runner's window can have lost by now.
+   *
+   * The bridge counts a window down from the whole second the shell read as the
+   * runner started, so a prompt carries `total - elapsed`. Elapsed cannot be
+   * more than the wall time this test has watched the runner live, which bounds
+   * the number exactly: a loaded host moves the bound with it instead of
+   * printing a number no assertion named.
+   */
+  const elapsedSecondsBound = (spawnedAt: number) =>
+    Math.floor((Date.now() - Math.floor(spawnedAt / 1000) * 1000) / 1000);
+
+  /** The window the runner appended to the first prompt it sent. */
+  const promptWindow = (prompt: string) => {
+    const match =
+      /Budget for this lane: (\d+) model requests and (\d+) seconds\./.exec(
+        prompt,
+      );
+    if (!match) throw new Error(`no budget note in the prompt: ${prompt}`);
+    return { requests: Number(match[1]), seconds: Number(match[2]) };
+  };
+
+  /** The seconds notice the runner sent at a tool boundary, as the model read it. */
+  const secondsNotice = (steers: string) => {
+    const match =
+      /Budget notice from the runner: (\d+) of (\d+) seconds spent\./.exec(
+        steers,
+      );
+    if (!match) throw new Error(`no seconds notice in the steers: ${steers}`);
+    return { spent: Number(match[1]), cap: Number(match[2]) };
   };
 
   const waitForExit = (
@@ -1749,21 +1782,24 @@ process.stdin.on("data", (chunk) => {
     // A lane that reaches a cap is cut without an answer. The notice is what
     // turns "budget spent" into "answer with what you have", so it must reach
     // Pi as a steer at a tool boundary before the request that would cross it.
-    const { root, sockPath, runnerProc } = await prepareSupervisedRun(
-      "budget-requests",
-      "standby",
-      "openai-codex",
-      {
+    const { root, sockPath, runnerProc, spawnedAt } =
+      await prepareSupervisedRun("budget-requests", "standby", "openai-codex", {
         budget: { requests: 4, inputTokens: 1_000_000 },
         totalTimeoutSeconds: 100_000,
-      },
-    );
+      });
     try {
       const statusPath = join(root, "status.json");
       await waitForStandbySettled(statusPath);
       const firstPrompt = await readFile(join(root, "pi-prompt.log"), "utf8");
-      expect(firstPrompt).toMatch(
-        /Budget for this lane: 4 model requests and (100000|99999) seconds\./,
+      const window = promptWindow(firstPrompt);
+      expect(window.requests).toBe(4);
+      // The lane's window is counted down from the runner's own start, so what
+      // the model is told is the total minus the seconds the runner has been
+      // alive: bounded by this test's own watch of it, never by a list of the
+      // numbers a loaded host can print.
+      expect(window.seconds).toBeLessThanOrEqual(100_000);
+      expect(window.seconds).toBeGreaterThanOrEqual(
+        100_000 - elapsedSecondsBound(spawnedAt),
       );
 
       // The standby turn was request 1. Two tool turns more: the notice fires
@@ -1811,15 +1847,11 @@ process.stdin.on("data", (chunk) => {
   it("tells the model to finish when three quarters of its window are gone", async () => {
     // The runner's own start is a whole second and its own startup is not
     // free, so the model is told the three seconds or what that left of them.
-    const { root, sockPath, runnerProc } = await prepareSupervisedRun(
-      "budget-seconds",
-      "standby",
-      "openai-codex",
-      {
+    const { root, sockPath, runnerProc, spawnedAt } =
+      await prepareSupervisedRun("budget-seconds", "standby", "openai-codex", {
         budget: { requests: 1_000, inputTokens: 1_000_000 },
         totalTimeoutSeconds: 3,
-      },
-    );
+      });
     try {
       const statusPath = join(root, "status.json");
       await waitForStandbySettled(statusPath);
@@ -1837,9 +1869,14 @@ process.stdin.on("data", (chunk) => {
           line["type"] === "budget_notice" && line["name"] === "seconds",
       );
       const steers = await readFile(join(root, "pi-steer.log"), "utf8");
-      expect(steers).toMatch(
-        /Budget notice from the runner: \d+ of [123] seconds spent\./,
-      );
+      const notice = secondsNotice(steers);
+      // The notice fires at the first tool boundary where three quarters of the
+      // window are gone, and the window is what the lane had left when it was
+      // briefed. The two numbers are bound to each other and to the wall time
+      // this test has watched, not to the numbers a 3 s window can print.
+      expect(notice.cap).toBeLessThanOrEqual(3);
+      expect(notice.spent).toBeGreaterThanOrEqual(Math.ceil(notice.cap * 0.75));
+      expect(notice.spent).toBeLessThanOrEqual(elapsedSecondsBound(spawnedAt));
 
       await waitForStatus(
         statusPath,
@@ -1896,19 +1933,16 @@ process.stdin.on("data", (chunk) => {
     // prompt, and a briefed lane idles for most of the run before it has one.
     // The 2026-09-15 sandbox lanes were told 355 s of a 508 s window after a
     // 308 s install, so the notice keyed to it never came.
-    const { root, sockPath, runnerProc } = await prepareSupervisedRun(
-      "budget-window-left",
-      null,
-      "openai-codex",
-      {
+    const { root, sockPath, runnerProc, spawnedAt } =
+      await prepareSupervisedRun("budget-window-left", null, "openai-codex", {
         budget: { requests: 1_000, inputTokens: 1_000_000 },
         totalTimeoutSeconds: 5,
-      },
-    );
+      });
     try {
       const statusPath = join(root, "status.json");
       await waitForStatus(statusPath, (s) => s["childIdle"] === true);
-      await new Promise((resolve) => setTimeout(resolve, 2_100));
+      const idleMs = 2_100;
+      await new Promise((resolve) => setTimeout(resolve, idleMs));
       await sendCommand(sockPath, {
         id: "brief",
         type: "prompt",
@@ -1916,8 +1950,15 @@ process.stdin.on("data", (chunk) => {
       });
       await waitForStandbySettled(statusPath);
       const prompt = await readFile(join(root, "pi-prompt.log"), "utf8");
-      expect(prompt).toMatch(
-        /Budget for this lane: 1000 model requests and [123] seconds\./,
+      const window = promptWindow(prompt);
+      expect(window.requests).toBe(1_000);
+      // The lane idled past half of its 5 s window before it was briefed, so
+      // the window it is told is at most what is left of that: the one it
+      // started with is not a window it can be told. The lower bound is the
+      // total minus the seconds this test has watched the runner live.
+      expect(window.seconds).toBeLessThanOrEqual(5 - Math.floor(idleMs / 1000));
+      expect(window.seconds).toBeGreaterThanOrEqual(
+        5 - elapsedSecondsBound(spawnedAt),
       );
 
       await sendCommand(sockPath, { type: "accept" });
