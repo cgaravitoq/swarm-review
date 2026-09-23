@@ -106,6 +106,17 @@ export class ReviewSandbox extends Sandbox<ReviewPiEnv> {
     );
   }
 
+  /** What the proxy checks a request against before it spends a slot on it. */
+  async openModelSession() {
+    const session = await this.ctx.storage.get<ModelSession>(MODEL_SESSION_KEY);
+    if (!session) return null;
+    return {
+      handle: session.handle,
+      caps: session.caps,
+      upstreamBaseUrl: session.upstreamBaseUrl,
+    };
+  }
+
   async clearModelSession() {
     await this.ctx.storage.delete(MODEL_SESSION_KEY);
   }
@@ -263,7 +274,8 @@ export default {
         request,
         url0,
         env.CONTROL_SECRET,
-        async (runId) => getSandbox(env.REVIEW_SANDBOX, runId).modelUsage(),
+        async (runId) =>
+          getSandbox(env.REVIEW_SANDBOX, runId).openModelSession(),
         async (runId) =>
           getSandbox(env.REVIEW_SANDBOX, runId).consumeModelAttempt(),
         async (runId, usage, retryable, seal) =>

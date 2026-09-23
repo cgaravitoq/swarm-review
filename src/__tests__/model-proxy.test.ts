@@ -46,7 +46,11 @@ const sessionConsumer =
 
 const sessionOpener =
   (caps = capsFor()) =>
-  async () => ({ handle: "review-pi-handle", caps });
+  async () => ({
+    handle: "review-pi-handle",
+    caps,
+    upstreamBaseUrl: "https://api.x.ai/v1",
+  });
 
 const proxyTarget = async (runId: string, secret = "control-secret") => {
   const capability = await modelCapability(runId, secret);

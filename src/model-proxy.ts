@@ -288,7 +288,11 @@ export async function proxyModelFetch(
   request: Request,
   url: URL,
   secret: string,
-  open: (runId: string) => Promise<{ handle: string; caps: ModelCaps } | null>,
+  open: (runId: string) => Promise<{
+    handle: string;
+    caps: ModelCaps;
+    upstreamBaseUrl: string;
+  } | null>,
   consume: (
     runId: string,
   ) => Promise<
@@ -322,6 +326,20 @@ export async function proxyModelFetch(
   if (presentedHandle(request) !== opened.handle) {
     return jsonError(401, "handle_rejected");
   }
+  // Every refusal comes before `consume`: a slot spent on a request that is
+  // then refused is an admission no end ever records.
+  let target: URL;
+  try {
+    target = resolveUpstreamTarget(
+      `${rest}${url.search}`,
+      opened.upstreamBaseUrl,
+    );
+  } catch (error) {
+    return jsonError(
+      403,
+      error instanceof Error ? error.message : String(error),
+    );
+  }
   const method = request.method;
   const body =
     method === "GET" || method === "HEAD"
@@ -330,18 +348,6 @@ export async function proxyModelFetch(
   if (body === "max_request_bytes") return jsonError(413, body);
   const consumed = await consume(runId);
   if (!consumed.ok) return jsonError(429, consumed.reason);
-  let target: URL;
-  try {
-    target = resolveUpstreamTarget(
-      `${rest}${url.search}`,
-      consumed.session.upstreamBaseUrl,
-    );
-  } catch (error) {
-    return jsonError(
-      403,
-      error instanceof Error ? error.message : String(error),
-    );
-  }
   const headers = new Headers(request.headers);
   headers.set("authorization", consumed.session.upstreamAuthorization);
   headers.delete("host");

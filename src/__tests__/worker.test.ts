@@ -701,12 +701,12 @@ describe("cloud model session accounting", () => {
     };
   };
 
-  const runningSandbox = async () => {
+  const runningSandbox = async (upstreamBaseUrl = broker.upstreamBaseUrl) => {
     const sandbox = new ReviewSandbox({} as never, env as never);
     Object.assign(sandbox, { ctx: { storage: storage() } });
     await sandbox.putModelSession({
       handle: broker.handle,
-      upstreamBaseUrl: broker.upstreamBaseUrl,
+      upstreamBaseUrl,
       upstreamAuthorization: broker.upstreamAuthorization,
       caps: broker.caps,
       totals: emptyModelTotals(),
@@ -799,6 +799,24 @@ describe("cloud model session accounting", () => {
     expect(upstream).not.toHaveBeenCalled();
     expect(await sandbox.modelUsage()).toMatchObject({
       totals: { requests: 0, retries: 0 },
+    });
+  });
+
+  it("admits nothing for a request it refuses before the upstream", async () => {
+    // The run request only asks for an https prefix, so a base no URL parser
+    // accepts reaches the session. Nothing can be sent there, and a slot spent
+    // before that refusal would be an admission no end ever records.
+    const sandbox = await runningSandbox("https://api.x.ai:99999/v1");
+    getSandbox.mockReturnValue(sandbox);
+    const upstream = vi.fn<typeof fetch>();
+    vi.stubGlobal("fetch", upstream);
+
+    const refused = await postModel("unroutable-run");
+
+    expect(refused.status).toBe(403);
+    expect(upstream).not.toHaveBeenCalled();
+    expect(await sandbox.modelUsage()).toMatchObject({
+      totals: { requests: 0, unended: 0 },
     });
   });
 
