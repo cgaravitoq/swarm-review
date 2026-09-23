@@ -2284,12 +2284,20 @@ async function main() {
         );
       }
 
-      if (!metadata.observedSources) {
+      // A resume restarts the broker and pi with this checkout's staging, so
+      // it holds the image to the host's copies as a fresh start does. Every
+      // other action only reattaches to the lane its metadata recorded, and a
+      // checkout that moved since must not keep an operator from inspecting
+      // or cancelling it.
+      const attachSources = options.resume
+        ? await readImageSources(dirname(runnerPath))
+        : metadata.observedSources;
+      if (!attachSources) {
         throw new Error(
-          `lane metadata for ${metadata.containerName} carries no source fingerprints and cannot be verified for resume`,
+          `lane metadata for ${metadata.containerName} carries no source fingerprints and cannot be verified`,
         );
       }
-      const resumeFingerprint = await docker(
+      const attachFingerprint = await docker(
         [
           "exec",
           metadata.containerName,
@@ -2301,12 +2309,12 @@ async function main() {
         "source fingerprint check",
         controller.signal,
       );
-      const resumeMismatch = firstSourceMismatch(
-        metadata.observedSources,
-        parseSourceFingerprint(resumeFingerprint).sources,
+      const attachMismatch = firstSourceMismatch(
+        attachSources,
+        parseSourceFingerprint(attachFingerprint).sources,
       );
-      if (resumeMismatch) {
-        throw new Error(sourceMismatchDetail(resumeMismatch));
+      if (attachMismatch) {
+        throw new Error(sourceMismatchDetail(attachMismatch));
       }
 
       const containerJobJson = await docker(
