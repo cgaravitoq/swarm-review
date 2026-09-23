@@ -667,7 +667,7 @@ export const brokerCaps = (
   ),
 });
 
-async function main() {
+export async function main() {
   const token = githubToken();
   const secret = process.env.REVIEW_PI_CONTROL_SECRET ?? required("secret");
   const runId = assertRunId(argument("run-id") ?? mintRunId("run"));
