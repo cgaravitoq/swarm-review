@@ -410,7 +410,43 @@ describe("model broker", () => {
       .map((line) => JSON.parse(line))
       .filter((line) => line.totals)
       .at(-1).totals;
-    expect(totals).toMatchObject({ requests: 2, retries: 1 });
+    // The retried attempt ended at its 503, so the only attempts the totals
+    // may call open are ones that never came back.
+    expect(totals).toMatchObject({ requests: 2, retries: 1, unended: 0 });
+  });
+
+  it("ends every attempt a provider it cannot reach turned away", async () => {
+    const unreachable = createServer();
+    const unreachablePort = await listen(unreachable);
+    await close(unreachable);
+    await close(broker);
+    ({ server: broker } = createBrokerServer({
+      port: 0,
+      handle: "review-pi-handle",
+      upstreamBaseUrl: `http://127.0.0.1:${unreachablePort}/v1`,
+      upstreamAuthorization: `Bearer ${CANARY}`,
+      caps,
+      ledgerPath,
+    }));
+    brokerPort = await listen(broker);
+
+    const response = await call();
+
+    expect(response.status).toBe(502);
+    const entries = (await readFile(ledgerPath, "utf8"))
+      .split("\n")
+      .filter(Boolean)
+      .map((line) => JSON.parse(line));
+    // Both refusals are the ends of their admissions, so neither attempt may
+    // read as still in flight.
+    expect(
+      entries
+        .filter((entry) => entry.event === "provider_error")
+        .map((entry) => entry.attemptId),
+    ).toEqual([1, 2]);
+    expect(entries.filter((entry) => entry.totals).at(-1).totals).toMatchObject(
+      { requests: 2, retries: 1, unended: 0 },
+    );
   });
 
   it("refuses a request body past the cap before it reaches the provider", async () => {
