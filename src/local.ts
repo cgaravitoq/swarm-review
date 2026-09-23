@@ -2978,6 +2978,28 @@ async function main() {
             runnerStatus.terminalReason ?? runnerStatus.state;
           break;
         }
+        // The socket exists only once Pi is up. While the runner is still
+        // cloning, installing or checking, its own status file is a
+        // truthful observation of the lane, not a lost one.
+        if (
+          runnerStatus &&
+          !(TERMINAL_RUNNER_STATES as readonly string[]).includes(
+            runnerStatus.state,
+          )
+        ) {
+          status = {
+            runId: options.runId,
+            phase: runnerStatus.phase,
+            state: runnerStatus.state,
+            detail: runnerStatus.detail,
+          };
+          const observed = `${runnerStatus.phase}/${runnerStatus.state}`;
+          if (observed !== reported) {
+            reported = observed;
+            console.log(`${new Date().toISOString()} ${reported}`);
+          }
+          continue;
+        }
         console.warn(`status observation uncertain: ${messageOf(err)}`);
         continue;
       }

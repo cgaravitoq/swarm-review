@@ -1875,6 +1875,33 @@ describe("public local CLI lifecycle", {
     expect(dockerLog).not.toMatch(/--detach.*review-run\.sh/);
   });
 
+  it("reports the runner's phase while the bridge socket is not up yet", async () => {
+    const root = await mkdtemp(join(tmpdir(), "review-pi-cli-"));
+    temporaryDirectories.push(root);
+    const arranged = await arrangeFakeDocker(root);
+    const runId = "preparation-phase";
+    const out = join(root, "out");
+
+    const result = await runLocalCli(localArguments(out, runId), {
+      ...fakeEnvironment(arranged, runId, "success"),
+      FAKE_BRIDGE_FLAKY: "2",
+      FAKE_BRIDGE_STATES: "done",
+      FAKE_PREPARATION_STATUS: JSON.stringify({
+        runId,
+        phase: "install",
+        state: "running",
+        detail: "",
+        process: { alive: true, pid: 50 },
+      }),
+    });
+
+    expect(result.code, result.output).toBe(0);
+    // A socket that does not exist yet is not an uncertain observation: the
+    // runner's own status file says which phase the lane is dying in.
+    expect(result.output).not.toContain("status observation uncertain");
+    expect(result.output).toContain("install/running");
+  });
+
   it("keeps waiting when the bridge is briefly unreachable but the run is alive", async () => {
     const root = await mkdtemp(join(tmpdir(), "review-pi-cli-"));
     temporaryDirectories.push(root);
