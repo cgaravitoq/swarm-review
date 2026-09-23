@@ -1943,6 +1943,111 @@ describe("public local CLI lifecycle", {
     expect(dockerLog).not.toMatch(/--detach.*review-run\.sh/);
   });
 
+  const broker = "/opt/review/model-broker.ts";
+  const olderBroker = "c".repeat(64);
+  const controlAction = (out: string, runId: string, action: string) => [
+    localScript,
+    "--out",
+    out,
+    "--run-id",
+    runId,
+    action,
+  ];
+
+  it("refuses to resume a lane whose checkout moved since it started, and still cancels it", async () => {
+    const root = await mkdtemp(join(tmpdir(), "review-pi-cli-"));
+    temporaryDirectories.push(root);
+    const arranged = await arrangeFakeDocker(root);
+    const runId = "moved-checkout";
+    const out = join(root, "out");
+    const authBlocked = {
+      FAKE_BRIDGE_STATES: "running,blocked",
+      FAKE_TERMINAL_REASON: "auth_blocked",
+    };
+    const started = await runLocalCli(localArguments(out, runId), {
+      ...fakeEnvironment(arranged, runId, "success"),
+      ...authBlocked,
+    });
+    expect(started.code, started.output).toBe(1);
+
+    // The lane started on an image whose broker this checkout has since
+    // replaced: the container, its job and its metadata all name the old one.
+    const metadataPath = join(out, runId, "metadata.json");
+    const metadata = JSON.parse(await readFile(metadataPath, "utf8")) as {
+      expectedSources: Record<string, string>;
+      observedSources: Record<string, string>;
+    };
+    metadata.expectedSources[broker] = olderBroker;
+    metadata.observedSources[broker] = olderBroker;
+    await writeFile(metadataPath, JSON.stringify(metadata));
+    const jobPath = join(arranged.container, "job.json");
+    const job = JSON.parse(await readFile(jobPath, "utf8")) as {
+      expectedSources: Record<string, string>;
+    };
+    job.expectedSources[broker] = olderBroker;
+    await writeFile(jobPath, JSON.stringify(job));
+    const environment = {
+      ...fakeEnvironment(arranged, runId, "success"),
+      ...authBlocked,
+      FAKE_IMAGE_SOURCES: JSON.stringify({
+        ...imageSources,
+        [broker]: olderBroker,
+      }),
+    };
+    const dockerLog = join(arranged.state, "docker.log");
+    const beforeResume = (await readFile(dockerLog, "utf8")).length;
+
+    const resumed = await runLocalCli(
+      controlAction(out, runId, "--resume"),
+      environment,
+    );
+
+    expect(resumed.code, resumed.output).toBe(1);
+    expect(resumed.output).toContain(
+      `image source ${broker} differs from the host's copy: expected ${imageSources[broker]}, observed ${olderBroker}`,
+    );
+    // Refused before the broker or pi was restarted with this checkout's staging.
+    const resumeLog = (await readFile(dockerLog, "utf8")).slice(beforeResume);
+    expect(resumeLog).not.toContain("--full model-broker.ts");
+    expect(existsSync(join(arranged.state, "restarted"))).toBe(false);
+
+    const cancelled = await runLocalCli(
+      controlAction(out, runId, "--cancel"),
+      environment,
+    );
+    expect(cancelled.code, cancelled.output).toBe(0);
+    expect(existsSync(join(arranged.state, "cancelled"))).toBe(true);
+  });
+
+  it("refuses to reattach to a container that no longer holds what its lane started with", async () => {
+    const root = await mkdtemp(join(tmpdir(), "review-pi-cli-"));
+    temporaryDirectories.push(root);
+    const arranged = await arrangeFakeDocker(root);
+    const runId = "drifted-container";
+    const out = join(root, "out");
+    const kept = await runLocalCli(
+      [...localArguments(out, runId), "--keep"],
+      fakeEnvironment(arranged, runId, "success"),
+    );
+    expect(kept.code, kept.output).toBe(0);
+
+    const inspected = await runLocalCli(
+      controlAction(out, runId, "--inspect"),
+      {
+        ...fakeEnvironment(arranged, runId, "success"),
+        FAKE_IMAGE_SOURCES: JSON.stringify({
+          ...imageSources,
+          [broker]: olderBroker,
+        }),
+      },
+    );
+
+    expect(inspected.code, inspected.output).toBe(1);
+    expect(inspected.output).toContain(
+      `image source ${broker} differs from the host's copy: expected ${imageSources[broker]}, observed ${olderBroker}`,
+    );
+  });
+
   it("reports the runner's phase while the bridge socket is not up yet", async () => {
     const root = await mkdtemp(join(tmpdir(), "review-pi-cli-"));
     temporaryDirectories.push(root);
