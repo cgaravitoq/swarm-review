@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -12,6 +13,7 @@ import {
   FINALIZE_REPORT_MARGIN_MS,
   FINALIZE_REQUEST_RESERVE,
   type LaneBrief,
+  main,
   observedIsolation,
   observedModelRequests,
   promptFailure,
@@ -1153,6 +1155,87 @@ describe("local driver lifecycle", () => {
     expect(parseCloudRunRequest(payload).job.targetEnv).toEqual({
       CLOUDFLARE_ACCOUNT_ID: "0630089e",
     });
+  });
+});
+
+describe("cloud driver entry", () => {
+  it("hands the Worker the host's hash of every image source", async () => {
+    const containerDir = join(import.meta.dirname, "..", "..", "container");
+    const hostSources = Object.fromEntries(
+      await Promise.all(
+        Object.entries(IMAGE_SOURCES).map(async ([path, name]) => [
+          path,
+          createHash("sha256")
+            .update(await readFile(join(containerDir, name)))
+            .digest("hex"),
+        ]),
+      ),
+    );
+    const out = await mkdtemp(join(tmpdir(), "review-pi-drive-"));
+    const runId = "drive-sources";
+    const started: { job: Record<string, unknown> }[] = [];
+    vi.stubEnv("GITHUB_TOKEN", "github-token");
+    vi.stubEnv("REVIEW_PI_CONTROL_SECRET", "control-secret");
+    vi.stubEnv("OPENCODE_API_KEY", "opencode-key");
+    vi.stubGlobal(
+      "fetch",
+      vi.fn((input: string, init?: RequestInit) => {
+        if (
+          input.startsWith("https://api.github.com/repos/acme/demo/commits/")
+        ) {
+          return Promise.resolve(
+            Response.json({ sha: input.split("/").pop() }),
+          );
+        }
+        if (input === "https://review.invalid/runs") {
+          started.push(JSON.parse(String(init?.body)));
+          return Promise.resolve(
+            Response.json({ error: "source_mismatch" }, { status: 409 }),
+          );
+        }
+        if (input === `https://review.invalid/runs/${runId}/stop`) {
+          return Promise.resolve(
+            Response.json({
+              artifacts: [],
+              shutdown: { destroy: { acknowledged: true } },
+            }),
+          );
+        }
+        return Promise.reject(new Error(`unexpected request to ${input}`));
+      }),
+    );
+    const argv = process.argv;
+    process.argv = [
+      "bun",
+      "drive.ts",
+      "--run-id",
+      runId,
+      "--out",
+      out,
+      "--worker",
+      "https://review.invalid",
+      "--repo",
+      "acme/demo",
+      "--head",
+      "a".repeat(40),
+      "--base",
+      "c".repeat(40),
+      "--provider",
+      "opencode-go",
+      "--model",
+      "deepseek-v4.1-flash",
+      "--canary",
+    ];
+    try {
+      await expect(main()).rejects.toThrow("control /runs: 409");
+    } finally {
+      process.argv = argv;
+      vi.unstubAllEnvs();
+      await rm(out, { recursive: true, force: true });
+    }
+
+    expect(started).toHaveLength(1);
+    expect(started[0]?.job["expectedSources"]).toEqual(hostSources);
   });
 });
 
