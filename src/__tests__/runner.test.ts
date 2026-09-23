@@ -1115,6 +1115,13 @@ process.stdin.on("data", (chunk) => {
           toolName: "bash",
           args: { command: "check.sh" },
         }) + "\\n");
+        process.stdout.write(JSON.stringify({
+          type: "tool_execution_update",
+          toolCallId: "call_tool_1",
+          toolName: "bash",
+          args: { command: "check.sh" },
+          partialResult: { content: [{ type: "text", text: "partial output" }] },
+        }) + "\\n");
 
         setTimeout(() => {
           process.stdout.write(JSON.stringify({
@@ -1715,6 +1722,14 @@ process.stdin.on("data", (chunk) => {
         toolName: "bash",
         isError: false,
       });
+      // A partial tool result is an event pi documents; recording it as a
+      // protocol error would leave a healthy lane's receipt saying the
+      // stream broke when it did not.
+      const toolStatus = JSON.parse(
+        await readFile(statusPath, "utf8"),
+      ) as Record<string, unknown>;
+      expect(toolStatus["detail"]).toBe("");
+      expect(toolStatus["lastEvent"]).toBe("agent_settled");
 
       await sendCommand(sockPath, { type: "accept" });
       await waitForExit(runnerProc);

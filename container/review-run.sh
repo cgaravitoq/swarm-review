@@ -680,7 +680,7 @@ function handlePiEvent(child, rawLine) {
     return;
   }
 
-  if (["agent_start", "turn_start", "message_start", "message_update", "message_end"].includes(event.type)) {
+  if (["agent_start", "turn_start", "message_start", "message_update", "message_end", "tool_execution_update"].includes(event.type)) {
     lastEvent = event.type;
     childIdle = false;
     isStreaming = true;
