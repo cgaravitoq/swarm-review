@@ -312,6 +312,16 @@ export const observedIsolation = (started: RunStart | undefined) =>
       }
     : null;
 
+/** What the control plane observed about a lane, as its receipt records it. */
+export const observedControl = (
+  started: RunStart | undefined,
+  state: RunState | undefined,
+) => ({
+  isolation: observedIsolation(started),
+  modelRequests: observedModelRequests(state),
+  usage: observedModelUsage(state),
+});
+
 const statusRecord = (state: RunState) =>
   asRecord(parseJson(artifactOf(state, "status.json")?.content));
 
@@ -1031,9 +1041,7 @@ async function main() {
     placementId: started?.placementId ?? state?.placementId ?? null,
     processId: started?.processId ?? null,
     container: started?.container ?? null,
-    isolation: observedIsolation(started),
-    modelRequests: observedModelRequests(state),
-    usage: observedModelUsage(state),
+    ...observedControl(started, state),
     finalize,
     runError: lifecycle.runError ? messageOf(lifecycle.runError) : null,
     shutdown: {
