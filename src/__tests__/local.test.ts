@@ -286,6 +286,9 @@ if [[ "$1" == "cp" ]]; then
     /bin/cp "$2" "$root/job.json"
     /bin/cp "$2" "$root/copied-job.json"
   fi
+  if [[ "$3" == *"/review-run.sh" ]]; then
+    touch "$state/runner-uploaded"
+  fi
   exit 0
 fi
 if [[ "$joined" == *"rm --force "* && ("$joined" == *"/auth.json"* || "$joined" == *"/broker.json"*) ]]; then
@@ -318,7 +321,11 @@ if [[ "$joined" == *" mkdir -p "* || "$joined" == *" chmod "* || "$joined" == *"
   exit 0
 fi
 if [[ "$joined" == *" sha256sum "* ]]; then
-  jq -r 'to_entries[] | "\\(.value)  \\(.key)"' <<< "\${FAKE_IMAGE_SOURCES:?}"
+  sources="\${FAKE_IMAGE_SOURCES:?}"
+  if [[ -f "$state/runner-uploaded" ]]; then
+    sources=$(jq --arg p "/opt/review/review-run.sh" --arg s "\${FAKE_RUNNER_SHA:?}" '.[$p]=$s' <<< "$sources")
+  fi
+  jq -r 'to_entries[] | "\\(.value)  \\(.key)"' <<< "$sources"
   exit 0
 fi
 if [[ "$joined" == *" --detach "* ]]; then
@@ -1380,6 +1387,7 @@ describe("public local CLI lifecycle", {
     FAKE_RUN_ID: runId,
     FAKE_MODE: mode,
     FAKE_IMAGE_SOURCES: JSON.stringify(imageSources),
+    FAKE_RUNNER_SHA: imageSources["/opt/review/review-run.sh"],
     FAKE_HEAD_SHA: revision("%H"),
     FAKE_BASE_SHA: revision("%H"),
     WORKERS_AI_API_KEY: "public-cli-secret",
@@ -1868,6 +1876,36 @@ describe("public local CLI lifecycle", {
       /^image source \/opt\/review\/model-broker\.ts differs/,
     );
     // Refused before any model request: the review process was never started.
+    const dockerLog = await readFile(
+      join(arranged.state, "docker.log"),
+      "utf8",
+    );
+    expect(dockerLog).not.toMatch(/--detach.*review-run\.sh/);
+  });
+
+  it("refuses an image whose own runner copy differs before the upload replaces it", async () => {
+    const root = await mkdtemp(join(tmpdir(), "review-pi-cli-"));
+    temporaryDirectories.push(root);
+    const arranged = await arrangeFakeDocker(root);
+    const runId = "stale-runner-image";
+    const out = join(root, "out");
+
+    const result = await runLocalCli(localArguments(out, runId), {
+      ...fakeEnvironment(arranged, runId, "success"),
+      FAKE_IMAGE_SOURCES: JSON.stringify({
+        ...imageSources,
+        "/opt/review/review-run.sh": "c".repeat(64),
+      }),
+    });
+
+    expect(result.code, result.output).toBe(1);
+    const receipt = JSON.parse(
+      await readFile(join(out, runId, "local-receipt.json"), "utf8"),
+    ) as Record<string, unknown>;
+    expect(receipt["outcome"]).toBe("failed");
+    expect(receipt["error"]).toMatch(
+      /^image source \/opt\/review\/review-run\.sh differs/,
+    );
     const dockerLog = await readFile(
       join(arranged.state, "docker.log"),
       "utf8",

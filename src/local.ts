@@ -2818,6 +2818,23 @@ async function main() {
         "job upload",
         controller.signal,
       );
+      // The image's own runner is judged before the driver's copy of the
+      // host's replaces it: an upload would otherwise erase the one source
+      // whose staleness this gate exists to catch.
+      const fingerprint = await docker(
+        ["exec", containerName, "sh", "-c", sourceFingerprintCommand()],
+        budget,
+        "source fingerprint",
+        controller.signal,
+      );
+      const observedSources = parseSourceFingerprint(fingerprint).sources;
+      const mismatch = firstSourceMismatch(expectedSources, observedSources);
+      if (mismatch) {
+        throw new Error(sourceMismatchDetail(mismatch));
+      }
+      // The gate just proved the image's runner hash and the host's are the
+      // same value, so the upload below replaces it with identical bytes.
+      containerRunnerSha = observedSources[REVIEW_RUNNER] ?? null;
       await docker(
         ["cp", runnerPath, `${containerName}:${REVIEW_RUNNER}`],
         budget,
@@ -2853,19 +2870,6 @@ async function main() {
         "run directory ownership",
         controller.signal,
       );
-
-      const fingerprint = await docker(
-        ["exec", containerName, "sh", "-c", sourceFingerprintCommand()],
-        budget,
-        "source fingerprint",
-        controller.signal,
-      );
-      const observedSources = parseSourceFingerprint(fingerprint).sources;
-      const mismatch = firstSourceMismatch(expectedSources, observedSources);
-      if (mismatch) {
-        throw new Error(sourceMismatchDetail(mismatch));
-      }
-      containerRunnerSha = observedSources[REVIEW_RUNNER] ?? null;
 
       const metadata: RunMetadata = {
         runId: options.runId,
