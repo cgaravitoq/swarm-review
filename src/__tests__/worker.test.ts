@@ -524,6 +524,45 @@ describe("review run lifecycle", () => {
     expect(write).not.toHaveBeenCalled();
   });
 
+  it("refuses an image built from another Dockerfile before any model request", async () => {
+    const exec = vi.fn((command: string) =>
+      command.includes("sha256sum")
+        ? Promise.resolve({
+            stdout: fingerprintStdout({
+              "/opt/review/Dockerfile": "c".repeat(64),
+            }),
+          })
+        : Promise.resolve({ stdout: "" }),
+    );
+    const putModelSession = vi.fn(() => Promise.resolve());
+    const startProcess = vi.fn(() => Promise.resolve({ id: "review" }));
+    getSandbox.mockReturnValue({
+      exec,
+      startProcess,
+      putModelSession,
+      destroy: vi.fn(() => Promise.resolve()),
+    });
+
+    const response = await handler.fetch(
+      authorized("https://review.invalid/runs", {
+        method: "POST",
+        body: startBody(),
+      }),
+      env,
+    );
+
+    expect(response.status).toBe(409);
+    expect(await response.json()).toMatchObject({
+      error: "source_mismatch",
+      file: "/opt/review/Dockerfile",
+      expected: sha64,
+      observed: "c".repeat(64),
+    });
+    expect(exec.mock.calls[0]?.[0]).toContain("/opt/review/Dockerfile");
+    expect(putModelSession).not.toHaveBeenCalled();
+    expect(startProcess).not.toHaveBeenCalled();
+  });
+
   it("destroys on explicit stop when artifact retrieval fails", async () => {
     const destroy = vi.fn(() => Promise.resolve());
     const clearModelSession = vi.fn(() => Promise.resolve());
@@ -742,6 +781,35 @@ describe("deployed container image", () => {
       ["response-seal.ts", "/opt/review/response-seal.ts"],
       ["Dockerfile", "/opt/review/Dockerfile"],
     ]);
+  });
+
+  it("compares every file the image is built from, the Dockerfile included", () => {
+    const tracked = spawnSync("git", ["ls-files", "container"], {
+      cwd: packageRoot,
+      encoding: "utf8",
+    })
+      .stdout.split("\n")
+      .filter(Boolean)
+      .map((file) => path.relative("container", file));
+
+    expect(tracked.sort()).toEqual(Object.values(IMAGE_SOURCES).sort());
+  });
+
+  it("pins what the image installs in the Dockerfile's own bytes", async () => {
+    const dockerfile = await readFile(
+      path.join(packageRoot, "container", "Dockerfile"),
+      "utf8",
+    );
+    const manifest = JSON.parse(
+      await readFile(path.join(packageRoot, "package.json"), "utf8"),
+    ) as { dependencies: Record<string, string> };
+
+    // A build argument would move pi, bun or the base without moving the
+    // bytes the gate compares.
+    expect(dockerfile).not.toMatch(/^\s*ARG\s/m);
+    expect(dockerfile).toContain(
+      `FROM docker.io/cloudflare/sandbox:${manifest.dependencies["@cloudflare/sandbox"]} AS bun`,
+    );
   });
 
   it("keeps the generated bake context out of git", () => {

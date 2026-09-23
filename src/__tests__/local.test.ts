@@ -1913,6 +1913,36 @@ describe("public local CLI lifecycle", {
     expect(dockerLog).not.toMatch(/--detach.*review-run\.sh/);
   });
 
+  it("refuses an image built from another Dockerfile before the review ever starts", async () => {
+    // Every copied source agrees; only the recipe that pins pi, bun and the
+    // extension does not, which is how an image with an older pi looks.
+    const root = await mkdtemp(join(tmpdir(), "review-pi-cli-"));
+    temporaryDirectories.push(root);
+    const arranged = await arrangeFakeDocker(root);
+    const runId = "stale-recipe-image";
+    const out = join(root, "out");
+
+    const result = await runLocalCli(localArguments(out, runId), {
+      ...fakeEnvironment(arranged, runId, "success"),
+      FAKE_IMAGE_SOURCES: JSON.stringify({
+        ...imageSources,
+        "/opt/review/Dockerfile": "c".repeat(64),
+      }),
+    });
+
+    expect(result.code, result.output).toBe(1);
+    const receipt = await readLocalReceipt(join(out, runId));
+    expect(receipt.error).toBe(
+      `image source /opt/review/Dockerfile differs from the host's copy: expected ${imageSources["/opt/review/Dockerfile"]}, observed ${"c".repeat(64)}`,
+    );
+    const dockerLog = await readFile(
+      join(arranged.state, "docker.log"),
+      "utf8",
+    );
+    expect(dockerLog).toMatch(/for f in [^;]*\/opt\/review\/Dockerfile;/);
+    expect(dockerLog).not.toMatch(/--detach.*review-run\.sh/);
+  });
+
   it("reports the runner's phase while the bridge socket is not up yet", async () => {
     const root = await mkdtemp(join(tmpdir(), "review-pi-cli-"));
     temporaryDirectories.push(root);
