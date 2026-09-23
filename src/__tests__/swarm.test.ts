@@ -2892,6 +2892,38 @@ exec /usr/bin/git "$@"
     });
   }, 120_000);
 
+  it("keeps an unattested report's install out of the lane row", async () => {
+    const arranged = await arrange("success");
+    const swarmId = "swarm-forged-install";
+    await writeReport(arranged, `${swarmId}-reviewer-1`, answer([finding()]), {
+      status: "skipped",
+      manifest: null,
+      reason: "the checkout root has no package.json",
+    });
+    await writeReport(arranged, `${swarmId}-reviewer-2`, answer([]));
+    // The answer is swapped after the model gave it, so no control-side seal
+    // matches the report and the install reason in it is the target's word.
+    await forgeReport(arranged, `${swarmId}-reviewer-1`, {
+      finalText: answer([]),
+    });
+
+    await runSwarm(swarmArguments(arranged, swarmId), arranged);
+    const receipt = await readReceipt(arranged.out, swarmId);
+    const lane = (receipt["lanes"] as Record<string, unknown>[]).find(
+      (entry) => entry["laneId"] === "reviewer-1",
+    );
+
+    expect(lane).toMatchObject({
+      status: "malformed",
+      reportCompletion: "unattested",
+      installSkipped: null,
+      installSkipReason: null,
+    });
+    expect(JSON.stringify(receipt)).not.toContain(
+      "the checkout root has no package.json",
+    );
+  }, 120_000);
+
   it("tells a warm sandbox verifier with nothing to rule on to stand down and removes it", async () => {
     const arranged = await arrange("success");
     const swarmId = "swarm-warm-idle";

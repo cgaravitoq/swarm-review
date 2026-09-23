@@ -2033,6 +2033,29 @@ const reportCompletion = (report: Awaited<ReturnType<typeof laneReport>>) =>
         : "complete";
 
 /**
+ * The lane fields only the runner's own report carries.
+ *
+ * `report.json` is written by the uid the reviewed repository executes as, so
+ * an unattested report contributes none of them: the row records the install as
+ * unobserved rather than repeating a value no control-side record confirms.
+ * Pi's version and the install stay target-written until the isolation wave
+ * moves the runner, and this is where that word stops being the target's.
+ */
+const attestedReportFields = (
+  report: Awaited<ReturnType<typeof laneReport>>,
+  receipt: {
+    installSkipped: boolean | null;
+    installSkipReason: string | null;
+  } | null,
+) =>
+  report?.attested
+    ? {
+        installSkipped: receipt?.installSkipped ?? null,
+        installSkipReason: receipt?.installSkipReason ?? null,
+      }
+    : { installSkipped: null, installSkipReason: null };
+
+/**
  * What the driver wrote about the finalize it sent, or null when it sent none.
  *
  * A lane cut by its request cap leaves this behind: the driver spends one
@@ -2790,8 +2813,7 @@ async function main() {
           (options.fast ? "low" : "high"),
         reasoning: fastUpstream ? packedLaneReasoning(options, laneId) : null,
         usage: receipt?.usage ?? null,
-        installSkipped: receipt?.installSkipped ?? null,
-        installSkipReason: receipt?.installSkipReason ?? null,
+        ...attestedReportFields(report, receipt),
         wallSeconds: receipt?.wallSeconds ?? null,
         teardownSeconds: receipt?.teardownSeconds ?? null,
         truncatedArtifacts: receipt?.truncatedArtifacts ?? [],
@@ -3081,8 +3103,7 @@ async function main() {
           receipt?.model ?? verifierLaneConfig.model ?? options.model ?? null,
         thinking: verifierLaneConfig.thinking ?? options.thinking ?? "low",
         usage: receipt?.usage ?? null,
-        installSkipped: receipt?.installSkipped ?? null,
-        installSkipReason: receipt?.installSkipReason ?? null,
+        ...attestedReportFields(report, receipt),
         wallSeconds: receipt?.wallSeconds ?? null,
         teardownSeconds: receipt?.teardownSeconds ?? null,
         truncatedArtifacts: receipt?.truncatedArtifacts ?? [],
@@ -3523,8 +3544,7 @@ async function main() {
         options.thinking ??
         (options.fast ? "low" : "high"),
       usage: verifierEvidence.receipt?.usage ?? null,
-      installSkipped: verifierEvidence.receipt?.installSkipped ?? null,
-      installSkipReason: verifierEvidence.receipt?.installSkipReason ?? null,
+      ...attestedReportFields(verifierReport, verifierEvidence.receipt),
       wallSeconds: verifierEvidence.receipt?.wallSeconds ?? null,
       teardownSeconds: verifierEvidence.receipt?.teardownSeconds ?? null,
       truncatedArtifacts: verifierEvidence.receipt?.truncatedArtifacts ?? [],
