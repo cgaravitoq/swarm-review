@@ -1976,9 +1976,10 @@ exec /bin/date "$@"
 
   it("tells the model to finish when three quarters of its window are gone", async () => {
     // The runner's clock started a second before its bridge, so the lane is
-    // told four of its five seconds, or less on a startup slower than a
-    // second, and the notice is measured against the window it was told
-    // rather than the one it started with.
+    // told nineteen of its twenty seconds, or less on a slower startup, and the
+    // notice is measured against the window it was told rather than the one it
+    // started with. A loaded host's startup has spent five seconds before
+    // the briefing, so the window leaves it room to brief the lane in time.
     const { root, sockPath, runnerProc, startedAt } =
       await prepareSupervisedRun(
         "budget-seconds",
@@ -1986,7 +1987,7 @@ exec /bin/date "$@"
         "openai-codex",
         {
           budget: { requests: 1_000, inputTokens: 1_000_000 },
-          totalTimeoutSeconds: 5,
+          totalTimeoutSeconds: 20,
         },
         {},
         1,
@@ -1999,14 +2000,14 @@ exec /bin/date "$@"
       );
       const briefedAfter = await piReadAt(root, "get_state");
       const briefedBefore = await piReadAt(root, "prompt");
-      const briefed = windowBetween(5, startedAt, briefedAfter, briefedBefore);
+      const briefed = windowBetween(20, startedAt, briefedAfter, briefedBefore);
       expect(window.seconds).toBeLessThanOrEqual(briefed.most);
       expect(window.seconds).toBeGreaterThanOrEqual(briefed.least);
       // A startup that spent the whole window leaves no notice to send.
       expect(window.seconds).toBeGreaterThan(0);
       // The tool turn starts once three quarters of that window are gone by
-      // Pi's clock, which is late enough for the notice and, for a four
-      // second window, too early for one that waited for all of it.
+      // Pi's clock, which is late enough for the notice and, for a window of
+      // four seconds or more, too early for one that waited for all of it.
       const threeQuarters =
         briefedBefore + Math.ceil(window.seconds * 0.75) * 1000 + 100;
       await new Promise((resolve) =>
