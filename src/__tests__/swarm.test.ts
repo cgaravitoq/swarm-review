@@ -5427,6 +5427,41 @@ await writeFile(
       expect(receipt["status"]).toBe("completed");
     }, 180_000);
 
+    it("reads a side one of a packed lane's two answers never reported as unobserved", async () => {
+      const arranged = await arrange("success");
+      const swarmId = "swarm-packed-retry-usage";
+      let reviewerAnswers = 0;
+      const provider = await fakeProvider((prompt) => {
+        if (isVerifierPrompt(prompt)) return completion(answer([]));
+        if (!prompt.includes(CANARY_PROMPT)) {
+          reviewerAnswers += 1;
+          if (reviewerAnswers === 1) {
+            return completion(
+              '```json\n{"status": "complete", "findings": [{"severity": "P2"\n```',
+              { usage: { completion_tokens: 22 } },
+            );
+          }
+        }
+        return completion(answer([]));
+      });
+      await pointUpstream(arranged, {
+        "https://api.x.ai/v1": provider.baseUrl,
+      });
+
+      const result = await runSwarm(
+        packedArguments(arranged, swarmId, ["--reviewers", "1"]),
+        arranged,
+      );
+      const lane = reviewerRows(await readReceipt(arranged.out, swarmId))[0];
+
+      // Both answers were paid for, and only one of them said what its input
+      // cost, so a sum of the one would read as the lane's whole input.
+      expect(result.code, result.output).toBe(0);
+      expect(reviewerAnswers).toBe(2);
+      expect(lane?.["relaunch"]).toMatchObject({ attempts: 1 });
+      expect(lane?.["usage"]).toEqual({ inputTokens: null, outputTokens: 44 });
+    }, 180_000);
+
     it("asks a lane once more when the ceiling cut it while still thinking in text", async () => {
       const arranged = await arrange("success");
       const swarmId = "swarm-packed-retry-thinking";

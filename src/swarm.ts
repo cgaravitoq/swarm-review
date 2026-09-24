@@ -33,6 +33,7 @@ import {
   writeTerminalReceipt,
 } from "./attempt";
 import {
+  addPackedUsage,
   canaryModels,
   completeOnce,
   FAST_REASONING_LEVELS,
@@ -2595,7 +2596,7 @@ async function main() {
                     reasoning: packedLaneReasoning(options, laneId),
                   });
                 let answer = await ask();
-                let usage: Record<string, number> = answer.usage;
+                let usage = answer.usage;
                 // A packed model that answers with JSON it cannot close is asked
                 // once more: the second answer is a fresh sample, not a replay,
                 // and one more request is cheaper than a lane the run must do
@@ -2614,13 +2615,7 @@ async function main() {
                   relaunchAttempts += 1;
                   const spent = usage;
                   answer = await ask();
-                  const second: Record<string, number> = answer.usage;
-                  usage = Object.fromEntries(
-                    Object.keys({ ...spent, ...second }).map((key) => [
-                      key,
-                      (spent[key] ?? 0) + (second[key] ?? 0),
-                    ]),
-                  );
+                  usage = addPackedUsage(spent, answer.usage);
                 }
                 finishReason = answer.finishReason;
                 await writeFastLaneArtifacts({

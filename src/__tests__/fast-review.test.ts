@@ -135,7 +135,49 @@ describe("completeOnce", () => {
       prompt: "review",
     });
 
-    expect(answer.usage).toStrictEqual({ outputTokens: 34 });
+    // A dropped field reads as nothing to a reader that sums the row.
+    expect(answer.usage).toStrictEqual({ inputTokens: null, outputTokens: 34 });
+  });
+
+  it("records the spend of an answer that reported none as unobserved", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn<typeof fetch>(() =>
+        Promise.resolve(
+          new Response(
+            JSON.stringify({
+              choices: [{ message: { content: "{}" }, finish_reason: "stop" }],
+            }),
+            { status: 200 },
+          ),
+        ),
+      ),
+    );
+    const artifactDir = await mkdtemp(join(tmpdir(), "review-pi-receipt-"));
+
+    const answer = await completeOnce({
+      baseUrl: "https://provider.invalid/v1",
+      bearer: "token",
+      model: "grok-4.6",
+      prompt: "review",
+    });
+    await writeFastLaneArtifacts({
+      artifactDir,
+      runId: "run-1",
+      attemptId: "attempt-1",
+      provider: "grok",
+      model: "grok-4.6",
+      finalText: answer.content,
+      wallSeconds: 7,
+      usage: answer.usage,
+    });
+
+    // The answer came back and its spend never did: an empty record in the
+    // row would read as a lane that was measured and spent nothing.
+    await expect(readLaneReceipt(artifactDir)).resolves.toMatchObject({
+      usage: null,
+    });
+    await rm(artifactDir, { recursive: true, force: true });
   });
 
   it("reads the spend out of an answer the gateway pretty-printed", async () => {
