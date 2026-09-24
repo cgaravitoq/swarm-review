@@ -43,6 +43,7 @@ import {
   type ModelCanary,
   writeFastLaneArtifacts,
 } from "./fast-review";
+import { laneImageReference } from "./image-tag";
 import { BROKER_LEDGER } from "./isolation";
 import {
   assertRunId,
@@ -2142,6 +2143,20 @@ async function main() {
   // and objects are read out of. Both are required before anything is paid for.
   const repo = requiredRepo(options.repo);
   const sourceRepo = requiredSource(options.source);
+  if (options.sandbox) {
+    const containerDir = join(
+      dirname(fileURLToPath(import.meta.url)),
+      "..",
+      "container",
+    );
+    options.image = await laneImageReference(
+      repo,
+      options.image,
+      DEFAULT_SWARM_IMAGE,
+      containerDir,
+      join(containerDir, "context", "bun.lock"),
+    );
+  }
   const suiteDir = resolve(options.outDir, options.swarmId);
   await mkdir(options.outDir, { recursive: true });
   await mkdir(suiteDir);

@@ -35,6 +35,7 @@ import {
   parseEnvironmentProbe,
 } from "./admission";
 import { writeAtomic } from "./attempt";
+import { laneImageReference } from "./image-tag";
 import {
   BROKER_PORT,
   CONTROL_DIR,
@@ -2024,6 +2025,16 @@ async function main() {
     "container",
     "review-run.sh",
   );
+  if (!isControlAction) {
+    const containerDir = dirname(runnerPath);
+    options.image = await laneImageReference(
+      repo,
+      options.image,
+      DEFAULT_IMAGE,
+      containerDir,
+      join(containerDir, "context", "bun.lock"),
+    );
+  }
   const controller = new AbortController();
   let interrupted = false;
   const onSignal = () => {

@@ -3,6 +3,7 @@ import { cp, glob, mkdir, rm, stat } from "node:fs/promises";
 import { dirname, join, relative, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import ts from "typescript";
+import { imageReference, imageTagFromFiles } from "../src/image-tag";
 
 const packageRoot = join(dirname(fileURLToPath(import.meta.url)), "..");
 const contextDir = join(packageRoot, "container", "context");
@@ -62,8 +63,38 @@ export const targetCheckout = (argv: string[]) => {
  */
 export const deployArguments = (argv: string[]) => {
   const flag = argv.indexOf("--target");
-  return flag === -1 ? argv : [...argv.slice(0, flag), ...argv.slice(flag + 2)];
+  const remaining =
+    flag === -1 ? argv : [...argv.slice(0, flag), ...argv.slice(flag + 2)];
+  const repo = remaining.indexOf("--repo");
+  const withoutRepo =
+    repo === -1
+      ? remaining
+      : [...remaining.slice(0, repo), ...remaining.slice(repo + 2)];
+  return withoutRepo.filter((argument) => argument !== "--image-only");
 };
+
+export const imageBuildArguments = (reference: string) => [
+  "build",
+  "--platform",
+  "linux/amd64",
+  "-t",
+  reference,
+  join(packageRoot, "container"),
+];
+
+const dockerBuild = (reference: string) =>
+  new Promise<void>((resolvePromise, reject) => {
+    const child = spawn("docker", imageBuildArguments(reference), {
+      cwd: packageRoot,
+      stdio: "inherit",
+    });
+    child.on("error", reject);
+    child.on("close", (code) =>
+      code === 0
+        ? resolvePromise()
+        : reject(new Error(`docker build exited with code ${code}`)),
+    );
+  });
 
 const materialize = async (checkout: string) => {
   for (const name of ["package.json", "bun.lock"]) {
@@ -155,6 +186,20 @@ const main = async () => {
   console.log(
     `bake context ${relative(packageRoot, contextDir)} <- ${checkout} (${manifests} manifests)`,
   );
+
+  if (process.argv.includes("--image-only")) {
+    const repoIndex = process.argv.indexOf("--repo");
+    const repository = process.argv[repoIndex + 1];
+    if (!repository) throw new Error("--image-only requires --repo owner/repo");
+    const tag = await imageTagFromFiles(
+      join(packageRoot, "container"),
+      join(contextDir, "bun.lock"),
+    );
+    const reference = imageReference(repository, tag);
+    await dockerBuild(reference);
+    console.log(`image: ${reference}`);
+    return;
+  }
 
   const deployed = await wrangler(
     ["deploy", ...deployArguments(process.argv.slice(2))],
