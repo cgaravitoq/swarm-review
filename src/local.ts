@@ -2046,6 +2046,9 @@ async function main() {
   // evidence, and an auth-blocked one is kept because it is the one kind of
   // end a resume can pick up.
   let runnerTerminalReason: string | null = null;
+  // The state the runner said the lane ended in, whichever poll heard it: the
+  // receipt's outcome is read from this, never from the error's wording.
+  let runnerEnding: string | null = null;
   const containerDisposable = () =>
     options.cancel ||
     finalAccepted ||
@@ -3018,6 +3021,7 @@ async function main() {
           runError = `run ${runnerStatus.state} at ${runnerStatus.phase}: ${runnerStatus.terminalReason ?? (runnerStatus.detail || "no reason recorded")}`;
           runnerTerminalReason =
             runnerStatus.terminalReason ?? runnerStatus.state;
+          runnerEnding = runnerStatus.state;
           break;
         }
         // The socket exists only once Pi is up. While the runner is still
@@ -3072,8 +3076,10 @@ async function main() {
       }
 
       if (curState === "cancelled") {
-        runError = "cancelled";
-        runnerTerminalReason = String(data["terminalReason"] ?? "cancelled");
+        const reason = String(data["terminalReason"] ?? "cancelled");
+        runError = `run cancelled at ${phase}: ${reason}`;
+        runnerTerminalReason = reason;
+        runnerEnding = curState;
         break;
       }
       // The brief lands once Pi is up and idle; before that the container is
@@ -3124,12 +3130,14 @@ async function main() {
         );
         runError = `run failed at ${phase}: ${reason}`;
         runnerTerminalReason = reason;
+        runnerEnding = curState;
         break;
       }
       if (curState === "blocked") {
         const reason = String(data["terminalReason"] ?? "blocked");
         runError = `run blocked at ${phase}: ${reason}`;
         runnerTerminalReason = reason;
+        runnerEnding = curState;
         break;
       }
       if (curState === "done") {
@@ -3352,11 +3360,9 @@ async function main() {
     outcome: runError
       ? interrupted
         ? "interrupted"
-        : runError === "cancelled"
-          ? "cancelled"
-          : runError.startsWith("run blocked")
-            ? "blocked"
-            : "failed"
+        : runnerEnding === "cancelled" || runnerEnding === "blocked"
+          ? runnerEnding
+          : "failed"
       : "completed",
     error: runError,
     teardownBudgetSeconds: TEARDOWN_BUDGET_SECONDS,
