@@ -1420,6 +1420,7 @@ const recordAt = (
   return value as Readonly<Record<string, unknown>>;
 };
 
+/** Numeric fields, keeping the null a writer recorded for a count it never observed. */
 const numberRecord = (
   object: Readonly<Record<string, unknown>>,
   key: string,
@@ -1428,7 +1429,9 @@ const numberRecord = (
   if (typeof value !== "object" || value === null) return null;
   return Object.fromEntries(
     Object.entries(value).flatMap(([field, entry]) =>
-      typeof entry === "number" ? [[field, entry] as const] : [],
+      typeof entry === "number" || entry === null
+        ? [[field, entry] as const]
+        : [],
     ),
   );
 };
@@ -1609,14 +1612,12 @@ export async function readLaneReceipt(directory: string) {
     await readFile(join(directory, "receipt.json"), "utf8"),
     "receipt.json",
   );
-  let usage: Record<string, number> = {};
   let install: ReturnType<typeof readInstallEvidence> | null = null;
   try {
     const report = jsonObject(
       await readFile(join(directory, "report.json"), "utf8"),
       "report.json",
     );
-    usage = numberRecord(report, "usage") ?? {};
     install = readInstallEvidence(report);
   } catch (error) {
     if (!isMissingFile(error)) throw error;
@@ -1631,11 +1632,16 @@ export async function readLaneReceipt(directory: string) {
     provider: stringAt(receipt, "provider", "receipt.json"),
     model: stringAt(receipt, "model", "receipt.json"),
     wallSeconds: numberAt(receipt, "wallSeconds", "receipt.json"),
-    teardownSeconds: 0,
-    usage,
+    // The cloud driver times no teardown and lists no truncated artifact, and
+    // a zero or an empty list here would be a measurement nobody took.
+    teardownSeconds: null,
+    // The Worker's session totals, which is the only side that held the
+    // credential. A lane whose session was never observed spent nothing the
+    // host can price, which is unobserved and not zero.
+    usage: numberRecord(receipt, "usage"),
     installSkipped: install?.skipped ?? null,
     installSkipReason: install?.reason ?? null,
-    truncatedArtifacts: [],
+    truncatedArtifacts: null,
     modelRequests: optionalNumber(receipt, "modelRequests"),
     isolation: readIsolationEvidence(receipt),
     error: runError,
@@ -2518,7 +2524,7 @@ async function main() {
           thinking: metadata.thinking,
           promptSha: metadata.promptSha,
           piVersion: null,
-          usage: null,
+          usage: cancelUsage,
           modelRequests: cancelUsage?.requests ?? null,
           fixture: metadata.fixturePath ?? null,
           checkCommand: metadata.checkCommand,
@@ -3354,7 +3360,10 @@ async function main() {
     thinking: options.thinking,
     promptSha,
     piVersion: parsedReport?.piVersion ?? null,
-    usage: parsedReport?.usage ?? null,
+    // The lane's usage is what the broker saw cross its own socket. Pi's
+    // report.json is written by the uid the reviewed repository executes as,
+    // so a token count in it is the target's word and is never the row's.
+    usage: providerUsage,
     // The broker's own count: a lane cut after it spent requests is finished
     // work, not a lane that never reached the model and can be relaunched.
     modelRequests: providerUsage?.requests ?? null,

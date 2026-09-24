@@ -264,17 +264,43 @@ const asRecord = (value: unknown) =>
     : undefined;
 
 /**
+ * What the control side observed about this lane's model traffic, or null when
+ * it observed none.
+ *
+ * The Worker's session is the only side that held the credential, so its totals
+ * are the lane's usage. `inputTokens` and `outputTokens` are null until a
+ * response carried a usage frame: a lane that was admitted and never answered
+ * spent requests and no observed tokens, and a zero there would read as tokens
+ * that were measured. `inputUnobserved` and `outputUnobserved` say how many
+ * requests each sum is short by.
+ */
+export const observedModelUsage = (state: RunState | undefined) => {
+  const totals = asRecord(asRecord(state?.control?.modelUsage)?.["totals"]);
+  if (!totals) return null;
+  const requests = totals["requests"];
+  if (typeof requests !== "number") return null;
+  const numberOrNull = (value: unknown) =>
+    typeof value === "number" ? value : null;
+  return {
+    requests,
+    retries: numberOrNull(totals["retries"]),
+    inputTokens: numberOrNull(totals["input"]),
+    outputTokens: numberOrNull(totals["output"]),
+    unended: numberOrNull(totals["unended"]),
+    inputUnobserved: numberOrNull(totals["inputUnobserved"]),
+    outputUnobserved: numberOrNull(totals["outputUnobserved"]),
+  };
+};
+
+/**
  * How many times the lane reached the model, or null when nobody observed it.
  *
  * A relaunch is free only while this is zero: a container that died before its
  * first request spent nothing, and one that died after it would buy the same
  * tokens twice.
  */
-export const observedModelRequests = (state: RunState | undefined) => {
-  const totals = asRecord(asRecord(state?.control?.modelUsage)?.["totals"]);
-  const requests = totals?.["requests"];
-  return typeof requests === "number" ? requests : null;
-};
+export const observedModelRequests = (state: RunState | undefined) =>
+  observedModelUsage(state)?.requests ?? null;
 
 /**
  * The isolation verdicts the control plane reported when the lane started.
@@ -290,6 +316,16 @@ export const observedIsolation = (started: RunStart | undefined) =>
         targetReadBroker: started.probes.targetReadBroker,
       }
     : null;
+
+/** What the control plane observed about a lane, as its receipt records it. */
+export const observedControl = (
+  started: RunStart | undefined,
+  state: RunState | undefined,
+) => ({
+  isolation: observedIsolation(started),
+  modelRequests: observedModelRequests(state),
+  usage: observedModelUsage(state),
+});
 
 const statusRecord = (state: RunState) =>
   asRecord(parseJson(artifactOf(state, "status.json")?.content));
@@ -1021,8 +1057,7 @@ export async function main() {
     placementId: started?.placementId ?? state?.placementId ?? null,
     processId: started?.processId ?? null,
     container: started?.container ?? null,
-    isolation: observedIsolation(started),
-    modelRequests: observedModelRequests(state),
+    ...observedControl(started, state),
     finalize,
     runError: lifecycle.runError ? messageOf(lifecycle.runError) : null,
     shutdown: {

@@ -14,8 +14,10 @@ import {
   FINALIZE_REQUEST_RESERVE,
   type LaneBrief,
   main,
+  observedControl,
   observedIsolation,
   observedModelRequests,
+  observedModelUsage,
   promptFailure,
   REPORT_GRACE_MS,
   requestControl,
@@ -136,6 +138,117 @@ describe("local driver lifecycle", () => {
     expect(observedModelRequests(undefined)).toBeNull();
   });
 
+  it("reads a lane's usage from the control side's session totals", () => {
+    const state = (modelUsage: unknown) => ({
+      runId: "run",
+      observedAt: "2026-09-10T00:00:00.000Z",
+      placementId: null,
+      control: { modelUsage },
+      artifacts: [],
+    });
+
+    expect(
+      observedModelUsage(
+        state({
+          totals: {
+            requests: 2,
+            retries: 0,
+            input: 40,
+            output: 8,
+            unended: 1,
+            inputUnobserved: 1,
+            outputUnobserved: 0,
+          },
+        }),
+      ),
+    ).toEqual({
+      requests: 2,
+      retries: 0,
+      inputTokens: 40,
+      outputTokens: 8,
+      unended: 1,
+      inputUnobserved: 1,
+      outputUnobserved: 0,
+    });
+    // A session whose responses carried no usage frame has no token count: the
+    // row records that as unobserved rather than as tokens measured at zero.
+    expect(
+      observedModelUsage(
+        state({
+          totals: { requests: 1, retries: 0, input: null, output: null },
+        }),
+      ),
+    ).toEqual({
+      requests: 1,
+      retries: 0,
+      inputTokens: null,
+      outputTokens: null,
+      unended: null,
+      inputUnobserved: null,
+      outputUnobserved: null,
+    });
+    // A Worker deployed before a count existed never reports it, and a count
+    // nobody reported is unobserved, not a zero that reads as measured.
+    expect(
+      observedModelUsage(
+        state({ totals: { requests: 3, input: 40, output: 8 } }),
+      ),
+    ).toEqual({
+      requests: 3,
+      retries: null,
+      inputTokens: 40,
+      outputTokens: 8,
+      unended: null,
+      inputUnobserved: null,
+      outputUnobserved: null,
+    });
+    expect(observedModelUsage(state({ totals: {} }))).toBeNull();
+    expect(observedModelUsage(state({}))).toBeNull();
+    expect(observedModelUsage(undefined)).toBeNull();
+  });
+
+  it("hands a row the Worker session's usage through the cloud receipt", async () => {
+    const totals = {
+      requests: 2,
+      retries: 0,
+      input: null,
+      output: null,
+      unended: 1,
+      inputUnobserved: 1,
+      outputUnobserved: 1,
+    };
+    const directory = await mkdtemp(join(tmpdir(), "review-pi-receipt-"));
+    await writeCloudReceipt(directory, {
+      runId: "run",
+      provider: "openai-codex",
+      model: "gpt-5.4",
+      wallSeconds: 12,
+      ...observedControl(undefined, {
+        runId: "run",
+        observedAt: "2026-09-10T00:00:00.000Z",
+        placementId: null,
+        control: { modelUsage: { totals } },
+        artifacts: [],
+      }),
+    });
+
+    // The receipt is the only way the session's count reaches the row, so it
+    // is read back through the reader the row uses, not off the helper.
+    await expect(readLaneReceipt(directory)).resolves.toMatchObject({
+      modelRequests: 2,
+      usage: {
+        requests: 2,
+        retries: 0,
+        inputTokens: null,
+        outputTokens: null,
+        unended: 1,
+        inputUnobserved: 1,
+        outputUnobserved: 1,
+      },
+    });
+    await rm(directory, { recursive: true, force: true });
+  });
+
   it("carries the escape the control plane reported into the lane receipt", async () => {
     const started = {
       runId: "run",
@@ -171,16 +284,15 @@ describe("local driver lifecycle", () => {
     expect(observedIsolation(undefined)).toBeNull();
 
     const directory = await mkdtemp(join(tmpdir(), "review-pi-receipt-"));
-    await writeFile(
-      join(directory, "receipt.json"),
-      JSON.stringify({
-        runId: "run",
-        provider: "openai-codex",
-        model: "gpt-5.4",
-        wallSeconds: 12,
-        isolation: observedIsolation(started),
-      }),
-    );
+    // Written the way the driver writes it, so the verdict reaches the row only
+    // if the receipt's control observations carry it.
+    await writeCloudReceipt(directory, {
+      runId: "run",
+      provider: "openai-codex",
+      model: "gpt-5.4",
+      wallSeconds: 12,
+      ...observedControl(started, undefined),
+    });
 
     await expect(readLaneReceipt(directory)).resolves.toMatchObject({
       isolation: {

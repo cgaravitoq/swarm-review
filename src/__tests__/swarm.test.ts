@@ -2401,7 +2401,8 @@ if [[ "$1" == "exec" && "$joined" == *"cat /opt/review/control/provider-usage.js
   else
     seal=$(printf '%s' "$final" | shasum -a 256 | cut -d' ' -f1)
   fi
-  printf '{"event":"provider_request","seal":"%s","totals":{"requests":1,"retries":0,"input":0,"output":0}}\n' "$seal"
+  if [[ -n "\${FAKE_LEDGER_TOTALS:-}" ]]; then ledger_totals="$FAKE_LEDGER_TOTALS"; else ledger_totals='{"requests":1,"retries":0,"input":0,"output":0,"unended":0,"inputUnobserved":0,"outputUnobserved":0}'; fi
+  printf '{"event":"provider_request","seal":"%s","totals":%s}\n' "$seal" "$ledger_totals"
   exit 0
 fi
 if [[ "$1" == "exec" && "\${@: -2:1}" == "cat" ]]; then
@@ -2848,6 +2849,91 @@ exec /usr/bin/git "$@"
       installSkipped: false,
       installSkipReason: null,
     });
+  }, 120_000);
+
+  it("prices a lane from the broker ledger, not from the report the target wrote", async () => {
+    const arranged = await arrange("success");
+    const swarmId = "swarm-ledger-usage";
+    await writeReport(arranged, `${swarmId}-reviewer-1`, answer([finding()]));
+    await writeReport(arranged, `${swarmId}-reviewer-2`, answer([]));
+    await writeReport(
+      arranged,
+      `${swarmId}-verifier`,
+      fenced({
+        verdicts: [
+          {
+            id: "c1",
+            status: "confirmed",
+            evidenceStrength: "static",
+            reason: "the source matches",
+          },
+        ],
+      }),
+    );
+
+    // Every report the harness writes claims `usage: { totalTokens: 7 }`, and
+    // the ledger says something else. The row has to carry the ledger's count:
+    // the report is written by the uid the checkout runs as.
+    const result = await runSwarm(swarmArguments(arranged, swarmId), arranged, {
+      ...arranged.env,
+      FAKE_LEDGER_TOTALS: JSON.stringify({
+        requests: 4,
+        retries: 1,
+        input: 111,
+        output: 222,
+        unended: 1,
+        inputUnobserved: 1,
+        outputUnobserved: 2,
+      }),
+    });
+    const receipt = await readReceipt(arranged.out, swarmId);
+    const lane = (receipt["lanes"] as Record<string, unknown>[]).find(
+      (entry) => entry["laneId"] === "reviewer-1",
+    );
+
+    expect(result.code, result.output).toBe(0);
+    expect(lane?.["usage"]).toEqual({
+      requests: 4,
+      retries: 1,
+      inputTokens: 111,
+      outputTokens: 222,
+      denials: 0,
+      unended: 1,
+      inputUnobserved: 1,
+      outputUnobserved: 2,
+    });
+  }, 120_000);
+
+  it("keeps an unattested report's install out of the lane row", async () => {
+    const arranged = await arrange("success");
+    const swarmId = "swarm-forged-install";
+    await writeReport(arranged, `${swarmId}-reviewer-1`, answer([finding()]), {
+      status: "skipped",
+      manifest: null,
+      reason: "the checkout root has no package.json",
+    });
+    await writeReport(arranged, `${swarmId}-reviewer-2`, answer([]));
+    // The answer is swapped after the model gave it, so no control-side seal
+    // matches the report and the install reason in it is the target's word.
+    await forgeReport(arranged, `${swarmId}-reviewer-1`, {
+      finalText: answer([]),
+    });
+
+    await runSwarm(swarmArguments(arranged, swarmId), arranged);
+    const receipt = await readReceipt(arranged.out, swarmId);
+    const lane = (receipt["lanes"] as Record<string, unknown>[]).find(
+      (entry) => entry["laneId"] === "reviewer-1",
+    );
+
+    expect(lane).toMatchObject({
+      status: "malformed",
+      reportCompletion: "unattested",
+      installSkipped: null,
+      installSkipReason: null,
+    });
+    expect(JSON.stringify(receipt)).not.toContain(
+      "the checkout root has no package.json",
+    );
   }, 120_000);
 
   it("tells a warm sandbox verifier with nothing to rule on to stand down and removes it", async () => {
@@ -4150,9 +4236,108 @@ await writeFile(
     model: "grok-4.6",
     wallSeconds: 1,
     modelRequests: brief.prompt ? 3 : 0,
+    ...(process.env.FAKE_CLOUD_USAGE
+      ? { usage: JSON.parse(process.env.FAKE_CLOUD_USAGE) }
+      : {}),
   }),
 );
 `;
+
+    it("carries a cloud lane's unobserved token counts into its row as null", async () => {
+      const arranged = await arrange("success");
+      const swarmId = "swarm-pool-usage";
+      const provider = await fakeProvider((_prompt, path) =>
+        path.startsWith("/repos/")
+          ? pullAnswer(arranged)
+          : completion(answer([finding({ file: "changed-a.ts", line: 1 })])),
+      );
+      await pointUpstream(arranged, {
+        "https://api.x.ai/v1": provider.baseUrl,
+      });
+      await pointGitHub(arranged, provider.baseUrl);
+      await writeFile(
+        join(arranged.repo, "agents/review-pi/src/drive.ts"),
+        fakeDriver,
+      );
+      // The Worker session admitted three requests and no response carried a
+      // usage frame, so its tokens were never observed.
+      const usage = {
+        requests: 3,
+        retries: 0,
+        inputTokens: null,
+        outputTokens: null,
+        unended: 1,
+      };
+
+      const result = await runSwarm(
+        packedArguments(arranged, swarmId, [
+          "--fast",
+          "--pr",
+          "6567",
+          "--worker",
+          "https://review.invalid",
+        ]),
+        arranged,
+        {
+          ...arranged.env,
+          GITHUB_TOKEN: "test-token",
+          FAKE_CLOUD_USAGE: JSON.stringify(usage),
+        },
+      );
+      const receipt = await readReceipt(arranged.out, swarmId);
+      const pool = laneRows(receipt).filter(
+        (lane) => lane["role"] === "verifier" && lane["claimedFile"],
+      );
+
+      expect(result.code, result.output).toBe(0);
+      // A dropped field reads as nothing to a reader that sums the row, so the
+      // row keeps the null the session reported.
+      expect(pool.map((lane) => lane["usage"])).toEqual([usage]);
+    }, 180_000);
+
+    it("records a cloud lane's teardown and truncation as unobserved in its row", async () => {
+      const arranged = await arrange("success");
+      const swarmId = "swarm-pool-teardown";
+      const provider = await fakeProvider((_prompt, path) =>
+        path.startsWith("/repos/")
+          ? pullAnswer(arranged)
+          : completion(answer([finding({ file: "changed-a.ts", line: 1 })])),
+      );
+      await pointUpstream(arranged, {
+        "https://api.x.ai/v1": provider.baseUrl,
+      });
+      await pointGitHub(arranged, provider.baseUrl);
+      await writeFile(
+        join(arranged.repo, "agents/review-pi/src/drive.ts"),
+        fakeDriver,
+      );
+
+      const result = await runSwarm(
+        packedArguments(arranged, swarmId, [
+          "--fast",
+          "--pr",
+          "6567",
+          "--worker",
+          "https://review.invalid",
+        ]),
+        arranged,
+        { ...arranged.env, GITHUB_TOKEN: "test-token" },
+      );
+      const receipt = await readReceipt(arranged.out, swarmId);
+      const pool = laneRows(receipt).filter(
+        (lane) => lane["role"] === "verifier" && lane["claimedFile"],
+      );
+
+      expect(result.code, result.output).toBe(0);
+      // The cloud driver's receipt times no teardown and lists no truncation,
+      // so a zero or an empty list there is a measurement nobody took.
+      expect(pool).toEqual([
+        expect.objectContaining({
+          teardownSeconds: null,
+          truncatedArtifacts: null,
+        }),
+      ]);
+    }, 180_000);
 
     it("keeps only a verbatim declared intent on a pool lane's findings", async () => {
       const arranged = await arrange("success");
@@ -4727,6 +4912,41 @@ await writeFile(
       expect(result.code).toBe(1);
     }, 180_000);
 
+    it("says a cut answer's output count was not observed when no frame reported it", async () => {
+      const arranged = await arrange("success");
+      const swarmId = "swarm-packed-cut-unreported";
+      const provider = await fakeProvider((prompt) =>
+        completion(
+          isVerifierPrompt(prompt)
+            ? answer([])
+            : "I will start with the changed file. The diff adds a guard that",
+          {
+            finishReason: "length",
+            ...(prompt.includes(CANARY_PROMPT)
+              ? {}
+              : { usage: { prompt_tokens: 11 } }),
+          },
+        ),
+      );
+      await pointUpstream(arranged, {
+        "https://api.x.ai/v1": provider.baseUrl,
+      });
+
+      await runSwarm(
+        packedArguments(arranged, swarmId, ["--reviewers", "1"]),
+        arranged,
+      );
+      const lane = reviewerRows(await readReceipt(arranged.out, swarmId))[0];
+
+      // The provider said the ceiling cut the answer and never said where, so
+      // the reason names no count nobody measured.
+      expect(lane?.["status"]).toBe("blocked");
+      expect(lane?.["usage"]).toEqual({ inputTokens: 11, outputTokens: null });
+      expect(lane?.["blockerReason"]).toBe(
+        "answer cut at an output token count that was not observed",
+      );
+    }, 180_000);
+
     it("records an answer the ceiling cut as cut, not as off-contract", async () => {
       const arranged = await arrange("success");
       const swarmId = "swarm-packed-cut-prose";
@@ -5250,6 +5470,41 @@ await writeFile(
       expect(receipt["status"]).toBe("completed");
     }, 180_000);
 
+    it("reads a side one of a packed lane's two answers never reported as unobserved", async () => {
+      const arranged = await arrange("success");
+      const swarmId = "swarm-packed-retry-usage";
+      let reviewerAnswers = 0;
+      const provider = await fakeProvider((prompt) => {
+        if (isVerifierPrompt(prompt)) return completion(answer([]));
+        if (!prompt.includes(CANARY_PROMPT)) {
+          reviewerAnswers += 1;
+          if (reviewerAnswers === 1) {
+            return completion(
+              '```json\n{"status": "complete", "findings": [{"severity": "P2"\n```',
+              { usage: { completion_tokens: 22 } },
+            );
+          }
+        }
+        return completion(answer([]));
+      });
+      await pointUpstream(arranged, {
+        "https://api.x.ai/v1": provider.baseUrl,
+      });
+
+      const result = await runSwarm(
+        packedArguments(arranged, swarmId, ["--reviewers", "1"]),
+        arranged,
+      );
+      const lane = reviewerRows(await readReceipt(arranged.out, swarmId))[0];
+
+      // Both answers were paid for, and only one of them said what its input
+      // cost, so a sum of the one would read as the lane's whole input.
+      expect(result.code, result.output).toBe(0);
+      expect(reviewerAnswers).toBe(2);
+      expect(lane?.["relaunch"]).toMatchObject({ attempts: 1 });
+      expect(lane?.["usage"]).toEqual({ inputTokens: null, outputTokens: 44 });
+    }, 180_000);
+
     it("asks a lane once more when the ceiling cut it while still thinking in text", async () => {
       const arranged = await arrange("success");
       const swarmId = "swarm-packed-retry-thinking";
@@ -5372,8 +5627,9 @@ await writeFile(
       expect(String(refusedLane?.["error"])).toContain("model not found");
       expect(String(refusedLane?.["error"])).toContain("404");
       expect(String(refusedLane?.["blockerReason"])).toContain(refused);
-      // No pack was sent and no tokens were spent on it.
-      expect(refusedLane?.["usage"]).toEqual({});
+      // No pack was sent, so the row has no usage to report, and the provider's
+      // own record shows no tokens were spent on it.
+      expect(refusedLane?.["usage"]).toBeNull();
       expect(
         provider.requests.filter(
           (request) =>

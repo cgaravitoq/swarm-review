@@ -3,12 +3,14 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import {
+  addPackedUsage,
   canaryModel,
   canaryModels,
   completeOnce,
   packedRequestBody,
   writeFastLaneArtifacts,
 } from "../fast-review";
+import { readLaneReceipt } from "../local";
 
 afterEach(() => {
   vi.unstubAllGlobals();
@@ -134,7 +136,75 @@ describe("completeOnce", () => {
       prompt: "review",
     });
 
-    expect(answer.usage).toStrictEqual({ outputTokens: 34 });
+    // A dropped field reads as nothing to a reader that sums the row.
+    expect(answer.usage).toStrictEqual({ inputTokens: null, outputTokens: 34 });
+  });
+
+  it("keeps the one side a usage nested under the message reported", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn<typeof fetch>(() =>
+        Promise.resolve(
+          new Response(
+            JSON.stringify({
+              choices: [{ message: { content: "{}" }, finish_reason: "stop" }],
+              message: { usage: { output_tokens: 9 } },
+            }),
+            { status: 200 },
+          ),
+        ),
+      ),
+    );
+
+    const answer = await completeOnce({
+      baseUrl: "https://provider.invalid/v1",
+      bearer: "token",
+      model: "grok-4.6",
+      prompt: "review",
+    });
+
+    expect(answer.usage).toStrictEqual({ inputTokens: null, outputTokens: 9 });
+  });
+
+  it("records the spend of an answer that reported none as unobserved", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn<typeof fetch>(() =>
+        Promise.resolve(
+          new Response(
+            JSON.stringify({
+              choices: [{ message: { content: "{}" }, finish_reason: "stop" }],
+            }),
+            { status: 200 },
+          ),
+        ),
+      ),
+    );
+    const artifactDir = await mkdtemp(join(tmpdir(), "review-pi-receipt-"));
+
+    const answer = await completeOnce({
+      baseUrl: "https://provider.invalid/v1",
+      bearer: "token",
+      model: "grok-4.6",
+      prompt: "review",
+    });
+    await writeFastLaneArtifacts({
+      artifactDir,
+      runId: "run-1",
+      attemptId: "attempt-1",
+      provider: "grok",
+      model: "grok-4.6",
+      finalText: answer.content,
+      wallSeconds: 7,
+      usage: answer.usage,
+    });
+
+    // The answer came back and its spend never did: an empty record in the
+    // row would read as a lane that was measured and spent nothing.
+    await expect(readLaneReceipt(artifactDir)).resolves.toMatchObject({
+      usage: null,
+    });
+    await rm(artifactDir, { recursive: true, force: true });
   });
 
   it("reads the spend out of an answer the gateway pretty-printed", async () => {
@@ -169,6 +239,40 @@ describe("completeOnce", () => {
     });
 
     expect(answer.usage).toEqual({ inputTokens: 11001, outputTokens: 1222 });
+  });
+
+  it("reads a camelCase spend out of an answer the gateway pretty-printed", async () => {
+    // Indented, so only the parsed record can carry it: the line reader that
+    // would also know the field names never sees a whole frame.
+    vi.stubGlobal(
+      "fetch",
+      vi.fn<typeof fetch>(() =>
+        Promise.resolve(
+          new Response(
+            JSON.stringify(
+              {
+                choices: [
+                  { message: { content: "ok" }, finish_reason: "stop" },
+                ],
+                usage: { inputTokens: 812, outputTokens: 64 },
+              },
+              null,
+              2,
+            ),
+            { status: 200 },
+          ),
+        ),
+      ),
+    );
+
+    const answer = await completeOnce({
+      baseUrl: "https://provider.invalid/v1",
+      bearer: "token",
+      model: "openai/gpt-5.6-luna",
+      prompt: "review",
+    });
+
+    expect(answer.usage).toEqual({ inputTokens: 812, outputTokens: 64 });
   });
 
   it("throws with the provider's own words when the call is refused", async () => {
@@ -513,7 +617,47 @@ describe("canaryModel", () => {
   });
 });
 
+describe("addPackedUsage", () => {
+  it("leaves a side one answer never reported unobserved for the lane", () => {
+    expect(
+      addPackedUsage(
+        { inputTokens: 5, outputTokens: null },
+        { inputTokens: 7, outputTokens: 3 },
+      ),
+    ).toEqual({ inputTokens: 12, outputTokens: null });
+    // An answer that reported no spend at all spent both sides unobserved.
+    expect(
+      addPackedUsage(null, { inputTokens: 7, outputTokens: 3 }),
+    ).toBeNull();
+    expect(
+      addPackedUsage({ inputTokens: 7, outputTokens: 3 }, null),
+    ).toBeNull();
+  });
+});
+
 describe("writeFastLaneArtifacts", () => {
+  it("records a lane whose call never answered as spending an unobserved count", async () => {
+    const artifactDir = await mkdtemp(join(tmpdir(), "review-pi-receipt-"));
+
+    await writeFastLaneArtifacts({
+      artifactDir,
+      runId: "run-1",
+      attemptId: "attempt-1",
+      provider: "grok",
+      model: "grok-4.6",
+      finalText: "",
+      wallSeconds: 7,
+      error: "fast review 503: upstream unavailable",
+    });
+
+    // No answer came back, so no usage was observed: an empty record in the
+    // row would read as a lane that was measured and spent nothing.
+    await expect(readLaneReceipt(artifactDir)).resolves.toMatchObject({
+      usage: null,
+    });
+    await rm(artifactDir, { recursive: true, force: true });
+  });
+
   it("never lets a reader observe a partial receipt", async () => {
     const artifactDir = await mkdtemp(join(tmpdir(), "review-pi-receipt-"));
     const path = join(artifactDir, "local-receipt.json");

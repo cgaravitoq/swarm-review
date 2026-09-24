@@ -33,6 +33,7 @@ import {
   writeTerminalReceipt,
 } from "./attempt";
 import {
+  addPackedUsage,
   canaryModels,
   completeOnce,
   FAST_REASONING_LEVELS,
@@ -2033,6 +2034,29 @@ const reportCompletion = (report: Awaited<ReturnType<typeof laneReport>>) =>
         : "complete";
 
 /**
+ * The lane fields only the runner's own report carries.
+ *
+ * `report.json` is written by the uid the reviewed repository executes as, so
+ * an unattested report contributes none of them: the row records the install as
+ * unobserved rather than repeating a value no control-side record confirms.
+ * Pi's version and the install stay target-written until the isolation wave
+ * moves the runner, and this is where that word stops being the target's.
+ */
+const attestedReportFields = (
+  report: Awaited<ReturnType<typeof laneReport>>,
+  receipt: {
+    installSkipped: boolean | null;
+    installSkipReason: string | null;
+  } | null,
+) =>
+  report?.attested
+    ? {
+        installSkipped: receipt?.installSkipped ?? null,
+        installSkipReason: receipt?.installSkipReason ?? null,
+      }
+    : { installSkipped: null, installSkipReason: null };
+
+/**
  * What the driver wrote about the finalize it sent, or null when it sent none.
  *
  * A lane cut by its request cap leaves this behind: the driver spends one
@@ -2572,7 +2596,7 @@ async function main() {
                     reasoning: packedLaneReasoning(options, laneId),
                   });
                 let answer = await ask();
-                let usage: Record<string, number> = answer.usage;
+                let usage = answer.usage;
                 // A packed model that answers with JSON it cannot close is asked
                 // once more: the second answer is a fresh sample, not a replay,
                 // and one more request is cheaper than a lane the run must do
@@ -2591,13 +2615,7 @@ async function main() {
                   relaunchAttempts += 1;
                   const spent = usage;
                   answer = await ask();
-                  const second: Record<string, number> = answer.usage;
-                  usage = Object.fromEntries(
-                    Object.keys({ ...spent, ...second }).map((key) => [
-                      key,
-                      (spent[key] ?? 0) + (second[key] ?? 0),
-                    ]),
-                  );
+                  usage = addPackedUsage(spent, answer.usage);
                 }
                 finishReason = answer.finishReason;
                 await writeFastLaneArtifacts({
@@ -2684,9 +2702,12 @@ async function main() {
     // one: an empty finding list here means "not reached", not "clean".
     const droppedAssigned =
       packed?.droppedFiles.filter((file) => files.includes(file)) ?? [];
+    const cutTokens = receipt?.usage?.["outputTokens"];
     const cutReason =
       finishReason === "length" || finishReason === "max_tokens"
-        ? `answer cut at ${receipt?.usage?.["outputTokens"] ?? 0} output tokens`
+        ? typeof cutTokens === "number"
+          ? `answer cut at ${cutTokens} output tokens`
+          : "answer cut at an output token count that was not observed"
         : null;
     const evidenceGap = packed?.truncated
       ? "pack truncated: the assigned diff alone exceeds the pack budget"
@@ -2790,11 +2811,10 @@ async function main() {
           (options.fast ? "low" : "high"),
         reasoning: fastUpstream ? packedLaneReasoning(options, laneId) : null,
         usage: receipt?.usage ?? null,
-        installSkipped: receipt?.installSkipped ?? null,
-        installSkipReason: receipt?.installSkipReason ?? null,
+        ...attestedReportFields(report, receipt),
         wallSeconds: receipt?.wallSeconds ?? null,
         teardownSeconds: receipt?.teardownSeconds ?? null,
-        truncatedArtifacts: receipt?.truncatedArtifacts ?? [],
+        truncatedArtifacts: receipt?.truncatedArtifacts ?? null,
         error: receipt?.error ?? laneEvidence.damage,
         orcaTerminal: laneTerminalFor(laneId),
         cleanup: laneCleanupFor(laneId),
@@ -3081,11 +3101,10 @@ async function main() {
           receipt?.model ?? verifierLaneConfig.model ?? options.model ?? null,
         thinking: verifierLaneConfig.thinking ?? options.thinking ?? "low",
         usage: receipt?.usage ?? null,
-        installSkipped: receipt?.installSkipped ?? null,
-        installSkipReason: receipt?.installSkipReason ?? null,
+        ...attestedReportFields(report, receipt),
         wallSeconds: receipt?.wallSeconds ?? null,
         teardownSeconds: receipt?.teardownSeconds ?? null,
-        truncatedArtifacts: receipt?.truncatedArtifacts ?? [],
+        truncatedArtifacts: receipt?.truncatedArtifacts ?? null,
         error: receipt?.error ?? laneEvidence.damage,
         orcaTerminal: laneTerminalFor(laneId),
         cleanup: laneCleanupFor(laneId),
@@ -3523,11 +3542,10 @@ async function main() {
         options.thinking ??
         (options.fast ? "low" : "high"),
       usage: verifierEvidence.receipt?.usage ?? null,
-      installSkipped: verifierEvidence.receipt?.installSkipped ?? null,
-      installSkipReason: verifierEvidence.receipt?.installSkipReason ?? null,
+      ...attestedReportFields(verifierReport, verifierEvidence.receipt),
       wallSeconds: verifierEvidence.receipt?.wallSeconds ?? null,
       teardownSeconds: verifierEvidence.receipt?.teardownSeconds ?? null,
-      truncatedArtifacts: verifierEvidence.receipt?.truncatedArtifacts ?? [],
+      truncatedArtifacts: verifierEvidence.receipt?.truncatedArtifacts ?? null,
       error: verifierEvidence.receipt?.error ?? verifierEvidence.damage,
       orcaTerminal: laneTerminalFor("verifier"),
       cleanup: laneCleanupFor("verifier"),
