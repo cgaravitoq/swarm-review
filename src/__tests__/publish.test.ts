@@ -103,6 +103,24 @@ describe("review payload", () => {
     );
   });
 
+  it("marks a runner that cannot run the sandbox image in Coverage", () => {
+    const body = buildReview(
+      receipt([]),
+      new Map(),
+      "acme/demo",
+      "P2",
+      false,
+      "ARM64",
+    ).body;
+    expect(body).toContain("<summary>Coverage</summary>\n");
+    expect(body).toContain(
+      "- runner ARM64 cannot run the sandbox image: reviewed with packed lanes",
+    );
+    expect(buildReview(receipt([]), new Map(), "acme/demo").body).not.toContain(
+      "cannot run the sandbox image",
+    );
+  });
+
   it("anchors a finding on a diff line and never requests changes", () => {
     const review = buildReview(
       receipt([finding()]),
@@ -1323,6 +1341,34 @@ describe("a run that publishes no review", () => {
     };
     expect(payload.body).toContain("<summary>Coverage</summary>");
     expect(payload.body).toContain("- fork reviewed with packed lanes");
+  });
+
+  it("publishes both packed lane notes when the runner cannot run the sandbox image", async () => {
+    const api = github();
+    const receiptPath = await artifact(completed());
+
+    await publish(receiptPath, env, [
+      "--publish",
+      "--fork",
+      "--packed-runner",
+      "ARM64",
+    ]);
+
+    const request = api.fetchMock.mock.calls.find(
+      ([url, init]) =>
+        String(url).includes("/pulls/7/reviews") &&
+        (init as RequestInit | undefined)?.method === "POST",
+    );
+    const payload = JSON.parse(
+      String((request?.[1] as RequestInit | undefined)?.body),
+    ) as {
+      body: string;
+    };
+    expect(payload.body).toContain("<summary>Coverage</summary>");
+    expect(payload.body).toContain("- fork reviewed with packed lanes");
+    expect(payload.body).toContain(
+      "- runner ARM64 cannot run the sandbox image: reviewed with packed lanes",
+    );
   });
 
   it("keeps one comment per run id and edits it on a re-run", async () => {
