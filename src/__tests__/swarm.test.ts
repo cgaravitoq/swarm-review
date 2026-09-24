@@ -526,6 +526,75 @@ describe("deterministic lane coverage", () => {
     );
   });
 
+  it("takes an input ceiling for every lane, and refuses one the trial is above", () => {
+    const sandbox = (extra: string[]) =>
+      parseSwarmOptions([
+        "--head",
+        "a".repeat(40),
+        "--base",
+        "b".repeat(40),
+        "--out",
+        "/out",
+        "--sandbox",
+        ...extra,
+      ]);
+
+    // A run that names no ceiling of its own names nothing, so the trial's
+    // table stays the only source.
+    expect(sandbox([]).laneInputCap).toBeUndefined();
+    const lowered = sandbox(["--lane-input-cap", "4000000"]);
+    expect(lowered.laneInputCap).toBe(4_000_000);
+    const args = laneArguments(
+      lowered,
+      "run-1",
+      "/out",
+      "/prompt.txt",
+      "h".repeat(40),
+      "b".repeat(40),
+      300,
+      {},
+      { role: "reviewer", laneId: "reviewer-1" },
+    );
+    // The lane is told the number its broker will cut it at, before it runs.
+    expect(args).toEqual(
+      expect.arrayContaining(["--lane-input-cap", "4000000"]),
+    );
+
+    expect(() => sandbox(["--lane-input-cap", "12000001"])).toThrow(
+      /--lane-input-cap 12000001 is above the t1b cumulative input cap of 12000000 tokens/,
+    );
+    expect(() =>
+      sandbox(["--lane-input-cap", "300000", "--trial-kind", "t1a"]),
+    ).toThrow(
+      /--lane-input-cap 300000 is above the t1a cumulative input cap of 250000 tokens/,
+    );
+    // The run refuses before any lane starts, and for the reason that would
+    // make the ceiling a claim nothing enforces: a packed lane calls the
+    // provider from this process and a cloud lane builds its own caps.
+    expect(() =>
+      parseSwarmOptions([
+        "--pr",
+        "6633",
+        "--out",
+        "/tmp/out",
+        "--lane-input-cap",
+        "4000000",
+      ]),
+    ).toThrow(/--lane-input-cap needs a lane with a broker/);
+    expect(() =>
+      parseSwarmOptions([
+        "--pr",
+        "6633",
+        "--out",
+        "/tmp/out",
+        "--worker",
+        "https://review.invalid",
+        "--lane-input-cap",
+        "4000000",
+      ]),
+    ).toThrow(/--lane-input-cap needs a lane with a broker/);
+  });
+
   it("refuses to relaunch a lane into a window that cannot host a review", () => {
     const options = parseSwarmOptions([
       "--head",
@@ -2740,6 +2809,59 @@ exec /usr/bin/git "$@"
     expect(result.output).not.toContain("swarm-test-secret");
   }, 120_000);
 
+  it("holds every lane of a run to the input ceiling it named", async () => {
+    const arranged = await arrange("success");
+    const swarmId = "swarm-lane-input-cap";
+    await writeReport(arranged, `${swarmId}-reviewer-1`, answer([finding()]));
+    await writeReport(arranged, `${swarmId}-reviewer-2`, answer([]));
+    await writeReport(
+      arranged,
+      `${swarmId}-verifier`,
+      fenced({
+        verdicts: [
+          {
+            id: "c1",
+            status: "confirmed",
+            evidenceStrength: "static",
+            reason: "the source matches",
+          },
+        ],
+      }),
+    );
+    // A third of the trial's ceiling, so a lane that ran under the trial's
+    // would be visible in every number below.
+    const cap = 4_000_000;
+
+    const result = await runSwarm(
+      [...swarmArguments(arranged, swarmId), "--lane-input-cap", String(cap)],
+      arranged,
+    );
+    const receipt = await readReceipt(arranged.out, swarmId);
+    const lanes = receipt["lanes"] as Record<string, unknown>[];
+
+    expect(result.code, result.output).toBe(0);
+    expect(receipt["status"]).toBe("completed");
+    expect(lanes.map((lane) => lane["laneInputCap"])).toEqual([cap, cap, cap]);
+    for (const lane of lanes) {
+      // The lane's own driver recorded the same ceiling, and the job it handed
+      // the runner measures the budget notice against it.
+      const laneReceipt = JSON.parse(
+        await readFile(
+          join(String(lane["artifactDir"]), "local-receipt.json"),
+          "utf8",
+        ),
+      ) as Record<string, unknown>;
+      const job = JSON.parse(
+        await readFile(
+          join(arranged.state, "jobs", `${String(lane["runId"])}.json`),
+          "utf8",
+        ),
+      ) as Record<string, unknown>;
+      expect(laneReceipt["laneInputCap"]).toBe(cap);
+      expect(job["budget"]).toMatchObject({ inputTokens: cap });
+    }
+  }, 120_000);
+
   it("starts the sandbox verifier beside the reviewers and briefs it once the candidates are frozen", async () => {
     // A cold verifier pays its clone and install after the reviewers are done,
     // on the run's critical path. Warm, it idles in its prepared checkout and
@@ -4036,6 +4158,14 @@ exec /usr/bin/git "$@"
       expect(packedPrompt).toContain("export const a = true;");
 
       expect(receipt["status"]).toBe("completed");
+      // A packed lane calls the provider from this process, so no broker holds
+      // it to an input ceiling and its row says so rather than quoting the
+      // trial's.
+      expect(laneRows(receipt).map((lane) => lane["laneInputCap"])).toEqual([
+        null,
+        null,
+        null,
+      ]);
       expect(packedLane?.["provider"]).toBe("xai");
       expect(packedLane?.["model"]).toBe("grok-4.6");
       expect(packedLane?.["finishReason"]).toBe("stop");

@@ -536,6 +536,28 @@ describe("reviewer context", () => {
       parseOptions([...base, "--context", "/briefs/demo.md"]).contextPath,
     ).toBe("/briefs/demo.md");
   });
+
+  it("refuses a lane input ceiling above the trial's, before any container", () => {
+    expect(parseOptions(base).laneInputCap).toBeUndefined();
+    expect(
+      parseOptions([...base, "--lane-input-cap", "4000000"]).laneInputCap,
+    ).toBe(4_000_000);
+    // Both numbers, because the caller has to see which one it asked for.
+    expect(() =>
+      parseOptions([
+        ...base,
+        "--lane-input-cap",
+        "5000000",
+        "--trial-kind",
+        "t1a",
+      ]),
+    ).toThrow(
+      /--lane-input-cap 5000000 is above the t1a cumulative input cap of 250000 tokens/,
+    );
+    expect(() => parseOptions([...base, "--lane-input-cap", "0"])).toThrow(
+      /--lane-input-cap must be a positive whole number of tokens/,
+    );
+  });
 });
 
 describe("credential boundary", () => {
@@ -1494,6 +1516,44 @@ describe("public local CLI lifecycle", {
       inputTokens: SESSION_CAPS.t1b.maxCumulativeInputTokens,
     });
     expect(job["totalTimeoutSeconds"]).toBe(RUN_BUDGET_SECONDS);
+  });
+
+  it("stops a lane at the input ceiling it was given, and says so in its receipt", async () => {
+    const root = await mkdtemp(join(tmpdir(), "review-pi-cli-"));
+    temporaryDirectories.push(root);
+    const arranged = await arrangeFakeDocker(root);
+    const runId = "lane-input-cap";
+    const out = join(root, "out");
+    // A third of the trial's ceiling is not a number any other path produces,
+    // so a lane told one budget and stopped at another would show here.
+    const cap = 4_000_000;
+
+    const result = await runLocalCli(
+      [...localArguments(out, runId), "--lane-input-cap", String(cap)],
+      fakeEnvironment(arranged, runId, "success"),
+    );
+    expect(result.code, result.output).toBe(0);
+    const job = JSON.parse(
+      await readFile(join(arranged.container, "copied-job.json"), "utf8"),
+    ) as Record<string, unknown>;
+    const broker = JSON.parse(
+      await readFile(join(arranged.container, "copied-broker.json"), "utf8"),
+    ) as { caps: Record<string, unknown> };
+    const receipt = await readLocalReceipt(join(out, runId));
+
+    // The broker is the process that cuts the lane, so the ceiling has to be
+    // its own and not the trial's.
+    expect(broker.caps).toEqual({
+      ...SESSION_CAPS.t1b,
+      maxCumulativeInputTokens: cap,
+    });
+    // The notice is measured against the same number: a lane told the trial's
+    // ceiling would be cut with its answer still unwritten.
+    expect(job["budget"]).toEqual({
+      requests: SESSION_CAPS.t1b.maxRequests,
+      inputTokens: cap,
+    });
+    expect(receipt.laneInputCap).toBe(cap);
   });
 
   it("accepts a missing optional artifact and requires report plus trace", async () => {
