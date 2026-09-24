@@ -1103,6 +1103,39 @@ exec /bin/cp "\${args[@]}"
     );
   });
 
+  it("records a failed template copy as the install's failure", async () => {
+    const lockfile = '{"lockfileVersion":1}\n';
+    const prepared = await prepareRun("template-copy-failure", {
+      "package.json": '{"name":"demo"}\n',
+      "bun.lock": lockfile,
+      node_modules: "a regular file where the template goes\n",
+    });
+    const template = await stageTemplate(prepared.root, lockfile);
+
+    const result = spawnSync("bash", [runnerScript, prepared.run], {
+      encoding: "utf8",
+      env: { ...prepared.env, REVIEW_TEMPLATE_ROOT: template },
+    });
+    const failed = {
+      status: "failed",
+      manifest: "bun.lock",
+      reason: "template copy: exit 1",
+      seconds: null,
+      nothingToDo: null,
+      template: false,
+    };
+
+    expect(result.status).not.toBe(0);
+    expect(
+      JSON.parse(await readFile(join(prepared.run, "install.json"), "utf8")),
+    ).toEqual(failed);
+    expect(
+      JSON.parse(await readFile(join(prepared.run, "status.json"), "utf8"))
+        .install,
+    ).toEqual(failed);
+    expect(existsSync(prepared.bunArgv)).toBe(false);
+  });
+
   it("installs with bun when the checkout root carries the binary lockfile", async () => {
     const prepared = await prepareRun("bun-lockb-project", {
       "package.json": '{"name":"demo"}\n',

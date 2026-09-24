@@ -215,7 +215,14 @@ do_install() {
   fi
   local code began seconds nothing_to_do template=false
   if [ "$manifest" = "bun.lock" ] && cmp -s "$REPO/bun.lock" "$TEMPLATE_ROOT/template-bun.lock" && [ -d "$TEMPLATE_ROOT/node_modules-template" ]; then
-    cp -a --reflink=auto "$TEMPLATE_ROOT/node_modules-template" "$REPO/node_modules" || return 1
+    cp -a --reflink=auto "$TEMPLATE_ROOT/node_modules-template" "$REPO/node_modules"
+    code=$?
+    if [ "$code" -ne 0 ]; then
+      jq -cn --arg manifest "$manifest" --argjson exit "$code" \
+        '{status:"failed", manifest:$manifest, reason:"template copy: exit \($exit)",
+          seconds:null, nothingToDo:null, template:false}' > "$RUN_DIR/install.json"
+      return "$code"
+    fi
     template=true
   fi
   began=$(date +%s)
