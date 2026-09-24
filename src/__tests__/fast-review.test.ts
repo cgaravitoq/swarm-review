@@ -140,6 +140,32 @@ describe("completeOnce", () => {
     expect(answer.usage).toStrictEqual({ inputTokens: null, outputTokens: 34 });
   });
 
+  it("keeps the one side a usage nested under the message reported", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn<typeof fetch>(() =>
+        Promise.resolve(
+          new Response(
+            JSON.stringify({
+              choices: [{ message: { content: "{}" }, finish_reason: "stop" }],
+              message: { usage: { output_tokens: 9 } },
+            }),
+            { status: 200 },
+          ),
+        ),
+      ),
+    );
+
+    const answer = await completeOnce({
+      baseUrl: "https://provider.invalid/v1",
+      bearer: "token",
+      model: "grok-4.6",
+      prompt: "review",
+    });
+
+    expect(answer.usage).toStrictEqual({ inputTokens: null, outputTokens: 9 });
+  });
+
   it("records the spend of an answer that reported none as unobserved", async () => {
     vi.stubGlobal(
       "fetch",
