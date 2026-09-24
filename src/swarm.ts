@@ -2137,7 +2137,8 @@ export const neverReachedModel = (evidence: {
       !evidence.receipt.modelRequests));
 
 async function main() {
-  const options = parseSwarmOptions(process.argv.slice(2));
+  const argv = process.argv.slice(2);
+  const options = parseSwarmOptions(argv);
   // The target is an input, not a property of where this package sits: the
   // identity every GitHub path is built from and the checkout the diffs, packs
   // and objects are read out of. Both are required before anything is paid for.
@@ -2151,8 +2152,7 @@ async function main() {
     );
     options.image = await laneImageReference(
       repo,
-      options.image,
-      DEFAULT_SWARM_IMAGE,
+      flag(argv, "image"),
       containerDir,
       join(containerDir, "context", "bun.lock"),
     );

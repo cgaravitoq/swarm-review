@@ -24,7 +24,8 @@ A commit that fails a gate is not committed, so fix the cause rather than bypass
 
 A lane image is not published anywhere, so a host that has never built one has no image to run.
 The build context is `container/`, and its `context/` subdirectory is generated rather than committed, so it has to exist first: `bun run deploy --target <checkout>` writes it, or copy the target's `package.json` and lockfile in by hand.
-The tag is the one the driver defaults to, and the platform is the one the driver runs, which is emulated on Apple silicon:
+Without `--image` the driver runs `ghcr.io/<owner>/<repo>-swarm-review-sandbox:<tag>`, whose tag is derived from the files in `container/` and the target's lockfile, and `bun run deploy --image-only --repo <owner/repo> --target <checkout>` stages the context and builds exactly that reference for the platform the driver runs, which is emulated on Apple silicon.
+The legacy tag is only what an explicit `--image review-pi-b5-swarm` names, and a flag that is passed is always the image the lane runs:
 
 ```sh
 docker build --platform linux/amd64 -t review-pi-b5-swarm container/

@@ -1991,7 +1991,8 @@ export async function readActivity(
 
 async function main() {
   const startedAt = Date.now();
-  const options = parseOptions(process.argv.slice(2));
+  const argv = process.argv.slice(2);
+  const options = parseOptions(argv);
   const isControlAction =
     options.inspect ||
     options.cancel ||
@@ -2029,8 +2030,7 @@ async function main() {
     const containerDir = dirname(runnerPath);
     options.image = await laneImageReference(
       repo,
-      options.image,
-      DEFAULT_IMAGE,
+      flag(argv, "image"),
       containerDir,
       join(containerDir, "context", "bun.lock"),
     );

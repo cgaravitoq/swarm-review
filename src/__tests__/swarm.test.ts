@@ -2936,6 +2936,39 @@ exec /usr/bin/git "$@"
     );
   }, 120_000);
 
+  const inspectedImages = async (arranged: Arranged) =>
+    new Set(
+      [
+        ...(
+          await readFile(join(arranged.state, "docker.log"), "utf8")
+        ).matchAll(/^image inspect --format \{\{\.Id\}\} (\S+)$/gm),
+      ].map((match) => match[1]),
+    );
+
+  const runQuietSwarm = async (
+    arranged: Arranged,
+    swarmId: string,
+    extra: string[] = [],
+  ) => {
+    for (const lane of ["reviewer-1", "reviewer-2", "verifier"]) {
+      await writeReport(arranged, `${swarmId}-${lane}`, answer([]));
+    }
+    return runSwarm([...swarmArguments(arranged, swarmId), ...extra], arranged);
+  };
+
+  it("keeps an explicit --image that names the legacy tag", async () => {
+    const arranged = await arrange("success");
+    const result = await runQuietSwarm(arranged, "swarm-legacy-image", [
+      "--image",
+      "review-pi-b5-swarm",
+    ]);
+
+    expect(result.code, result.output).toBe(0);
+    expect(await inspectedImages(arranged)).toEqual(
+      new Set(["review-pi-b5-swarm"]),
+    );
+  }, 120_000);
+
   it("tells a warm sandbox verifier with nothing to rule on to stand down and removes it", async () => {
     const arranged = await arrange("success");
     const swarmId = "swarm-warm-idle";

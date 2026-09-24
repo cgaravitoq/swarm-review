@@ -57,19 +57,12 @@ describe("sandbox image tag", () => {
         await imageTagFromFiles(directory, lockfile),
       );
       expect(
-        await laneImageReference(
-          "acme/demo",
-          "legacy-default",
-          "legacy-default",
-          directory,
-          lockfile,
-        ),
+        await laneImageReference("acme/demo", undefined, directory, lockfile),
       ).toBe(expected);
       expect(
         await laneImageReference(
           "acme/demo",
           "custom-image:one",
-          "legacy-default",
           directory,
           lockfile,
         ),

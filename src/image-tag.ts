@@ -49,12 +49,11 @@ export function imageReference(repository: string, tag: string): string {
 
 export async function laneImageReference(
   repository: string,
-  requested: string,
-  legacyDefault: string,
+  requested: string | undefined,
   containerDir: string,
   lockfilePath: string,
 ): Promise<string> {
-  if (requested !== legacyDefault) {
+  if (requested !== undefined) {
     return requested;
   }
   return imageReference(

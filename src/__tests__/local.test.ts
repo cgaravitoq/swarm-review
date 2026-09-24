@@ -1496,6 +1496,24 @@ describe("public local CLI lifecycle", {
     expect(job["totalTimeoutSeconds"]).toBe(RUN_BUDGET_SECONDS);
   });
 
+  it("keeps an explicit --image that names the legacy tag", async () => {
+    const root = await mkdtemp(join(tmpdir(), "review-pi-cli-"));
+    temporaryDirectories.push(root);
+    const arranged = await arrangeFakeDocker(root);
+    const runId = "legacy-image";
+    const out = join(root, "out");
+
+    const result = await runLocalCli(
+      [...localArguments(out, runId), "--image", "review-pi-b5-local"],
+      fakeEnvironment(arranged, runId, "success"),
+    );
+
+    expect(result.code, result.output).toBe(0);
+    expect(await readFile(join(arranged.state, "docker.log"), "utf8")).toMatch(
+      /^image inspect --format \{\{\.Id\}\} review-pi-b5-local$/m,
+    );
+  });
+
   it("accepts a missing optional artifact and requires report plus trace", async () => {
     const root = await mkdtemp(join(tmpdir(), "review-pi-cli-"));
     temporaryDirectories.push(root);
