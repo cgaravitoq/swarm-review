@@ -81,11 +81,11 @@ describe("response usage", () => {
       'data: {"type":"message_start","message":{"usage":{"input_tokens":5}}}\n\n';
     const long = `data: {"usage":{"output_tokens":9},"pad":"${"x".repeat(64)}"}`;
 
-    const ended = usageReader({ lineChars: 64 });
+    const ended = usageReader({ lineChars: long.length - 1 });
     ended.write(`${opening}${long}\n\n`);
     expect(ended.read()).toEqual({ input: null, output: null });
 
-    const open = usageReader({ lineChars: 64 });
+    const open = usageReader({ lineChars: long.length - 1 });
     open.write(opening);
     open.write(long);
     expect(open.read()).toEqual({ input: null, output: null });
