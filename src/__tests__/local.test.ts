@@ -456,6 +456,11 @@ if [[ "$1" == "exec" && "$joined" == *" --send "* ]]; then
 fi
 if [[ "$1" == "exec" && "\${@: -2:1}" == "cat" ]]; then
   if [[ -n "\${FAKE_PREPARATION_STATUS:-}" && "\${@: -1}" == *"/status.json" ]]; then
+    if [[ -n "\${FAKE_STATUS_HANG_INTERRUPTS_FROM:-}" && $(date +%s) -ge "\${FAKE_STATUS_HANG_INTERRUPTS_FROM}" ]]; then
+      trap 'touch "$state/driver-interrupted"; kill -TERM "$PPID"; sleep 0.1; exit 143' TERM
+      sleep 600 &
+      wait
+    fi
     printf '%s\\n' "\${FAKE_PREPARATION_STATUS}"
     exit 0
   fi
@@ -2047,47 +2052,74 @@ describe("public local CLI lifecycle", {
 
   it("ends a lane whose status file says done forever at the run's deadline", async () => {
     // The 402 hang: the bridge was gone, the runner's last word was done, and
-    // the driver never believes a done it did not hear from the bridge.
-    const root = await mkdtemp(join(tmpdir(), "review-pi-cli-"));
-    temporaryDirectories.push(root);
-    const arranged = await arrangeFakeDocker(root);
-    const runId = "done-forever";
-    const out = join(root, "out");
+    // the driver never believes a done it did not hear from the bridge. The
+    // second lane is interrupted while the deadline is still unwinding its
+    // status read, and a swarm's cut is what its receipt names. Both lanes
+    // wait out the same deadline.
     const totalSeconds = 8;
-    const startedAt = Date.now();
-
-    const result = await runLocalCli(
-      [...localArguments(out, runId).slice(0, -1), String(totalSeconds)],
-      {
-        ...fakeEnvironment(arranged, runId, "success"),
-        FAKE_BRIDGE: "unavailable",
-        FAKE_PREPARATION_STATUS: JSON.stringify({
-          runId,
-          phase: "finished",
-          state: "done",
-          detail: "",
-          terminalReason: "completed",
-          process: { alive: false, pid: 50 },
-        }),
-      },
-    );
-
-    const elapsedSeconds = (Date.now() - startedAt) / 1000;
     const deadlineSeconds = totalSeconds + RUN_DEADLINE_GRACE_SECONDS;
-    expect(result.code, result.output).toBe(1);
-    expect(elapsedSeconds).toBeGreaterThanOrEqual(deadlineSeconds);
-    expect(elapsedSeconds).toBeLessThan(deadlineSeconds + 15);
-    await expect(readLocalReceipt(join(out, runId))).resolves.toMatchObject({
+    const startedAt = Date.now();
+    const pastDeadline = async (
+      runId: string,
+      environment: Record<string, string>,
+    ) => {
+      const root = await mkdtemp(join(tmpdir(), "review-pi-cli-"));
+      temporaryDirectories.push(root);
+      const arranged = await arrangeFakeDocker(root);
+      const out = join(root, "out");
+      const result = await runLocalCli(
+        [...localArguments(out, runId).slice(0, -1), String(totalSeconds)],
+        {
+          ...fakeEnvironment(arranged, runId, "success"),
+          FAKE_BRIDGE: "unavailable",
+          FAKE_PREPARATION_STATUS: JSON.stringify({
+            runId,
+            phase: "finished",
+            state: "done",
+            detail: "",
+            terminalReason: "completed",
+            process: { alive: false, pid: 50 },
+          }),
+          ...environment,
+        },
+      );
+      return {
+        result,
+        elapsedSeconds: (Date.now() - startedAt) / 1000,
+        receipt: await readLocalReceipt(join(out, runId)),
+        dockerLog: await readFile(join(arranged.state, "docker.log"), "utf8"),
+        driverInterrupted: existsSync(
+          join(arranged.state, "driver-interrupted"),
+        ),
+      };
+    };
+
+    const [expired, interrupted] = await Promise.all([
+      pastDeadline("done-forever", {}),
+      pastDeadline("interrupted-at-deadline", {
+        FAKE_STATUS_HANG_INTERRUPTS_FROM: String(
+          Math.floor(startedAt / 1000) + deadlineSeconds - 3,
+        ),
+      }),
+    ]);
+
+    expect(expired.result.code, expired.result.output).toBe(1);
+    expect(expired.elapsedSeconds).toBeGreaterThanOrEqual(deadlineSeconds);
+    expect(expired.elapsedSeconds).toBeLessThan(deadlineSeconds + 15);
+    expect(expired.receipt).toMatchObject({
       outcome: "failed",
       error: `run deadline exceeded after ${deadlineSeconds} s`,
     });
-    const dockerLog = await readFile(
-      join(arranged.state, "docker.log"),
-      "utf8",
+    expect(expired.dockerLog).toContain(
+      "rm --force --volumes review-pi-local-done-forever",
     );
-    expect(dockerLog).toContain(
-      `rm --force --volumes review-pi-local-${runId}`,
-    );
+    expect(interrupted.result.code, interrupted.result.output).toBe(1);
+    expect(interrupted.driverInterrupted).toBe(true);
+    expect(interrupted.elapsedSeconds).toBeGreaterThanOrEqual(deadlineSeconds);
+    expect(interrupted.receipt).toMatchObject({
+      outcome: "interrupted",
+      error: "interrupted",
+    });
   });
 
   it("refuses an image whose broker copy differs before the review ever starts", async () => {
