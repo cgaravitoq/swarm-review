@@ -7,8 +7,14 @@
  * run-scoped URL under /model/<runId>/<capability>/.
  */
 
-import { responseSealer } from "../container/response-seal";
+import {
+  responseSealer,
+  WORKER_SSE_LINE_CHARS,
+} from "../container/response-seal";
+import { type ModelUsage, usageReader } from "../container/response-usage";
 import { assertCloudRunId } from "./isolation";
+
+export type { ModelUsage };
 
 export type ModelCaps = {
   maxRequests: number;
@@ -17,9 +23,6 @@ export type ModelCaps = {
   maxCumulativeOutputTokens: number;
   maxRequestBytes: number;
 };
-
-/** Provider-reported usage. A field the body never carried is null, never zero. */
-export type ModelUsage = { input: number | null; output: number | null };
 
 export type ModelTotals = {
   requests: number;
@@ -168,58 +171,6 @@ export function resolveUpstreamTarget(requestUrl: string, baseUrl: string) {
   }
   return target;
 }
-
-export const readUsage = (body: string): ModelUsage | null => {
-  const totals: ModelUsage = { input: null, output: null };
-  const numberAt = (record: Record<string, unknown>, key: string) => {
-    const value = record[key];
-    return typeof value === "number" ? value : 0;
-  };
-  const consider = (candidate: Record<string, unknown> | undefined) => {
-    if (!candidate || typeof candidate !== "object") return;
-    const anthropicInput = candidate["input_tokens"];
-    const input =
-      anthropicInput ?? candidate["prompt_tokens"] ?? candidate["inputTokens"];
-    const output =
-      candidate["output_tokens"] ??
-      candidate["completion_tokens"] ??
-      candidate["outputTokens"];
-    if (typeof input !== "number" && typeof output !== "number") return;
-    if (typeof input === "number") {
-      totals.input =
-        input +
-        (typeof anthropicInput === "number"
-          ? numberAt(candidate, "cache_read_input_tokens") +
-            numberAt(candidate, "cache_creation_input_tokens")
-          : 0);
-    }
-    if (typeof output === "number") totals.output = output;
-  };
-  for (const line of body.split("\n")) {
-    const payload = line.startsWith("data:")
-      ? line.slice(5).trim()
-      : line.trim();
-    if (!payload || payload === "[DONE]") continue;
-    try {
-      const parsed = JSON.parse(payload) as Record<string, unknown>;
-      const nestedUsage = (key: string) => {
-        const container = parsed[key];
-        return typeof container === "object" && container !== null
-          ? (container as Record<string, unknown>)["usage"]
-          : undefined;
-      };
-      consider(
-        (parsed["usage"] as Record<string, unknown> | undefined) ??
-          // OpenAI's Responses API nests it under the response, Anthropic's
-          // Messages API under the message it opens with.
-          (nestedUsage("response") as Record<string, unknown> | undefined) ??
-          (nestedUsage("message") as Record<string, unknown> | undefined) ??
-          parsed,
-      );
-    } catch {}
-  }
-  return totals.input === null && totals.output === null ? null : totals;
-};
 
 const jsonError = (status: number, reason: string) =>
   new Response(JSON.stringify({ error: { type: "review_pi_model", reason } }), {
@@ -385,19 +336,19 @@ export async function proxyModelFetch(
   }
   const decoder = new TextDecoder();
   const sealer = responseSealer();
+  const usage = usageReader({ lineChars: WORKER_SSE_LINE_CHARS });
   const stream = new TransformStream<Uint8Array, Uint8Array>({
     transform(chunk, controller) {
-      sealer.write(decoder.decode(chunk, { stream: true }));
+      const text = decoder.decode(chunk, { stream: true });
+      sealer.write(text);
+      usage.write(text);
       controller.enqueue(chunk);
     },
     async flush() {
-      sealer.write(decoder.decode());
-      await recordAttempt(
-        runId,
-        readUsage(sealer.tail()),
-        retryable,
-        sealer.seal(),
-      );
+      const text = decoder.decode();
+      sealer.write(text);
+      usage.write(text);
+      await recordAttempt(runId, usage.read(), retryable, sealer.seal());
     },
   });
   return new Response(upstream.body.pipeThrough(stream), {

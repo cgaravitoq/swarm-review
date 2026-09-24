@@ -4,8 +4,8 @@
 
 import { mkdir, writeFile } from "node:fs/promises";
 import { join } from "node:path";
+import { readUsage } from "../container/response-usage";
 import { writeLocalReceipt } from "./local";
-import { readUsage } from "./model-proxy";
 
 const FAST_MAX_TOKENS = 8192;
 const FAST_TIMEOUT_MS = 180_000;
@@ -278,7 +278,7 @@ export async function completeOnce(input: {
     usageFrom(
       (record?.["response"] as Record<string, unknown> | undefined)?.["usage"],
     ) ??
-    (streamed
+    (streamed.input !== null || streamed.output !== null
       ? {
           ...(streamed.input === null ? {} : { inputTokens: streamed.input }),
           ...(streamed.output === null

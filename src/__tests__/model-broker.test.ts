@@ -12,7 +12,6 @@ import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
   createBrokerServer,
-  readUsage,
   reserveAttempt,
   resolveUpstreamTarget,
 } from "../../container/model-broker";
@@ -365,6 +364,23 @@ describe("model broker", () => {
   const sha256 = (text: string) =>
     createHash("sha256").update(text, "utf8").digest("hex");
 
+  it("reads the input a long answer reported on the frame it opened with", async () => {
+    // Anthropic reports the input when the message starts and the output when
+    // it ends, so by the end of an answer longer than any tail the frame that
+    // carried the input is long gone.
+    upstreamBody = [
+      'event: message_start\ndata: {"type":"message_start","message":{"usage":{"input_tokens":1200,"cache_read_input_tokens":800,"output_tokens":1}}}',
+      `event: content_block_delta\ndata: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"${"x".repeat(RESPONSE_TAIL_CHARS + 1024)}"}}`,
+      'event: message_delta\ndata: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":42}}',
+    ].join("\n\n");
+
+    await call().then((response) => response.text());
+
+    const entry = await requestEntry();
+    expect(entry?.["usage"]).toEqual({ input: 2000, output: 42 });
+    expect(entry?.["totals"]).toMatchObject({ input: 2000, output: 42 });
+  });
+
   it("seals the answer text that crossed the broker, which report.json cannot rewrite", async () => {
     await call();
 
@@ -517,35 +533,6 @@ describe("model broker", () => {
 
     expect(response.status).toBe(413);
     expect(received).toHaveLength(0);
-  });
-
-  it("reads usage from the last event of a streamed response", () => {
-    const stream = [
-      'data: {"usage":{"input_tokens":10,"output_tokens":1}}',
-      'data: {"usage":{"input_tokens":10,"output_tokens":42}}',
-      "data: [DONE]",
-    ].join("\n");
-
-    expect(readUsage(stream)).toEqual({ input: 10, output: 42 });
-    expect(readUsage("not json at all")).toBeNull();
-  });
-
-  it("counts the cached halves of an Anthropic prompt as input, not as nothing", () => {
-    // Anthropic opens with the input and closes with the output, and reports the
-    // cached halves of the prompt beside `input_tokens` rather than inside it.
-    // Replacing one reading with the other, or counting only `input_tokens`,
-    // would let a cached review run against the token caps for free.
-    const claudeCode = [
-      'event: message_start\ndata: {"type":"message_start","message":{"usage":{"input_tokens":2,"cache_read_input_tokens":100,"cache_creation_input_tokens":3894,"output_tokens":1}}}',
-      'event: message_delta\ndata: {"type":"message_delta","usage":{"output_tokens":7}}',
-    ].join("\n");
-
-    expect(readUsage(claudeCode)).toEqual({ input: 3996, output: 7 });
-    // OpenAI-style usage already folds cache reads into `prompt_tokens`, so the
-    // same body must not be counted twice.
-    expect(
-      readUsage('data: {"usage":{"prompt_tokens":30,"completion_tokens":4}}'),
-    ).toEqual({ input: 30, output: 4 });
   });
 });
 

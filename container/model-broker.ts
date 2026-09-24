@@ -17,6 +17,7 @@ import { appendFileSync, readFileSync } from "node:fs";
 import type { IncomingMessage, ServerResponse } from "node:http";
 import { createServer } from "node:http";
 import { CONTAINER_SSE_LINE_CHARS, responseSealer } from "./response-seal";
+import { type ModelUsage, usageReader } from "./response-usage";
 
 /** The cap that would be broken by admitting one more request, or null. */
 export type BrokerCaps = {
@@ -124,81 +125,6 @@ export function resolveUpstreamTarget(requestUrl: string, baseUrl: string) {
   return target;
 }
 
-/**
- * Provider-reported usage, whether the response was one JSON body or an SSE
- * stream. Only the last usage object in a stream is authoritative, so the scan
- * keeps overwriting rather than summing.
- */
-/**
- * Provider-reported usage, whether the response was one JSON body or an SSE
- * stream. A frame updates the fields it carries and the last value of each one
- * wins, rather than the last frame replacing the whole reading: Anthropic opens
- * with the input and closes with the output, so replacing would keep one and
- * lose the other.
- *
- * Anthropic also reports the cached halves of a prompt apart from
- * `input_tokens`, and a review that caches its context spends most of its input
- * there. Counting only `input_tokens` would show a lane sitting against its
- * token ceiling as having spent almost nothing. OpenAI-style usage already folds
- * cache reads into `prompt_tokens`, so the cache fields are added only where a
- * provider reports them on their own.
- */
-export const readUsage = (
-  body: string,
-): { input: number; output: number } | null => {
-  const totals = { input: 0, output: 0 };
-  let seen = false;
-  const numberAt = (record: Record<string, unknown>, key: string) => {
-    const value = record[key];
-    return typeof value === "number" ? value : 0;
-  };
-  const consider = (candidate: Record<string, unknown> | undefined) => {
-    if (!candidate || typeof candidate !== "object") return;
-    const anthropicInput = candidate["input_tokens"];
-    const input =
-      anthropicInput ?? candidate["prompt_tokens"] ?? candidate["inputTokens"];
-    const output =
-      candidate["output_tokens"] ??
-      candidate["completion_tokens"] ??
-      candidate["outputTokens"];
-    if (typeof input !== "number" && typeof output !== "number") return;
-    seen = true;
-    if (typeof input === "number") {
-      totals.input =
-        input +
-        (typeof anthropicInput === "number"
-          ? numberAt(candidate, "cache_read_input_tokens") +
-            numberAt(candidate, "cache_creation_input_tokens")
-          : 0);
-    }
-    if (typeof output === "number") totals.output = output;
-  };
-  for (const line of body.split("\n")) {
-    const payload = line.startsWith("data:")
-      ? line.slice(5).trim()
-      : line.trim();
-    if (!payload || payload === "[DONE]") continue;
-    try {
-      const parsed = JSON.parse(payload) as Record<string, unknown>;
-      const nestedUsage = (key: string) => {
-        const container = parsed[key];
-        return typeof container === "object" && container !== null
-          ? (container as Record<string, unknown>)["usage"]
-          : undefined;
-      };
-      consider(
-        (parsed["usage"] as Record<string, unknown> | undefined) ??
-          // OpenAI's Responses API nests it under the response, Anthropic's
-          // Messages API under the message it opens with.
-          (nestedUsage("response") as Record<string, unknown> | undefined) ??
-          (nestedUsage("message") as Record<string, unknown> | undefined) ??
-          parsed,
-      );
-    } catch {}
-  }
-  return seen ? totals : null;
-};
-
 /** The ledger line that ends one admitted attempt, before its id and totals. */
 type AttemptEnd =
   | { event: "provider_retry"; status: number; attempt: number }
@@ -207,7 +133,7 @@ type AttemptEnd =
       status: number;
       attempt: number;
       path: string;
-      usage: ReturnType<typeof readUsage>;
+      usage: ModelUsage;
       seal: string | null;
     }
   | { event: "provider_error"; attempt: number; message: string };
@@ -362,31 +288,34 @@ export function createBrokerServer(config: BrokerConfig) {
           // Pi streams, so the answer is forwarded chunk by chunk. Buffering
           // the whole body here would turn a streamed review into one long
           // silence and break the activity the run is watched through. The
-          // sealer hashes the answer as it passes and keeps only the tail the
-          // usage frame is in.
+          // sealer hashes the answer as it passes, and the usage reader reads
+          // every frame as it passes rather than the tail the answer ends on.
           const decoder = new TextDecoder();
           const sealer = responseSealer({
             lineChars: CONTAINER_SSE_LINE_CHARS,
           });
+          const usage = usageReader({ lineChars: CONTAINER_SSE_LINE_CHARS });
           if (upstream.body) {
             for await (const chunk of upstream.body) {
-              sealer.write(decoder.decode(chunk, { stream: true }));
+              const text = decoder.decode(chunk, { stream: true });
+              sealer.write(text);
+              usage.write(text);
               res.write(Buffer.from(chunk));
             }
-            sealer.write(decoder.decode());
+            const text = decoder.decode();
+            sealer.write(text);
+            usage.write(text);
           }
           res.end();
-          const usage = readUsage(sealer.tail());
-          if (usage) {
-            totals.input += usage.input;
-            totals.output += usage.output;
-          }
+          const reported = usage.read();
+          totals.input += reported.input ?? 0;
+          totals.output += reported.output ?? 0;
           outcome = {
             event: "provider_request",
             status: upstream.status,
             attempt,
             path: target.pathname,
-            usage,
+            usage: reported,
             seal: upstream.body ? sealer.seal() : null,
           };
         }
