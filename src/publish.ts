@@ -10,7 +10,8 @@
  * credential stays on the host. Publishing is opt-in.
  */
 
-import { readFile } from "node:fs/promises";
+import { readdir, readFile } from "node:fs/promises";
+import { dirname, join } from "node:path";
 
 export const REVIEW_EVENT = "COMMENT" as const;
 export const REVIEW_SIDE = "RIGHT" as const;
@@ -92,6 +93,7 @@ export type SwarmReceipt = {
   swarmId: string;
   status: string;
   requested: { head: string; base: string; pullRequest: number | null };
+  failure?: { stage: string; message: string };
   findings: Finding[];
   coverage?: {
     changedFiles: string[];
@@ -105,6 +107,8 @@ export type SwarmReceipt = {
   };
   lanes?: {
     laneId?: string;
+    /** The run dir this lane's artifacts sit in, one per launch. */
+    runId?: string;
     role: string;
     model: string | null;
     status: string;
@@ -367,6 +371,11 @@ export function assertPublishableReceipt(
   receipt: SwarmReceipt,
   expected: ExpectedRevisions,
 ) {
+  // A run that failed before its lanes has no revisions to check, and its own
+  // failure is the reason the pull request is owed.
+  if (receipt.status === "failed" && receipt.failure) {
+    throw new Error(`${receipt.failure.stage}: ${receipt.failure.message}`);
+  }
   if (!FULL_SHA.test(receipt.requested.head)) {
     throw new Error("receipt head must be a full SHA");
   }
@@ -744,33 +753,52 @@ export async function fetchThreeDotDiff(
 }
 
 /**
- * Every review on the pull request, not just the first page.
+ * Every page of a GitHub list endpoint, not just the first.
  *
- * A missed page reads as "never published", and the run would post its own
- * review a second time.
+ * A missed page reads as "never written", and the caller then posts a second
+ * copy of something the pull request already carries.
  */
-export async function fetchReviews(
-  repo: string,
-  pullRequest: number,
+async function githubPages<T>(
+  path: string,
+  what: string,
   token: string,
-) {
-  const reviews: { id: number; body?: string | null }[] = [];
+): Promise<T[]> {
+  const entries: T[] = [];
   for (let page = 1; ; page += 1) {
     const response = await fetch(
-      `https://api.github.com/repos/${repo}/pulls/${pullRequest}/reviews?per_page=100&page=${page}`,
+      `https://api.github.com${path}?per_page=100&page=${page}`,
       { headers: githubHeaders(token, "application/vnd.github+json") },
     );
     if (!response.ok) {
-      throw new Error(`GitHub reviews request failed: ${response.status}`);
+      throw new Error(`GitHub ${what} request failed: ${response.status}`);
     }
-    const batch = (await response.json()) as {
-      id: number;
-      body?: string | null;
-    }[];
-    reviews.push(...batch);
-    if (batch.length < 100) return reviews;
+    const batch = (await response.json()) as T[];
+    entries.push(...batch);
+    if (batch.length < 100) return entries;
   }
 }
+
+export const fetchReviews = (
+  repo: string,
+  pullRequest: number,
+  token: string,
+) =>
+  githubPages<{ id: number; body?: string | null }>(
+    `/repos/${repo}/pulls/${pullRequest}/reviews`,
+    "reviews",
+    token,
+  );
+
+export const fetchIssueComments = (
+  repo: string,
+  pullRequest: number,
+  token: string,
+) =>
+  githubPages<{
+    id: number;
+    user?: { login: string } | null;
+    body?: string | null;
+  }>(`/repos/${repo}/issues/${pullRequest}/comments`, "comments", token);
 
 export async function revalidatePullRequest(
   repo: string,
@@ -874,6 +902,324 @@ export async function updateReviewBody(
   }
 }
 
+/**
+ * The run a refusal is reported against: its id keys the marker and its page
+ * is where the run's artifact sits.
+ *
+ * The id is the workflow run rather than the swarm, because a re-run keeps the
+ * run id and moves only the attempt: the same reader, the same run, and the
+ * comment it already has is the one to edit.
+ */
+export const runIdentity = (env: Record<string, string | undefined>) => {
+  const server = env["GITHUB_SERVER_URL"];
+  const repository = env["GITHUB_REPOSITORY"];
+  const runId = env["GITHUB_RUN_ID"];
+  return server && repository && runId
+    ? { runId, url: `${server}/${repository}/actions/runs/${runId}` }
+    : null;
+};
+
+export type RunIdentity = NonNullable<ReturnType<typeof runIdentity>>;
+
+const REFUSAL_MARKER_PREFIX = "<!-- swarm-review:run:";
+
+/** One comment per run: the marker is what a re-run finds and edits. */
+export const refusalMarker = (runId: string) =>
+  `${REFUSAL_MARKER_PREFIX}${runId} -->`;
+
+/** The step a lane was in when it stopped, as its own status.json records it. */
+export type LanePhase = { runId: string; phase: string; state: string };
+
+const parseLanePhase = (raw: string): LanePhase | undefined => {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(raw);
+  } catch {
+    return undefined;
+  }
+  if (typeof parsed !== "object" || parsed === null) return undefined;
+  const record = parsed as Record<string, unknown>;
+  const runId = record["runId"];
+  const phase = record["phase"];
+  const state = record["state"];
+  return typeof runId === "string" &&
+    typeof phase === "string" &&
+    typeof state === "string"
+    ? { runId, phase, state }
+    : undefined;
+};
+
+/**
+ * The phase every lane died in, read from the status.json each lane rewrites at
+ * every step.
+ *
+ * The lane's receipt names its outcome and the swarm's receipt names its
+ * status, but neither names the step it was in when it stopped; only this file
+ * does, and only a lane that ran in a container writes one.
+ */
+export async function lanePhases(artifactRoot: string): Promise<LanePhase[]> {
+  const entries = await readdir(artifactRoot, { withFileTypes: true }).catch(
+    () => [],
+  );
+  const phases: LanePhase[] = [];
+  for (const entry of entries) {
+    if (!entry.isDirectory()) continue;
+    const raw = await readFile(
+      join(artifactRoot, entry.name, "status.json"),
+      "utf8",
+    ).catch(() => null);
+    const phase = raw === null ? undefined : parseLanePhase(raw);
+    if (phase) phases.push(phase);
+  }
+  return phases.sort((a, b) => a.runId.localeCompare(b.runId));
+}
+
+/** One lane as the comment names it. */
+export type RefusalLane = {
+  lane: string;
+  status: string;
+  phase: LanePhase | null;
+};
+
+/**
+ * The lanes a refusal names: the receipt's own, each with the phase its
+ * status.json recorded.
+ *
+ * A run that died before it wrote a receipt still wrote one status.json per
+ * lane that started, and those are the only names left of it.
+ */
+export const refusalLanes = (
+  lanes: NonNullable<SwarmReceipt["lanes"]>,
+  phases: readonly LanePhase[],
+): RefusalLane[] => {
+  const byRunId = new Map(phases.map((phase) => [phase.runId, phase]));
+  if (lanes.length === 0) {
+    return phases.map((phase) => ({
+      lane: phase.runId,
+      status: "unobserved",
+      phase,
+    }));
+  }
+  return lanes.map((lane) => ({
+    lane: lane.laneId ?? lane.runId ?? lane.role,
+    status: lane.status,
+    phase: (lane.runId !== undefined && byRunId.get(lane.runId)) || null,
+  }));
+};
+
+const REFUSAL_REASON_LIMIT = 400;
+
+/** The refusal as one line: it heads a public comment, not a log file. */
+export const refusalReason = (error: unknown) => {
+  const text = (error instanceof Error ? error.message : String(error))
+    .replaceAll("`", "'")
+    .replaceAll("<", "‹")
+    .replace(/\s+/g, " ")
+    .trim();
+  return text.length <= REFUSAL_REASON_LIMIT
+    ? text
+    : `${text.slice(0, REFUSAL_REASON_LIMIT).replace(/\s+\S*$/, "")}…`;
+};
+
+/**
+ * A lane-written field as a code span in a table cell. The lane's own file is
+ * target-writable inside its container, so nothing from it reaches the comment
+ * as markup or as another run's marker. The cut comes before the escape so it
+ * cannot split an escaped pipe.
+ */
+const statusCell = (text: string) =>
+  `\`${cell(text.slice(0, 80).replaceAll("`", "'").replaceAll("<", "‹"))}\``;
+
+/**
+ * What a run that published no review leaves behind: the refusal, the phase
+ * each lane reached, and the run whose artifact holds the rest.
+ */
+export const refusalCommentBody = (input: {
+  runId: string;
+  reason: string;
+  url: string;
+  lanes: readonly RefusalLane[];
+}) =>
+  [
+    refusalMarker(input.runId),
+    "",
+    `**swarm-review published no review.** \`${input.reason}\``,
+    ...(input.lanes.length === 0
+      ? []
+      : [
+          "",
+          "| Lane | Status | Phase |",
+          "| --- | --- | --- |",
+          ...input.lanes.map(
+            (lane) =>
+              `| ${statusCell(lane.lane)} | ${statusCell(lane.status)} | ${lane.phase ? `${statusCell(lane.phase.phase)} ${statusCell(lane.phase.state)}` : "no status.json"} |`,
+          ),
+        ]),
+    "",
+    `[Run artifact](${input.url})`,
+  ].join("\n");
+
+export async function postIssueComment(
+  repo: string,
+  pullRequest: number,
+  token: string,
+  body: string,
+) {
+  const response = await fetch(
+    `https://api.github.com/repos/${repo}/issues/${pullRequest}/comments`,
+    {
+      method: "POST",
+      headers: {
+        ...githubHeaders(token, "application/vnd.github+json"),
+        "content-type": "application/json",
+      },
+      body: JSON.stringify({ body }),
+    },
+  );
+  if (!response.ok) {
+    throw new Error(
+      `GitHub comment request failed: ${response.status}: ${await response.text()}`,
+    );
+  }
+}
+
+export async function updateIssueComment(
+  repo: string,
+  commentId: number,
+  token: string,
+  body: string,
+) {
+  const response = await fetch(
+    `https://api.github.com/repos/${repo}/issues/comments/${commentId}`,
+    {
+      method: "PATCH",
+      headers: {
+        ...githubHeaders(token, "application/vnd.github+json"),
+        "content-type": "application/json",
+      },
+      body: JSON.stringify({ body }),
+    },
+  );
+  if (!response.ok) {
+    throw new Error(
+      `GitHub comment update failed: ${response.status}: ${await response.text()}`,
+    );
+  }
+}
+
+/**
+ * The login the token acts as. REST's `/user` refuses an installation token,
+ * while GraphQL's viewer answers for it and for a personal token alike.
+ */
+export async function fetchViewerLogin(token: string) {
+  const response = await fetch("https://api.github.com/graphql", {
+    method: "POST",
+    headers: {
+      ...githubHeaders(token, "application/vnd.github+json"),
+      "content-type": "application/json",
+    },
+    body: JSON.stringify({ query: "query { viewer { login } }" }),
+  });
+  if (!response.ok) {
+    throw new Error(`GitHub viewer request failed: ${response.status}`);
+  }
+  const parsed = (await response.json()) as {
+    data?: { viewer?: { login?: unknown } | null } | null;
+  };
+  const login = parsed.data?.viewer?.login;
+  return typeof login === "string" ? login : null;
+}
+
+/**
+ * The run's own comment, edited when it is already there and posted when not.
+ *
+ * Only a comment the token's identity wrote can be edited, so one carrying the
+ * marker under another author is not this run's. An edit that still fails
+ * leaves a fresh comment rather than none.
+ */
+export async function upsertRefusalComment(input: {
+  repo: string;
+  pullRequest: number;
+  token: string;
+  runId: string;
+  body: string;
+}) {
+  const marker = refusalMarker(input.runId);
+  const viewer = await fetchViewerLogin(input.token).catch(() => null);
+  const existing = (
+    await fetchIssueComments(input.repo, input.pullRequest, input.token)
+  ).find(
+    (comment) =>
+      viewer !== null &&
+      comment.user?.login === viewer &&
+      (comment.body ?? "").startsWith(`${marker}\n`),
+  );
+  if (existing) {
+    try {
+      await updateIssueComment(
+        input.repo,
+        existing.id,
+        input.token,
+        input.body,
+      );
+      return "edited" as const;
+    } catch (error: unknown) {
+      console.error(
+        `refusal comment ${existing.id} not edited: ${error instanceof Error ? error.message : String(error)}`,
+      );
+    }
+  }
+  await postIssueComment(
+    input.repo,
+    input.pullRequest,
+    input.token,
+    input.body,
+  );
+  return "created" as const;
+}
+
+/**
+ * Reports a refusal on the pull request, best effort.
+ *
+ * The caller has already decided to fail: a report that cannot be posted is
+ * logged and never replaces the refusal itself.
+ */
+async function reportRefusal(input: {
+  run: RunIdentity | null;
+  repo: string;
+  pullRequest: number | null;
+  token: string | null;
+  receipt: SwarmReceipt | null;
+  artifactRoot: string;
+  error: unknown;
+}) {
+  if (!input.run || input.pullRequest === null || input.token === null) return;
+  try {
+    const outcome = await upsertRefusalComment({
+      repo: input.repo,
+      pullRequest: input.pullRequest,
+      token: input.token,
+      runId: input.run.runId,
+      body: refusalCommentBody({
+        runId: input.run.runId,
+        reason: refusalReason(input.error),
+        url: input.run.url,
+        lanes: refusalLanes(
+          input.receipt?.lanes ?? [],
+          await lanePhases(input.artifactRoot),
+        ),
+      }),
+    });
+    console.log(
+      `refusal comment ${outcome} on ${input.repo}#${input.pullRequest}`,
+    );
+  } catch (error: unknown) {
+    console.error(
+      `refusal not reported: ${error instanceof Error ? error.message : String(error)}`,
+    );
+  }
+}
+
 export function publishCommand(options: {
   receiptPath: string;
   repo: string;
@@ -891,91 +1237,120 @@ export function publishCommand(options: {
   ].join(" ");
 }
 
-async function main() {
-  const options = parsePublishOptions(process.argv.slice(2));
-  const receipt = JSON.parse(
-    await readFile(options.receiptPath, "utf8"),
-  ) as SwarmReceipt;
-  const pullRequest = options.pullRequest ?? receipt.requested.pullRequest;
-  if (!pullRequest) {
-    throw new Error("no pull request in the receipt; pass --pr");
-  }
-  const expected: ExpectedRevisions = {
-    head: options.expectedHead ?? receipt.requested.head,
-    mergeBase: options.expectedMergeBase ?? receipt.requested.base,
-  };
-  assertPublishableReceipt(receipt, expected);
-  const token = process.env["GITHUB_TOKEN"] ?? process.env["GH_TOKEN"];
-  if (!token) throw new Error("GITHUB_TOKEN or GH_TOKEN is required");
-
-  const validated = await revalidatePullRequest(
-    options.repo,
-    pullRequest,
-    token,
-    expected,
-    options.allowMovedHead,
-  );
-  if (alreadyPublished(validated.reviews, receipt.swarmId, expected.head)) {
-    throw new Error(
-      "a review for this run and SHA is already on the pull request",
-    );
-  }
-  const built = buildReview(
-    receipt,
-    commentableLines(validated.diff),
-    options.repo,
-    options.minSeverity,
-  );
-  const payload = githubReviewPayload(built);
-  const superseded = supersededReviews(validated.reviews);
-  const command = publishCommand({
-    receiptPath: options.receiptPath,
-    repo: options.repo,
-    pullRequest,
-    expected,
-  });
-
-  if (!options.publish) {
-    console.log(
-      JSON.stringify(
-        {
-          github: payload,
-          score: built.score,
-          expected,
-          mergeBase: validated.mergeBase,
-          supersedes: superseded.map((review) => review.id),
-          command,
-        },
-        null,
-        2,
-      ),
-    );
-    console.log(
-      `\ndry run: ${payload.comments.length} inline comments for ${options.repo}#${pullRequest}. Pass --publish to send.`,
-    );
-    return;
-  }
-  const posted = await postReview(options.repo, pullRequest, token, payload);
-  console.log(posted.html_url);
-  for (const review of superseded) {
-    try {
-      await updateReviewBody(
-        options.repo,
-        pullRequest,
-        review.id,
-        token,
-        supersededBody(review.body ?? "", {
-          swarmId: receipt.swarmId,
-          head: expected.head,
-          url: posted.html_url,
-        }),
-      );
-      console.log(`superseded review ${review.id}`);
-    } catch (error: unknown) {
-      console.error(
-        `review ${review.id} not marked superseded: ${error instanceof Error ? error.message : String(error)}`,
-      );
+export async function main(
+  argv: string[] = process.argv.slice(2),
+  env: Record<string, string | undefined> = process.env,
+) {
+  const options = parsePublishOptions(argv);
+  const token = env["GITHUB_TOKEN"] ?? env["GH_TOKEN"] ?? null;
+  const run = runIdentity(env);
+  const artifactRoot = dirname(options.receiptPath);
+  let receipt: SwarmReceipt | null = null;
+  let pullRequest: number | null = options.pullRequest ?? null;
+  try {
+    receipt = JSON.parse(
+      await readFile(options.receiptPath, "utf8"),
+    ) as SwarmReceipt;
+    pullRequest ??= receipt.requested.pullRequest;
+    if (!pullRequest) {
+      throw new Error("no pull request in the receipt; pass --pr");
     }
+    const expected: ExpectedRevisions = {
+      head: options.expectedHead ?? receipt.requested.head,
+      mergeBase: options.expectedMergeBase ?? receipt.requested.base,
+    };
+    assertPublishableReceipt(receipt, expected);
+    if (!token) throw new Error("GITHUB_TOKEN or GH_TOKEN is required");
+
+    const validated = await revalidatePullRequest(
+      options.repo,
+      pullRequest,
+      token,
+      expected,
+      options.allowMovedHead,
+    );
+    if (alreadyPublished(validated.reviews, receipt.swarmId, expected.head)) {
+      // This run's review is on the pull request, so there is no refusal to
+      // report; the job fails as it did before.
+      console.error(
+        "a review for this run and SHA is already on the pull request",
+      );
+      process.exitCode = 1;
+      return;
+    }
+    const built = buildReview(
+      receipt,
+      commentableLines(validated.diff),
+      options.repo,
+      options.minSeverity,
+    );
+    const payload = githubReviewPayload(built);
+    const superseded = supersededReviews(validated.reviews);
+    const command = publishCommand({
+      receiptPath: options.receiptPath,
+      repo: options.repo,
+      pullRequest,
+      expected,
+    });
+
+    if (!options.publish) {
+      console.log(
+        JSON.stringify(
+          {
+            github: payload,
+            score: built.score,
+            expected,
+            mergeBase: validated.mergeBase,
+            supersedes: superseded.map((review) => review.id),
+            command,
+          },
+          null,
+          2,
+        ),
+      );
+      console.log(
+        `\ndry run: ${payload.comments.length} inline comments for ${options.repo}#${pullRequest}. Pass --publish to send.`,
+      );
+      return;
+    }
+    const posted = await postReview(options.repo, pullRequest, token, payload);
+    console.log(posted.html_url);
+    for (const review of superseded) {
+      try {
+        await updateReviewBody(
+          options.repo,
+          pullRequest,
+          review.id,
+          token,
+          supersededBody(review.body ?? "", {
+            swarmId: receipt.swarmId,
+            head: expected.head,
+            url: posted.html_url,
+          }),
+        );
+        console.log(`superseded review ${review.id}`);
+      } catch (error: unknown) {
+        console.error(
+          `review ${review.id} not marked superseded: ${error instanceof Error ? error.message : String(error)}`,
+        );
+      }
+    }
+  } catch (error: unknown) {
+    // Publishing is opt-in, and so is the report: a dry run leaves the pull
+    // request as it found it. The job fails either way.
+    process.exitCode = 1;
+    if (options.publish) {
+      await reportRefusal({
+        run,
+        repo: options.repo,
+        pullRequest,
+        token,
+        receipt,
+        artifactRoot,
+        error,
+      });
+    }
+    throw error;
   }
 }
 
