@@ -93,6 +93,7 @@ export type SwarmReceipt = {
   swarmId: string;
   status: string;
   requested: { head: string; base: string; pullRequest: number | null };
+  failure?: { stage: string; message: string };
   findings: Finding[];
   coverage?: {
     changedFiles: string[];
@@ -370,6 +371,11 @@ export function assertPublishableReceipt(
   receipt: SwarmReceipt,
   expected: ExpectedRevisions,
 ) {
+  // A run that failed before its lanes has no revisions to check, and its own
+  // failure is the reason the pull request is owed.
+  if (receipt.status === "failed" && receipt.failure) {
+    throw new Error(`${receipt.failure.stage}: ${receipt.failure.message}`);
+  }
   if (!FULL_SHA.test(receipt.requested.head)) {
     throw new Error("receipt head must be a full SHA");
   }
