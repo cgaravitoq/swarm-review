@@ -401,14 +401,41 @@ describe("summary body", () => {
         changedFiles: ["src/local.ts", "fixtures/corpus.json"],
         uncoveredFiles: ["fixtures/corpus.json"],
         unpackableFiles: [
-          { file: "fixtures/corpus.json", diffBytes: 2_150_400 },
+          {
+            file: "fixtures/corpus.json",
+            diffBytes: 2_150_400,
+            headBytes: 2_150_400,
+            binary: false,
+          },
         ],
       },
     });
     expect(body).toContain("- not reviewed: `fixtures/corpus.json`");
     expect(body).toContain(
-      "- too large for one lane: `fixtures/corpus.json` (2100 KB of diff)",
+      "- too large for one lane: `fixtures/corpus.json` (2100 KB of diff, 2100 KB at head)",
     );
+  });
+
+  it("says a binary was left out for what it is, not for its size", () => {
+    const body = build([finding({ id: "c1", severity: "P2" })], {
+      coverage: {
+        changedFiles: ["src/local.ts", "assets/Inter-Regular.ttf"],
+        uncoveredFiles: ["assets/Inter-Regular.ttf"],
+        unpackableFiles: [
+          {
+            file: "assets/Inter-Regular.ttf",
+            diffBytes: 120,
+            headBytes: 341_888,
+            binary: true,
+          },
+        ],
+      },
+    });
+    expect(body).toContain("- not reviewed: `assets/Inter-Regular.ttf`");
+    expect(body).toContain(
+      "- binary, not read as text: `assets/Inter-Regular.ttf`",
+    );
+    expect(body).not.toContain("too large for one lane");
   });
 
   it("lists every published finding and advisory as a table row linked to the head", () => {

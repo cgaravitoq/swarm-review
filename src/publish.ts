@@ -96,7 +96,12 @@ export type SwarmReceipt = {
   coverage?: {
     changedFiles: string[];
     uncoveredFiles: string[];
-    unpackableFiles?: { file: string; diffBytes: number }[];
+    unpackableFiles?: {
+      file: string;
+      diffBytes: number;
+      headBytes: number;
+      binary: boolean;
+    }[];
   };
   lanes?: {
     laneId?: string;
@@ -603,7 +608,9 @@ export function buildReview(
   }
   for (const entry of receipt.coverage?.unpackableFiles ?? []) {
     summary.push(
-      `- too large for one lane: \`${entry.file}\` (${Math.round(entry.diffBytes / 1024)} KB of diff)`,
+      entry.binary
+        ? `- binary, not read as text: \`${entry.file}\``
+        : `- too large for one lane: \`${entry.file}\` (${Math.round(entry.diffBytes / 1024)} KB of diff, ${Math.round(entry.headBytes / 1024)} KB at head)`,
     );
   }
   // A lane that did not finish is an angle nobody took, even when another

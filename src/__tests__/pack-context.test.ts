@@ -149,6 +149,68 @@ describe("packLaneContext", () => {
     ).toEqual([]);
   });
 
+  it("names a binary, and a file too large at head to sit beside its diff", async () => {
+    const repo = await mkdtemp(join(tmpdir(), "review-pi-pack-binary-"));
+    temporary.push(repo);
+    git(repo, ["init"]);
+    git(repo, ["config", "user.email", "t@invalid"]);
+    git(repo, ["config", "user.name", "t"]);
+    // A lockfile's shape: a few lines change, and the file at head is most of
+    // a lane. A font's shape: bytes with no text in them, at any size.
+    const lock = Array.from(
+      { length: 200 },
+      (_, index) => `"pkg-${index}": "1.0.${index}"`,
+    );
+    const glyphs = Buffer.from(
+      Array.from({ length: 512 }, (_, index) => index % 256),
+    );
+    await writeFile(join(repo, "lock.txt"), `${lock.join("\n")}\n`);
+    await writeFile(join(repo, "font.ttf"), glyphs);
+    await writeFile(join(repo, "small.ts"), "export const small = 1;\n");
+    git(repo, ["add", "."]);
+    git(repo, ["commit", "-m", "base"]);
+    const base = git(repo, ["rev-parse", "HEAD"]).trim();
+    lock[0] = '"pkg-0": "2.0.0"';
+    await writeFile(join(repo, "lock.txt"), `${lock.join("\n")}\n`);
+    await writeFile(
+      join(repo, "font.ttf"),
+      Buffer.from(glyphs.map((byte: number) => 255 - byte)),
+    );
+    await writeFile(join(repo, "small.ts"), "export const small = 2;\n");
+    git(repo, ["add", "."]);
+    git(repo, ["commit", "-m", "head"]);
+    const head = git(repo, ["rev-parse", "HEAD"]).trim();
+
+    const unpackable = unpackableFiles({
+      repo,
+      head,
+      base,
+      files: ["font.ttf", "lock.txt", "small.ts"],
+      budget: 4_000,
+    });
+
+    // The lane packs each assigned file whole at head beside the diff, so the
+    // lockfile's few changed lines are not what decides: the file is. The font
+    // fits any budget and is still left out, because a model handed its bytes
+    // would judge them as source.
+    expect(unpackable).toEqual([
+      {
+        file: "font.ttf",
+        diffBytes: expect.any(Number),
+        headBytes: 512,
+        binary: true,
+      },
+      {
+        file: "lock.txt",
+        diffBytes: expect.any(Number),
+        headBytes: expect.any(Number),
+        binary: false,
+      },
+    ]);
+    expect(unpackable[1]?.diffBytes).toBeLessThan(2_000);
+    expect(unpackable[1]?.headBytes).toBeGreaterThan(2_000);
+  });
+
   it("derives the budget from whichever ceiling binds first", () => {
     // t1a's request cap is under the model's prompt limit, so the trial binds.
     expect(packBudgetChars("t1a", "grok-4.6")).toBe(
