@@ -800,6 +800,9 @@ child.on("exit", (code) => {
     // Reaching the review step is only half of it: the reviewer has to have
     // been handed a prompt, and the install must never have been attempted.
     expect(await readFile(prepared.piArgv, "utf8")).toContain("--mode json");
+    expect(await readFile(prepared.piArgv, "utf8")).toContain(
+      "-- review this change",
+    );
     expect(await readFile(prepared.bunArgv, "utf8")).not.toContain(
       "install --frozen-lockfile",
     );
@@ -834,6 +837,10 @@ child.on("exit", (code) => {
       manifest: "bun.lock",
       reason: null,
     });
+    expect(steps.find((step) => step["step"] === "review")?.["exit"]).toBe(0);
+    expect(await readFile(prepared.piArgv, "utf8")).toContain(
+      "-- review this change",
+    );
   });
 
   it("installs with bun when the checkout root carries the binary lockfile", async () => {
@@ -865,6 +872,10 @@ child.on("exit", (code) => {
       manifest: "bun.lockb",
       reason: null,
     });
+    expect(steps.find((step) => step["step"] === "review")?.["exit"]).toBe(0);
+    expect(await readFile(prepared.piArgv, "utf8")).toContain(
+      "-- review this change",
+    );
   });
 
   it("names the resolver it could not follow instead of installing a foreign tree", async () => {
@@ -878,6 +889,7 @@ child.on("exit", (code) => {
       encoding: "utf8",
       env: prepared.env,
     });
+    const steps = await readSteps(prepared.run);
     const report = JSON.parse(
       await readFile(join(prepared.run, "report.json"), "utf8"),
     );
@@ -891,6 +903,10 @@ child.on("exit", (code) => {
     });
     expect(await readFile(prepared.bunArgv, "utf8")).not.toContain(
       "install --frozen-lockfile",
+    );
+    expect(steps.find((step) => step["step"] === "review")?.["exit"]).toBe(0);
+    expect(await readFile(prepared.piArgv, "utf8")).toContain(
+      "-- review this change",
     );
   });
 });
