@@ -42,6 +42,23 @@ describe("response usage", () => {
     expect(readUsage(closing)).toEqual({ input: 3996, output: 7 });
   });
 
+  it("reads a Responses answer's usage nested under the response it completes", () => {
+    const stream = [
+      'event: response.created\ndata: {"type":"response.created","response":{"id":"r1","usage":null}}',
+      'event: response.output_text.delta\ndata: {"type":"response.output_text.delta","delta":"ok"}',
+      'event: response.completed\ndata: {"type":"response.completed","response":{"id":"r1","usage":{"input_tokens":1938,"output_tokens":84,"total_tokens":2022}}}',
+      "",
+    ].join("\n\n");
+
+    expect(readUsage(stream)).toEqual({ input: 1938, output: 84 });
+  });
+
+  it("reads a usage a provider reports in camelCase", () => {
+    expect(
+      readUsage('data: {"usage":{"inputTokens":21,"outputTokens":5}}'),
+    ).toEqual({ input: 21, output: 5 });
+  });
+
   it("leaves a side no frame reported unobserved, never zero", () => {
     expect(readUsage('data: {"usage":{"output_tokens":7}}')).toEqual({
       input: null,
