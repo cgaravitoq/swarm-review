@@ -673,6 +673,86 @@ describe("buildTrials", () => {
     });
   });
 
+  it("reads a usage record whose token sums are null as a record", () => {
+    const sheet = buildSheet(KEY, "W2", [
+      {
+        receiptPath: "r1.json",
+        receipt: swarmReceipt({
+          candidates: [],
+          findings: [],
+          lanes: [
+            {
+              laneId: "reviewer-1",
+              role: "reviewer",
+              model: "m",
+              status: "completed",
+              finishReason: "stop",
+              usage: { inputTokens: 100, outputTokens: 10 },
+            },
+            {
+              laneId: "reviewer-2",
+              role: "reviewer",
+              model: "m",
+              status: "completed",
+              finishReason: "stop",
+              usage: { inputTokens: null, outputTokens: null },
+            },
+          ],
+        }),
+      },
+    ]);
+
+    // A Worker session that never saw a usage frame starts its sums from null;
+    // the lane spent tokens nobody observed, so the trial has no sum to quote.
+    expect(sheet.receipts[0]?.lanes[1]?.usage).toEqual({
+      inputTokens: null,
+      outputTokens: null,
+    });
+    expect(buildTrials(KEY, sheet)[0]?.usage).toEqual({
+      inputTokens: null,
+      outputTokens: null,
+    });
+  });
+
+  it("reads a usage record that carries only a request count as a record", () => {
+    const sheet = buildSheet(KEY, "W2", [
+      {
+        receiptPath: "r1.json",
+        receipt: swarmReceipt({
+          candidates: [],
+          findings: [],
+          lanes: [
+            {
+              laneId: "reviewer-1",
+              role: "reviewer",
+              model: "m",
+              status: "completed",
+              finishReason: "stop",
+              usage: { inputTokens: 100, outputTokens: 10 },
+            },
+            {
+              laneId: "reviewer-2",
+              role: "reviewer",
+              model: "m",
+              status: "completed",
+              finishReason: "stop",
+              usage: { requests: 1, unended: 1 },
+            },
+          ],
+        }),
+      },
+    ]);
+
+    expect(sheet.receipts[0]?.lanes[1]?.usage).toEqual({
+      inputTokens: null,
+      outputTokens: null,
+    });
+    expect(buildTrials(KEY, sheet)[0]?.usage).toEqual({
+      inputTokens: null,
+      outputTokens: null,
+    });
+  });
+
   it("deduplicates a defect two rows name", () => {
     const trials = buildTrials(
       KEY,

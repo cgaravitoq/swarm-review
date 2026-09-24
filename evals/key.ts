@@ -164,8 +164,11 @@ const optionalNumber = (value: unknown) =>
 /**
  * The lane receipt's usage in either shape: the host's own `inputTokens` and
  * `outputTokens`, or the Pi receipt's `input`, `output`, `turns`, `cacheRead`,
- * `totalTokens` and `costUsd`. A shape neither reader understands is unknown
- * spend, not a broken run, so it reads as absent instead of failing the sheet.
+ * `totalTokens` and `costUsd`. A record that names a token sum or a count
+ * beside one is read even when every one of them is null, since that is what
+ * a lane that observed nothing records; a shape that names none of them is
+ * unknown spend, not a broken run, so it reads as absent instead of failing
+ * the sheet.
  *
  * A side the control side recorded as unobserved reads null, and so does a
  * sum its own counts say is short (`sumIsShort`): either one read as a number
@@ -176,9 +179,20 @@ const optionalUsage = (value: unknown) => {
     return null;
   }
   const usage = value as Readonly<Record<string, unknown>>;
-  const input = usage["inputTokens"] ?? usage["input"];
-  const output = usage["outputTokens"] ?? usage["output"];
-  if (input === undefined && output === undefined) return null;
+  const input =
+    usage["inputTokens"] !== undefined ? usage["inputTokens"] : usage["input"];
+  const output =
+    usage["outputTokens"] !== undefined
+      ? usage["outputTokens"]
+      : usage["output"];
+  const named = [
+    input,
+    output,
+    usage["unended"],
+    usage["inputUnobserved"],
+    usage["outputUnobserved"],
+  ];
+  if (named.every((field) => field === undefined)) return null;
   const observed = (tokens: unknown, side: "input" | "output") =>
     typeof tokens === "number" &&
     Number.isInteger(tokens) &&
