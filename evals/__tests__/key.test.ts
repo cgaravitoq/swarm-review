@@ -753,6 +753,33 @@ describe("buildTrials", () => {
     });
   });
 
+  it("reads a token sum that is not a whole number as unobserved", () => {
+    const sheet = buildSheet(KEY, "W2", [
+      {
+        receiptPath: "r1.json",
+        receipt: swarmReceipt({
+          candidates: [],
+          findings: [],
+          lanes: [
+            {
+              laneId: "reviewer-1",
+              role: "reviewer",
+              model: "m",
+              status: "completed",
+              finishReason: "stop",
+              usage: { inputTokens: 100.5, outputTokens: 10 },
+            },
+          ],
+        }),
+      },
+    ]);
+
+    expect(sheet.receipts[0]?.lanes[0]?.usage).toEqual({
+      inputTokens: null,
+      outputTokens: 10,
+    });
+  });
+
   it("deduplicates a defect two rows name", () => {
     const trials = buildTrials(
       KEY,
