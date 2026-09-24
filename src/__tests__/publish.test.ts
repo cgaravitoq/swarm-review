@@ -21,6 +21,7 @@ import {
   type SwarmReceipt,
   supersededBody,
   supersededReviews,
+  updateIssueComment,
   updateReviewBody,
 } from "../publish";
 
@@ -1004,19 +1005,18 @@ describe("a run that publishes no review", () => {
     }
   });
 
-  const publish = (receiptPath: string) =>
+  const publish = (
+    receiptPath: string,
+    runEnv: Record<string, string | undefined> = env,
+    flags = ["--publish"],
+  ) =>
     main(
-      [
-        "--receipt",
-        receiptPath,
-        "--repo",
-        "acme/demo",
-        "--pr",
-        "7",
-        "--publish",
-      ],
-      env,
+      ["--receipt", receiptPath, "--repo", "acme/demo", "--pr", "7", ...flags],
+      runEnv,
     );
+
+  const issueRequests = (fetchMock: ReturnType<typeof vi.fn>) =>
+    fetchMock.mock.calls.filter(([url]) => String(url).includes("/issues/"));
 
   const artifact = async (
     swarm: SwarmReceipt,
@@ -1038,6 +1038,19 @@ describe("a run that publishes no review", () => {
     return receiptPath;
   };
 
+  const commentUrl =
+    /^https:\/\/api\.github\.com\/repos\/acme\/demo\/issues\/comments\/(\d+)$/;
+
+  const commentBody = (init?: RequestInit) => {
+    const parsed = JSON.parse(String(init?.body)) as unknown;
+    return typeof parsed === "object" &&
+      parsed !== null &&
+      Object.keys(parsed).join() === "body" &&
+      typeof (parsed as { body: unknown }).body === "string"
+      ? (parsed as { body: string }).body
+      : null;
+  };
+
   const github = (moved = false) => {
     const comments: { id: number; body: string }[] = [];
     const fetchMock = vi.fn(async (url: string, init?: RequestInit) => {
@@ -1046,16 +1059,25 @@ describe("a run that publishes no review", () => {
         (init?.headers as Record<string, string> | undefined)?.["accept"] ?? "",
       );
       if (url.includes("/issues/comments/")) {
-        const id = Number(url.split("/").at(-1));
-        const body = JSON.parse(String(init?.body)) as { body: string };
+        const id = Number(commentUrl.exec(url)?.[1]);
         const comment = comments.find((entry) => entry.id === id);
-        if (comment) comment.body = body.body;
-        return Response.json(comment ?? {}, { status: 200 });
+        const body = method === "PATCH" ? commentBody(init) : null;
+        if (!comment || body === null) {
+          return Response.json({ message: "Not Found" }, { status: 404 });
+        }
+        comment.body = body;
+        return Response.json(comment, { status: 200 });
       }
       if (url.includes("/issues/7/comments")) {
         if (method !== "POST") return Response.json(comments, { status: 200 });
-        const body = JSON.parse(String(init?.body)) as { body: string };
-        const comment = { id: comments.length + 1, body: body.body };
+        const body = commentBody(init);
+        if (
+          url !== "https://api.github.com/repos/acme/demo/issues/7/comments" ||
+          body === null
+        ) {
+          return Response.json({ message: "Not Found" }, { status: 404 });
+        }
+        const comment = { id: comments.length + 1, body };
         comments.push(comment);
         return Response.json(comment, { status: 201 });
       }
@@ -1171,23 +1193,62 @@ describe("a run that publishes no review", () => {
     ).toHaveLength(1);
   });
 
-  it("edits its own comment when the same run reports a second time", async () => {
+  it("keeps one comment per run id and edits it on a re-run", async () => {
+    const api = github();
+    const receiptPath = await artifact(failed());
+    const other = { ...env, GITHUB_RUN_ID: "5151" };
+
+    for (const runEnv of [env, other, env, other]) {
+      await expect(publish(receiptPath, runEnv)).rejects.toThrow(
+        "publication requires a completed or partial review",
+      );
+    }
+
+    expect(api.comments.map((comment) => comment.body.split("\n")[0])).toEqual([
+      marker,
+      "<!-- swarm-review:run:5151 -->",
+    ]);
+    const methods = issueRequests(api.fetchMock).map(
+      ([, init]) => (init as RequestInit | undefined)?.method ?? "GET",
+    );
+    expect(methods.filter((method) => method === "POST")).toHaveLength(2);
+    const edits = issueRequests(api.fetchMock).filter(
+      ([, init]) => (init as RequestInit | undefined)?.method === "PATCH",
+    );
+    expect(edits.map(([url]) => url)).toEqual([
+      "https://api.github.com/repos/acme/demo/issues/comments/1",
+      "https://api.github.com/repos/acme/demo/issues/comments/2",
+    ]);
+    await expect(
+      updateIssueComment("acme/demo", 99, "token", "body"),
+    ).rejects.toThrow("GitHub comment update failed: 404");
+  });
+
+  it("leaves the pull request alone on a dry run", async () => {
     const api = github();
     const receiptPath = await artifact(failed());
 
-    await expect(publish(receiptPath)).rejects.toThrow(
-      "publication requires a completed or partial review",
-    );
-    await expect(publish(receiptPath)).rejects.toThrow(
+    await expect(publish(receiptPath, env, [])).rejects.toThrow(
       "publication requires a completed or partial review",
     );
 
-    expect(api.comments).toHaveLength(1);
-    const methods = api.fetchMock.mock.calls
-      .filter(([url]) => String(url).includes("/issues/"))
-      .map(([, init]) => (init as RequestInit | undefined)?.method ?? "GET");
-    expect(methods.filter((method) => method === "POST")).toHaveLength(1);
-    expect(methods.filter((method) => method === "PATCH")).toHaveLength(1);
+    expect(process.exitCode).toBe(1);
+    expect(api.comments).toEqual([]);
+    expect(issueRequests(api.fetchMock)).toHaveLength(0);
+  });
+
+  it("posts no comment without a workflow run to name", async () => {
+    const api = github();
+    const receiptPath = await artifact(failed());
+    const { GITHUB_RUN_ID: _, ...anonymous } = env;
+
+    await expect(publish(receiptPath, anonymous)).rejects.toThrow(
+      "publication requires a completed or partial review",
+    );
+
+    expect(process.exitCode).toBe(1);
+    expect(api.comments).toEqual([]);
+    expect(issueRequests(api.fetchMock)).toHaveLength(0);
   });
 
   it("comments a head that moved off the frozen SHA", async () => {
