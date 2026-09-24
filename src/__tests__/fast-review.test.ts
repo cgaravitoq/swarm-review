@@ -241,6 +241,40 @@ describe("completeOnce", () => {
     expect(answer.usage).toEqual({ inputTokens: 11001, outputTokens: 1222 });
   });
 
+  it("reads a camelCase spend out of an answer the gateway pretty-printed", async () => {
+    // Indented, so only the parsed record can carry it: the line reader that
+    // would also know the field names never sees a whole frame.
+    vi.stubGlobal(
+      "fetch",
+      vi.fn<typeof fetch>(() =>
+        Promise.resolve(
+          new Response(
+            JSON.stringify(
+              {
+                choices: [
+                  { message: { content: "ok" }, finish_reason: "stop" },
+                ],
+                usage: { inputTokens: 812, outputTokens: 64 },
+              },
+              null,
+              2,
+            ),
+            { status: 200 },
+          ),
+        ),
+      ),
+    );
+
+    const answer = await completeOnce({
+      baseUrl: "https://provider.invalid/v1",
+      bearer: "token",
+      model: "openai/gpt-5.6-luna",
+      prompt: "review",
+    });
+
+    expect(answer.usage).toEqual({ inputTokens: 812, outputTokens: 64 });
+  });
+
   it("throws with the provider's own words when the call is refused", async () => {
     vi.stubGlobal(
       "fetch",
