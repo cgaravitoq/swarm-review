@@ -40,7 +40,7 @@ async function arrange(headRepo: string, pullSucceeds: boolean) {
   );
   await writeFile(
     join(bin, "bun"),
-    '#!/bin/sh\nprintf "bun %s\\n" "$*" >> "$ACTION_LOG"\nif [ "$1" = "$ACTION_ROOT/src/swarm.ts" ]; then printf "%s\\0" "$@" > "$ACTION_ARGS"; [ "$ACTION_FAIL" = swarm ] && exit 1; fi\nif [ "$2" = "$ACTION_ROOT/scripts/deploy.ts" ] && [ "$ACTION_FAIL" = deploy ]; then exit 1; fi\nexit 0\n',
+    '#!/bin/sh\nprintf "bun %s\\n" "$*" >> "$ACTION_LOG"\nif [ "$1" = "$ACTION_ROOT/src/swarm.ts" ]; then printf "%s\\0" "$@" > "$ACTION_ARGS"; [ "$ACTION_FAIL" = swarm ] && exit 1; fi\nif [ "$2" = "$ACTION_ROOT/scripts/deploy.ts" ] && [ "$ACTION_FAIL" = deploy ]; then printf "docker build failed: exec /bin/sh: exec format error\\n" >&2; exit 1; fi\nexit 0\n',
   );
   for (const name of ["gh", "docker", "bun"]) {
     await chmod(join(bin, name), 0o755);
@@ -68,6 +68,13 @@ async function arrange(headRepo: string, pullSucceeds: boolean) {
       (await readFile(env.ACTION_LOG, "utf8")).trim().split("\n"),
     swarmArgs: async () =>
       (await readFile(env.ACTION_ARGS, "utf8")).split("\0").slice(0, -1),
+    failure: async () =>
+      JSON.parse(
+        await readFile(
+          join(env.RUNNER_TEMP, "swarm-review", "pr-42-123-1", "failure.json"),
+          "utf8",
+        ),
+      ) as { stage: string; message: string },
   };
 }
 
@@ -207,6 +214,10 @@ describe("composite action driver", () => {
     expect(log.at(-1)).toBe(
       `bun ${packageRoot}/src/publish.ts --receipt ${fixture.env.RUNNER_TEMP}/swarm-review/pr-42-123-1/swarm-receipt.json --repo acme/demo --pr 42 --publish --allow-moved-head`,
     );
+    expect(await fixture.failure()).toEqual({
+      stage: "registry login",
+      message: "docker login exited with code 2",
+    });
   });
 
   it("publishes when the missing image fails to build", async () => {
@@ -223,6 +234,10 @@ describe("composite action driver", () => {
     expect(log.at(-1)).toBe(
       `bun ${packageRoot}/src/publish.ts --receipt ${fixture.env.RUNNER_TEMP}/swarm-review/pr-42-123-1/swarm-receipt.json --repo acme/demo --pr 42 --publish --allow-moved-head`,
     );
+    expect(await fixture.failure()).toEqual({
+      stage: "image build",
+      message: "docker build failed: exec /bin/sh: exec format error",
+    });
   });
 
   it("runs a fork forced to sandbox without the packed fork note", async () => {

@@ -1,4 +1,5 @@
 import { execFile, spawn } from "node:child_process";
+import { mkdir, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { promisify } from "node:util";
 import { imageReference, imageTagFromFiles } from "./image-tag";
@@ -6,24 +7,53 @@ import { imageReference, imageTagFromFiles } from "./image-tag";
 const exec = promisify(execFile);
 type Env = Record<string, string | undefined>;
 
+/** Which step a run died in, as `failure.json` reports it. */
+type Stage =
+  | "pull request lookup"
+  | "account lookup"
+  | "registry login"
+  | "image pull"
+  | "image build"
+  | "image push"
+  | "review";
+
 function required(env: Env, name: string): string {
   const value = env[name];
   if (!value) throw new Error(`${name} is required`);
   return value;
 }
 
+/** The last non-empty line of a child's stderr, which is where a failure says why. */
+const lastLine = (stderr: string) => {
+  const lines = stderr.split("\n");
+  for (let index = lines.length - 1; index >= 0; index -= 1) {
+    const line = (lines[index] ?? "").trim();
+    if (line) return line;
+  }
+  return "";
+};
+
 function run(command: string, args: string[], env: Env, input?: string) {
   return new Promise<void>((resolve, reject) => {
     const child = spawn(command, args, {
       env,
-      stdio: [input === undefined ? "inherit" : "pipe", "inherit", "inherit"],
+      stdio: [input === undefined ? "inherit" : "pipe", "inherit", "pipe"],
+    });
+    // Only the tail is kept: a build's stderr runs to megabytes, and its last
+    // line is the whole of what the failure has to name.
+    let stderr = "";
+    child.stderr?.on("data", (chunk: Buffer) => {
+      process.stderr.write(chunk);
+      stderr = `${stderr}${chunk}`.slice(-8192);
     });
     child.on("error", reject);
-    child.on("close", (code) =>
-      code === 0
-        ? resolve()
-        : reject(new Error(`${command} ${args[0]} exited with code ${code}`)),
-    );
+    child.on("close", (code) => {
+      if (code === 0) return resolve();
+      const cause = lastLine(stderr);
+      reject(
+        new Error(cause || `${command} ${args[0]} exited with code ${code}`),
+      );
+    });
     if (input !== undefined) child.stdin?.end(input);
   });
 }
@@ -60,6 +90,8 @@ export async function main(env: Env = process.env): Promise<void> {
   const source = join(required(env, "GITHUB_WORKSPACE"), "swarm-review-source");
   const out = join(required(env, "RUNNER_TEMP"), "swarm-review");
   const swarmId = `pr-${pullRequest}-${required(env, "GITHUB_RUN_ID")}-${required(env, "GITHUB_RUN_ATTEMPT")}`;
+  const swarmDir = join(out, swarmId);
+  let stage: Stage = "pull request lookup";
   let packedFork = false;
   let runEnv = env;
   try {
@@ -76,6 +108,7 @@ export async function main(env: Env = process.env): Promise<void> {
     const fork = headRepository.toLowerCase() !== repository.toLowerCase();
     const selected = mode === "auto" ? (fork ? "packed" : "sandbox") : mode;
     packedFork = fork && selected === "packed";
+    stage = "account lookup";
     runEnv = { ...env, CLOUDFLARE_ACCOUNT_ID: await accountId(env) };
     const args = [
       join(actionPath, "src", "swarm.ts"),
@@ -88,13 +121,7 @@ export async function main(env: Env = process.env): Promise<void> {
     ];
 
     if (selected === "sandbox") {
-      const image = imageReference(
-        repository,
-        await imageTagFromFiles(
-          join(actionPath, "container"),
-          join(source, "bun.lock"),
-        ),
-      );
+      stage = "registry login";
       await run(
         "docker",
         [
@@ -107,11 +134,20 @@ export async function main(env: Env = process.env): Promise<void> {
         runEnv,
         `${required(env, "GITHUB_TOKEN")}\n`,
       );
+      stage = "image pull";
+      const image = imageReference(
+        repository,
+        await imageTagFromFiles(
+          join(actionPath, "container"),
+          join(source, "bun.lock"),
+        ),
+      );
       try {
         await run("docker", ["pull", image], runEnv);
         console.log(`sandbox image pulled: ${image}`);
       } catch {
         console.log(`sandbox image missing, building: ${image}`);
+        stage = "image build";
         await run(
           "bun",
           [
@@ -125,6 +161,7 @@ export async function main(env: Env = process.env): Promise<void> {
           ],
           runEnv,
         );
+        stage = "image push";
         await run("docker", ["push", image], runEnv);
         console.log(`sandbox image pushed: ${image}`);
       }
@@ -163,9 +200,16 @@ export async function main(env: Env = process.env): Promise<void> {
     }
     args.push("--swarm-id", swarmId, "--out", out);
     console.log(`review mode: ${selected}${fork ? " (fork)" : ""}`);
+    stage = "review";
     await run("bun", args, runEnv);
   } catch (error) {
-    console.error(error instanceof Error ? error.message : String(error));
+    const message = error instanceof Error ? error.message : String(error);
+    console.error(message);
+    await mkdir(swarmDir, { recursive: true });
+    await writeFile(
+      join(swarmDir, "failure.json"),
+      JSON.stringify({ stage, message }),
+    );
   }
   await run(
     "bun",
