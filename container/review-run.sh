@@ -201,7 +201,7 @@ install_evidence() {
   if [ -s "$RUN_DIR/install.json" ]; then
     jq -c . "$RUN_DIR/install.json" 2>/dev/null && return 0
   fi
-  printf '{"status":"unknown","manifest":null,"reason":null,"seconds":null,"nothingToDo":null}'
+  printf '{"status":"unknown","manifest":null,"reason":null,"seconds":null,"nothingToDo":null,"template":null}'
 }
 
 do_install() {
@@ -210,14 +210,15 @@ do_install() {
   manifest=$(install_manifest)
   if [ -z "$manifest" ]; then
     jq -cn --arg reason "$(install_skip_reason)" \
-      '{status:"skipped", manifest:null, reason:$reason, seconds:null, nothingToDo:null}' > "$RUN_DIR/install.json"
+      '{status:"skipped", manifest:null, reason:$reason, seconds:null, nothingToDo:null, template:null}' > "$RUN_DIR/install.json"
     return 0
   fi
-  local code began seconds nothing_to_do
-  began=$(date +%s)
+  local code began seconds nothing_to_do template=false
   if [ "$manifest" = "bun.lock" ] && cmp -s "$REPO/bun.lock" "$TEMPLATE_ROOT/template-bun.lock" && [ -d "$TEMPLATE_ROOT/node_modules-template" ]; then
     cp -a --reflink=auto "$TEMPLATE_ROOT/node_modules-template" "$REPO/node_modules" || return 1
+    template=true
   fi
+  began=$(date +%s)
   if is_supervised; then
     bun install --frozen-lockfile > "$RUN_DIR/install.log" 2>&1
     code=$?
@@ -231,10 +232,10 @@ do_install() {
     nothing_to_do=true
   fi
   jq -cn --arg manifest "$manifest" --argjson seconds "$seconds" \
-    --argjson nothingToDo "$nothing_to_do" --argjson exit "$code" \
+    --argjson nothingToDo "$nothing_to_do" --argjson template "$template" --argjson exit "$code" \
     '{status:(if $exit == 0 then "installed" else "failed" end), manifest:$manifest,
       reason:(if $exit == 0 then null else "exit \($exit)" end), seconds:$seconds,
-      nothingToDo:$nothingToDo}' > "$RUN_DIR/install.json"
+      nothingToDo:$nothingToDo, template:$template}' > "$RUN_DIR/install.json"
   [ "$code" -eq 0 ] || return "$code"
 }
 

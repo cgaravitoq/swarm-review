@@ -868,6 +868,7 @@ args=()
 for argument in "$@"; do
   [ "$argument" = "--reflink=auto" ] || args+=("$argument")
 done
+sleep "\${FAKE_CP_SECONDS:-0}"
 exec /bin/cp "\${args[@]}"
 `,
     );
@@ -921,6 +922,7 @@ exec /bin/cp "\${args[@]}"
       reason: "the checkout root has no package.json",
       seconds: null,
       nothingToDo: null,
+      template: null,
     });
     // Reaching the review step is only half of it: the reviewer has to have
     // been handed a prompt, and the install must never have been attempted.
@@ -963,6 +965,7 @@ exec /bin/cp "\${args[@]}"
       reason: null,
       seconds: expect.any(Number),
       nothingToDo: false,
+      template: false,
     });
     expect(
       JSON.parse(await readFile(join(prepared.run, "status.json"), "utf8")),
@@ -1041,13 +1044,27 @@ exec /bin/cp "\${args[@]}"
 
     const result = spawnSync("bash", [runnerScript, prepared.run], {
       encoding: "utf8",
-      env: { ...prepared.env, REVIEW_TEMPLATE_ROOT: template },
+      env: {
+        ...prepared.env,
+        REVIEW_TEMPLATE_ROOT: template,
+        FAKE_CP_SECONDS: "2",
+      },
     });
+    const status = JSON.parse(
+      await readFile(join(prepared.run, "status.json"), "utf8"),
+    );
 
     expect(result.status, result.stderr).toBe(0);
     expect(await readFile(join(prepared.root, "template-seen"), "utf8")).toBe(
       "present\n",
     );
+    // The copy took two seconds of its own, and none of them are the install's.
+    expect(status.install).toMatchObject({
+      status: "installed",
+      template: true,
+      seconds: expect.any(Number),
+    });
+    expect(status.install.seconds).toBeLessThan(2);
     expect(await readFile(prepared.bunArgv, "utf8")).toContain(
       "install --frozen-lockfile",
     );
@@ -1069,6 +1086,14 @@ exec /bin/cp "\${args[@]}"
     });
 
     expect(result.status, result.stderr).toBe(0);
+    expect(
+      JSON.parse(await readFile(join(prepared.run, "status.json"), "utf8"))
+        .install,
+    ).toMatchObject({
+      status: "installed",
+      template: false,
+      seconds: expect.any(Number),
+    });
     expect(existsSync(join(prepared.root, "template-seen"))).toBe(false);
     expect(existsSync(join(prepared.run, "work/repo/node_modules"))).toBe(
       false,
@@ -1108,6 +1133,7 @@ exec /bin/cp "\${args[@]}"
       reason: null,
       seconds: expect.any(Number),
       nothingToDo: false,
+      template: false,
     });
     expect(steps.find((step) => step["step"] === "review")?.["exit"]).toBe(0);
     expect(await readFile(prepared.piArgv, "utf8")).toContain(
@@ -1139,6 +1165,7 @@ exec /bin/cp "\${args[@]}"
         "the checkout root has a package.json and no bun lockfile (found package-lock.json)",
       seconds: null,
       nothingToDo: null,
+      template: null,
     });
     expect(await readFile(prepared.bunArgv, "utf8")).not.toContain(
       "install --frozen-lockfile",
