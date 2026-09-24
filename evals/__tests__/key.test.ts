@@ -530,6 +530,42 @@ describe("buildTrials", () => {
     expect(trials[0]?.usage).toEqual({ inputTokens: 140, outputTokens: 15 });
   });
 
+  it("reads a usage record that names no token count as absent", () => {
+    const sheet = buildSheet(KEY, "W2", [
+      {
+        receiptPath: "r1.json",
+        receipt: swarmReceipt({
+          candidates: [],
+          findings: [],
+          lanes: [
+            {
+              laneId: "reviewer-1",
+              role: "reviewer",
+              model: "m",
+              status: "completed",
+              finishReason: "stop",
+              usage: { inputTokens: 100, outputTokens: 10 },
+            },
+            {
+              laneId: "reviewer-2",
+              role: "reviewer",
+              model: "m",
+              status: "failed",
+              finishReason: null,
+              usage: { turns: 0 },
+            },
+          ],
+        }),
+      },
+    ]);
+
+    expect(sheet.receipts[0]?.lanes[1]?.usage).toBeNull();
+    expect(buildTrials(KEY, sheet)[0]?.usage).toEqual({
+      inputTokens: 100,
+      outputTokens: 10,
+    });
+  });
+
   it("leaves a trial's token sum unobserved when a lane left its count unobserved", () => {
     const sheet = buildSheet(KEY, "W2", [
       {
