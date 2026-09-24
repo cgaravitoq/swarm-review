@@ -1333,6 +1333,21 @@ process.stdin.on("data", (chunk) => {
           toolName: "bash",
           args: { command: "long-running-command" },
         }) + "\\n");
+      } else if (cmd.message.includes("candidate then model error")) {
+        setTimeout(() => {
+          process.stdout.write(JSON.stringify({
+            type: "turn_end",
+            message: { stopReason: "stop", usage: { input: 3, output: 3, totalTokens: 6 } },
+          }) + "\\n");
+          process.stdout.write(JSON.stringify({
+            type: "agent_end",
+            messages: [{ role: "assistant", content: [{ type: "text", text: "candidate before the error" }] }],
+          }) + "\\n");
+          process.stdout.write(JSON.stringify({
+            type: "turn_end",
+            message: { stopReason: "error", errorMessage: "provider model error" },
+          }) + "\\n");
+        }, 30);
       } else if (cmd.message.includes("candidate then continue")) {
         setTimeout(() => {
           process.stdout.write(JSON.stringify({
@@ -2525,6 +2540,41 @@ process.stdin.on("data", (chunk) => {
         });
       } finally {
         modelError.runnerProc.kill();
+      }
+    }
+  });
+
+  it("keeps a failed or blocked review's ending through the cancel that ends it", async () => {
+    // A driver cancels a review the provider already refused so the runner
+    // writes its evidence and stops; the cancel is not why the review ended.
+    const cases = [
+      ["simulate quota blocked", "blocked", "quota_blocked"],
+      ["candidate then model error", "failed", "model_error"],
+    ] as const;
+    for (const [prompt, state, reason] of cases) {
+      const lane = await prepareSupervisedRun(`cancel-after-${reason}`, prompt);
+      try {
+        const statusPath = join(lane.root, "status.json");
+        await waitForStatus(
+          statusPath,
+          (status) =>
+            status["state"] === state && status["terminalReason"] === reason,
+        );
+        await sendCommand(lane.sockPath, {
+          type: "cancel",
+          reason: "cancelled_by_conductor",
+        });
+        expect(await waitForExit(lane.runnerProc)).toBe(130);
+        expect(
+          JSON.parse(await readFile(statusPath, "utf8")),
+          prompt,
+        ).toMatchObject({
+          state,
+          terminalReason: reason,
+          process: { alive: false },
+        });
+      } finally {
+        lane.runnerProc.kill();
       }
     }
   });
