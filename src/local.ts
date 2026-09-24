@@ -351,8 +351,9 @@ export type BridgeResponse = {
 };
 
 /**
- * The host's own copy of every file the lane image executes or reads, keyed
- * by the container path the image runs it from.
+ * The sha256 of the host's copy of every file in `container/` the image is
+ * built from, the Dockerfile among them, keyed by the path the image holds it
+ * at.
  */
 export async function readImageSources(
   containerDir: string,
