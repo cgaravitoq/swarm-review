@@ -1610,6 +1610,23 @@ exec /bin/date "$@"
     throw new Error(`Predicate on ${tracePath} not met after ${timeoutMs}ms`);
   };
 
+  /** A log the fake Pi appends to, once it holds what the test waits for. */
+  const waitForLog = async (
+    path: string,
+    predicate: (log: string) => boolean,
+    timeoutMs = SUPERVISED_WAIT_MS,
+  ) => {
+    const start = Date.now();
+    while (Date.now() - start < timeoutMs) {
+      try {
+        const log = await readFile(path, "utf8");
+        if (predicate(log)) return log;
+      } catch {}
+      await new Promise((r) => setTimeout(r, 20));
+    }
+    throw new Error(`Predicate on ${path} not met after ${timeoutMs}ms`);
+  };
+
   /** When Pi read the bridge's nth command of a type, by Pi's own clock. */
   const piReadAt = async (root: string, type: string, nth = 0) => {
     const read = (await readFile(join(root, "pi-clock.jsonl"), "utf8"))
@@ -2023,7 +2040,11 @@ exec /bin/date "$@"
         (line) =>
           line["type"] === "budget_notice" && line["name"] === "seconds",
       );
-      const steers = await readFile(join(root, "pi-steer.log"), "utf8");
+      // The bridge traces the notice before it sends it, and Pi logs its
+      // clock read before the steer, so the steer's own line orders both.
+      const steers = await waitForLog(join(root, "pi-steer.log"), (log) =>
+        log.includes("seconds spent."),
+      );
       const notice = secondsNotice(steers);
       expect(notice.cap).toBe(window.seconds);
       // What the notice says was spent is the time from the briefing to the
