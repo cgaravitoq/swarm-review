@@ -52,9 +52,11 @@ export const CANARY_PROMPT = "Reply with the single word: ok";
  * The gateway's `/compat` route forwards the request body to the vendor almost
  * untouched, so a body that is valid for one lab is refused by another. The
  * prefix is what the gateway itself routes on, which makes it the only thing a
- * caller has to know.
+ * caller has to know. Workers AI's own endpoint takes the same model without
+ * the gateway's prefix.
  */
 const modelLab = (model: string) => {
+  if (model.startsWith("@cf/")) return "workers-ai";
   const separator = model.indexOf("/");
   return separator === -1 ? "" : model.slice(0, separator);
 };
