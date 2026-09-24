@@ -757,6 +757,39 @@ describe("cloud model session accounting", () => {
     });
   });
 
+  it("says a session total is short by the request that never reported that side", async () => {
+    const sandbox = await runningSandbox();
+    getSandbox.mockReturnValue(sandbox);
+    vi.stubGlobal(
+      "fetch",
+      vi
+        .fn<typeof fetch>()
+        .mockResolvedValueOnce(
+          new Response('data: {"usage":{"completion_tokens":7}}'),
+        )
+        .mockResolvedValueOnce(
+          new Response(
+            'data: {"usage":{"prompt_tokens":3,"completion_tokens":1}}',
+          ),
+        ),
+    );
+
+    await (await postModel("one-sided-run")).text();
+    await (await postModel("one-sided-run")).text();
+
+    // Three input tokens is what one of the two requests reported, and the
+    // count beside it is what keeps that sum from reading as the lane's input.
+    expect((await sandbox.modelUsage())?.totals).toEqual({
+      requests: 2,
+      retries: 0,
+      input: 3,
+      output: 8,
+      unended: 0,
+      inputUnobserved: 1,
+      outputUnobserved: 0,
+    });
+  });
+
   it("keeps an attempt unended when the client walks away before the stream closes", async () => {
     const sandbox = await runningSandbox();
     getSandbox.mockReturnValue(sandbox);
@@ -816,6 +849,39 @@ describe("cloud model session accounting", () => {
       retries: 0,
       input: 8,
       output: 2,
+    });
+  });
+
+  it("leaves the unobserved counts absent on a session stored before they were counted", async () => {
+    const sandbox = new ReviewSandbox({} as never, env as never);
+    Object.assign(sandbox, { ctx: { storage: storage() } });
+    await sandbox.putModelSession({
+      handle: broker.handle,
+      upstreamBaseUrl: broker.upstreamBaseUrl,
+      upstreamAuthorization: broker.upstreamAuthorization,
+      caps: broker.caps,
+      totals: { requests: 1, retries: 0, input: 5, output: 1, unended: 0 },
+    });
+    getSandbox.mockReturnValue(sandbox);
+    vi.stubGlobal(
+      "fetch",
+      vi.fn<typeof fetch>(() =>
+        Promise.resolve(
+          new Response('data: {"usage":{"completion_tokens":1}}'),
+        ),
+      ),
+    );
+
+    await (await postModel("stored-before-counts-run")).text();
+
+    // Requests nobody counted before cannot be counted from here, so the
+    // count stays absent rather than starting a number that reads as whole.
+    expect((await sandbox.modelUsage())?.totals).toEqual({
+      requests: 2,
+      retries: 0,
+      input: 5,
+      output: 2,
+      unended: 0,
     });
   });
 

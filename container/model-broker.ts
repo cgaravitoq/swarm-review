@@ -42,6 +42,17 @@ export type BrokerTotals = {
    * only saw the settled lines would read a request no record names.
    */
   unended: number;
+  /**
+   * Ended attempts whose response never reported that side of their usage: a
+   * retried or failed attempt, an answer without a usage frame, or one whose
+   * frames this hop could not read.
+   *
+   * `input` and `output` add only what a provider reported, so each is short by
+   * the attempts counted here, and a reader that saw only the sums would read
+   * them as complete.
+   */
+  inputUnobserved: number;
+  outputUnobserved: number;
 };
 
 export type BrokerConfig = {
@@ -138,6 +149,8 @@ type AttemptEnd =
     }
   | { event: "provider_error"; attempt: number; message: string };
 
+const UNREPORTED: ModelUsage = { input: null, output: null };
+
 const readBody = (stream: IncomingMessage) =>
   new Promise<Buffer>((resolve, reject) => {
     const chunks: Buffer[] = [];
@@ -149,7 +162,15 @@ const readBody = (stream: IncomingMessage) =>
 export function createBrokerServer(config: BrokerConfig) {
   const caps = config.caps;
   const ledgerPath = config.ledgerPath;
-  const totals = { requests: 0, retries: 0, input: 0, output: 0, unended: 0 };
+  const totals: BrokerTotals = {
+    requests: 0,
+    retries: 0,
+    input: 0,
+    output: 0,
+    unended: 0,
+    inputUnobserved: 0,
+    outputUnobserved: 0,
+  };
   // Numbered across the broker's whole run, not per HTTP request: the id is
   // what pairs an admission with its end, and pi sends many requests a lane.
   let admitted = 0;
@@ -307,15 +328,12 @@ export function createBrokerServer(config: BrokerConfig) {
             usage.write(text);
           }
           res.end();
-          const reported = usage.read();
-          totals.input += reported.input ?? 0;
-          totals.output += reported.output ?? 0;
           outcome = {
             event: "provider_request",
             status: upstream.status,
             attempt,
             path: target.pathname,
-            usage: reported,
+            usage: usage.read(),
             seal: upstream.body ? sealer.seal() : null,
           };
         }
@@ -323,6 +341,12 @@ export function createBrokerServer(config: BrokerConfig) {
         lastError = error instanceof Error ? error.message : String(error);
         outcome = { event: "provider_error", attempt, message: lastError };
       }
+      const reported =
+        outcome.event === "provider_request" ? outcome.usage : UNREPORTED;
+      if (reported.input === null) totals.inputUnobserved += 1;
+      else totals.input += reported.input;
+      if (reported.output === null) totals.outputUnobserved += 1;
+      else totals.output += reported.output;
       totals.unended -= 1;
       record({ ...outcome, attemptId, totals: { ...totals } });
       if (outcome.event === "provider_request") return;

@@ -73,13 +73,17 @@ export class ReviewSandbox extends Sandbox<ReviewPiEnv> {
   ) {
     const session = await this.ctx.storage.get<ModelSession>(MODEL_SESSION_KEY);
     if (!session) return;
-    if (usage) {
-      if (usage.input !== null) {
-        session.totals.input = (session.totals.input ?? 0) + usage.input;
-      }
-      if (usage.output !== null) {
-        session.totals.output = (session.totals.output ?? 0) + usage.output;
-      }
+    const input = usage?.input ?? null;
+    if (input !== null) {
+      session.totals.input = (session.totals.input ?? 0) + input;
+    } else if (session.totals.inputUnobserved !== undefined) {
+      session.totals.inputUnobserved += 1;
+    }
+    const output = usage?.output ?? null;
+    if (output !== null) {
+      session.totals.output = (session.totals.output ?? 0) + output;
+    } else if (session.totals.outputUnobserved !== undefined) {
+      session.totals.outputUnobserved += 1;
     }
     if (session.totals.unended !== undefined) session.totals.unended -= 1;
     session.retryPending = retryable;

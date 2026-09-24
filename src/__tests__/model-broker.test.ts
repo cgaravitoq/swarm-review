@@ -195,6 +195,8 @@ describe("model broker", () => {
       input: 1200,
       output: 300,
       unended: 0,
+      inputUnobserved: 0,
+      outputUnobserved: 0,
     });
   });
 
@@ -378,7 +380,33 @@ describe("model broker", () => {
 
     const entry = await requestEntry();
     expect(entry?.["usage"]).toEqual({ input: 2000, output: 42 });
-    expect(entry?.["totals"]).toMatchObject({ input: 2000, output: 42 });
+    expect(entry?.["totals"]).toMatchObject({
+      input: 2000,
+      output: 42,
+      inputUnobserved: 0,
+      outputUnobserved: 0,
+    });
+  });
+
+  it("counts a side no frame of the response reported as unobserved, never as zero", async () => {
+    upstreamBody =
+      'data: {"type":"message_delta","usage":{"output_tokens":7}}\n\n';
+
+    await call().then((response) => response.text());
+
+    const entry = await requestEntry();
+    expect(entry?.["usage"]).toEqual({ input: null, output: 7 });
+    // The input total adds nothing for this request, and the count beside it
+    // is what says the total is one request short.
+    expect(entry?.["totals"]).toEqual({
+      requests: 1,
+      retries: 0,
+      input: 0,
+      output: 7,
+      unended: 0,
+      inputUnobserved: 1,
+      outputUnobserved: 0,
+    });
   });
 
   it("seals the answer text that crossed the broker, which report.json cannot rewrite", async () => {
@@ -490,8 +518,15 @@ describe("model broker", () => {
       .filter((line) => line.totals)
       .at(-1).totals;
     // The retried attempt ended at its 503, so the only attempts the totals
-    // may call open are ones that never came back.
-    expect(totals).toMatchObject({ requests: 2, retries: 1, unended: 0 });
+    // may call open are ones that never came back. Neither 503 reported any
+    // usage, so both are counted as unobserved rather than as free.
+    expect(totals).toMatchObject({
+      requests: 2,
+      retries: 1,
+      unended: 0,
+      inputUnobserved: 2,
+      outputUnobserved: 2,
+    });
   });
 
   it("ends every attempt a provider it cannot reach turned away", async () => {
@@ -524,7 +559,13 @@ describe("model broker", () => {
         .map((entry) => entry.attemptId),
     ).toEqual([1, 2]);
     expect(entries.filter((entry) => entry.totals).at(-1).totals).toMatchObject(
-      { requests: 2, retries: 1, unended: 0 },
+      {
+        requests: 2,
+        retries: 1,
+        unended: 0,
+        inputUnobserved: 2,
+        outputUnobserved: 2,
+      },
     );
   });
 
@@ -757,6 +798,8 @@ describe("attempt reservation", () => {
       input: 0,
       output: 0,
       unended: 0,
+      inputUnobserved: 0,
+      outputUnobserved: 0,
     };
 
     expect(reserveAttempt(totals, caps, false)).toBeNull();
@@ -768,6 +811,8 @@ describe("attempt reservation", () => {
       input: 0,
       output: 0,
       unended: 2,
+      inputUnobserved: 0,
+      outputUnobserved: 0,
     });
     // The third attempt is refused instead of being counted after the fact.
     expect(reserveAttempt(totals, caps, false)).toBe("max_requests");
@@ -777,14 +822,30 @@ describe("attempt reservation", () => {
   it("refuses once the cumulative token totals are already spent", () => {
     expect(
       reserveAttempt(
-        { requests: 0, retries: 0, input: 100, output: 0, unended: 0 },
+        {
+          requests: 0,
+          retries: 0,
+          input: 100,
+          output: 0,
+          unended: 0,
+          inputUnobserved: 0,
+          outputUnobserved: 0,
+        },
         caps,
         false,
       ),
     ).toBe("max_input_tokens");
     expect(
       reserveAttempt(
-        { requests: 0, retries: 0, input: 0, output: 100, unended: 0 },
+        {
+          requests: 0,
+          retries: 0,
+          input: 0,
+          output: 100,
+          unended: 0,
+          inputUnobserved: 0,
+          outputUnobserved: 0,
+        },
         caps,
         false,
       ),

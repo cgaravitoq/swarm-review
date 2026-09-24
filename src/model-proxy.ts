@@ -42,6 +42,18 @@ export type ModelTotals = {
    * be counted down.
    */
   unended?: number;
+  /**
+   * Ended attempts whose response never reported that side of their usage: an
+   * attempt the upstream never answered, an answer without a body or a usage
+   * frame, or one whose frames this hop could not read.
+   *
+   * `input` and `output` add only what a provider reported, so each is short by
+   * the attempts counted here, and a reader that saw only the sums would read
+   * them as complete. Absent, like `unended`, on a session stored before the
+   * count existed.
+   */
+  inputUnobserved?: number;
+  outputUnobserved?: number;
 };
 
 export type ModelSession = {
@@ -111,6 +123,8 @@ export const emptyModelTotals = (): ModelTotals => ({
   input: null,
   output: null,
   unended: 0,
+  inputUnobserved: 0,
+  outputUnobserved: 0,
 });
 
 export function publicModelUsage(session: ModelSession | undefined) {
