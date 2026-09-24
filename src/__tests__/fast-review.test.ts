@@ -401,6 +401,21 @@ describe("completeOnce", () => {
       chat_template_kwargs: { thinking: false },
     });
 
+    // Workers AI's own endpoint takes the id without the gateway's prefix,
+    // and the model thinks by default there too.
+    expect(
+      packedRequestBody({
+        ...base,
+        model: "@cf/deepseek-ai/deepseek-v4-flash-0731",
+      }),
+    ).toEqual({
+      model: "@cf/deepseek-ai/deepseek-v4-flash-0731",
+      messages: [{ role: "user", content: "review" }],
+      max_tokens: 8192,
+      temperature: 0,
+      chat_template_kwargs: { thinking: false },
+    });
+
     // xAI and any id without a lab prefix keep the classic shape, which is
     // what a direct provider call has always sent.
     expect(packedRequestBody({ ...base, model: "grok-4.6" })).toEqual({
