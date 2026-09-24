@@ -744,33 +744,52 @@ export async function fetchThreeDotDiff(
 }
 
 /**
- * Every review on the pull request, not just the first page.
+ * Every page of a GitHub list endpoint, not just the first.
  *
- * A missed page reads as "never published", and the run would post its own
- * review a second time.
+ * A missed page reads as "never written", and the caller then posts a second
+ * copy of something the pull request already carries.
  */
-export async function fetchReviews(
-  repo: string,
-  pullRequest: number,
+async function githubPages<T>(
+  path: string,
+  what: string,
   token: string,
-) {
-  const reviews: { id: number; body?: string | null }[] = [];
+): Promise<T[]> {
+  const entries: T[] = [];
   for (let page = 1; ; page += 1) {
     const response = await fetch(
-      `https://api.github.com/repos/${repo}/pulls/${pullRequest}/reviews?per_page=100&page=${page}`,
+      `https://api.github.com${path}?per_page=100&page=${page}`,
       { headers: githubHeaders(token, "application/vnd.github+json") },
     );
     if (!response.ok) {
-      throw new Error(`GitHub reviews request failed: ${response.status}`);
+      throw new Error(`GitHub ${what} request failed: ${response.status}`);
     }
-    const batch = (await response.json()) as {
-      id: number;
-      body?: string | null;
-    }[];
-    reviews.push(...batch);
-    if (batch.length < 100) return reviews;
+    const batch = (await response.json()) as T[];
+    entries.push(...batch);
+    if (batch.length < 100) return entries;
   }
 }
+
+export const fetchReviews = (
+  repo: string,
+  pullRequest: number,
+  token: string,
+) =>
+  githubPages<{ id: number; body?: string | null }>(
+    `/repos/${repo}/pulls/${pullRequest}/reviews`,
+    "reviews",
+    token,
+  );
+
+export const fetchIssueComments = (
+  repo: string,
+  pullRequest: number,
+  token: string,
+) =>
+  githubPages<{ id: number; body?: string | null }>(
+    `/repos/${repo}/issues/${pullRequest}/comments`,
+    "comments",
+    token,
+  );
 
 export async function revalidatePullRequest(
   repo: string,
