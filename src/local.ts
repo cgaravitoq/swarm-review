@@ -35,6 +35,7 @@ import {
   parseEnvironmentProbe,
 } from "./admission";
 import { writeAtomic } from "./attempt";
+import { laneImageReference } from "./image-tag";
 import {
   BROKER_PORT,
   CONTROL_DIR,
@@ -117,6 +118,7 @@ export const EXPORTED_ARTIFACTS = [
   "trace.jsonl",
   "review-error.json",
   "run.log",
+  "install.log",
   "diff.stat",
   "check.log",
   "prompt.txt",
@@ -2005,7 +2007,8 @@ export async function readActivity(
 
 async function main() {
   const startedAt = Date.now();
-  const options = parseOptions(process.argv.slice(2));
+  const argv = process.argv.slice(2);
+  const options = parseOptions(argv);
   // One value for the whole lane: the broker cuts it at these caps and the
   // runner's notice is measured against the same numbers, so a lane cannot be
   // told one budget and stopped at another.
@@ -2030,6 +2033,21 @@ async function main() {
   // them in its own metadata.
   const repo = isControlAction ? "" : requiredRepo(options.repo);
   const sourceRepo = isControlAction ? "" : requiredSource(options.source);
+  const runnerPath = join(
+    dirname(fileURLToPath(import.meta.url)),
+    "..",
+    "container",
+    "review-run.sh",
+  );
+  if (!isControlAction) {
+    const containerDir = dirname(runnerPath);
+    options.image = await laneImageReference(
+      repo,
+      flag(argv, "image"),
+      containerDir,
+      join(containerDir, "context", "bun.lock"),
+    );
+  }
   await mkdir(options.outDir, { recursive: true });
   const outDir = join(options.outDir, options.runId);
   await mkdir(outDir, { recursive: true });
@@ -2037,12 +2055,6 @@ async function main() {
   let containerRunDir = `/workspace/runs/${options.runId}`;
   let containerName = `review-pi-local-${options.runId}`;
   let ownershipId: string = randomUUID();
-  const runnerPath = join(
-    dirname(fileURLToPath(import.meta.url)),
-    "..",
-    "container",
-    "review-run.sh",
-  );
   const controller = new AbortController();
   let interrupted = false;
   const onSignal = () => {

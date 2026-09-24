@@ -43,6 +43,7 @@ import {
   type ModelCanary,
   writeFastLaneArtifacts,
 } from "./fast-review";
+import { laneImageReference } from "./image-tag";
 import { BROKER_LEDGER } from "./isolation";
 import {
   assertRunId,
@@ -2158,7 +2159,8 @@ export const neverReachedModel = (evidence: {
       !evidence.receipt.modelRequests));
 
 async function main() {
-  const options = parseSwarmOptions(process.argv.slice(2));
+  const argv = process.argv.slice(2);
+  const options = parseSwarmOptions(argv);
   // The input ceiling every brokered lane of this run is held to: the trial's,
   // or the one the caller lowered it to. A packed lane calls the provider from
   // this process and has no broker to hold it to anything.
@@ -2171,6 +2173,19 @@ async function main() {
   // and objects are read out of. Both are required before anything is paid for.
   const repo = requiredRepo(options.repo);
   const sourceRepo = requiredSource(options.source);
+  if (options.sandbox) {
+    const containerDir = join(
+      dirname(fileURLToPath(import.meta.url)),
+      "..",
+      "container",
+    );
+    options.image = await laneImageReference(
+      repo,
+      flag(argv, "image"),
+      containerDir,
+      join(containerDir, "context", "bun.lock"),
+    );
+  }
   const suiteDir = resolve(options.outDir, options.swarmId);
   await mkdir(options.outDir, { recursive: true });
   await mkdir(suiteDir);

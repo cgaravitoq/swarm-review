@@ -1,6 +1,6 @@
 import { execFileSync, spawn } from "node:child_process";
 import { createHash } from "node:crypto";
-import { readFileSync } from "node:fs";
+import { existsSync, readFileSync, realpathSync } from "node:fs";
 import {
   appendFile,
   chmod,
@@ -22,6 +22,7 @@ import { createBrokerServer } from "../../container/model-broker";
 import { PARTIAL_SUFFIX } from "../attempt";
 import { FINALIZE_REQUEST_RESERVE } from "../drive";
 import { CANARY_PROMPT } from "../fast-review";
+import { imageReference, imageTagFromFiles } from "../image-tag";
 import { TEARDOWN_BUDGET_SECONDS } from "../local";
 import { wholeChangeFits } from "../pack-context";
 import { IMAGE_SOURCES } from "../protocol";
@@ -2563,10 +2564,16 @@ exec /usr/bin/git "$@"
     await cp(join(packageRoot, "src"), join(repo, "agents/review-pi/src"), {
       recursive: true,
     });
-    await cp(
-      join(packageRoot, "container"),
-      join(repo, "agents/review-pi/container"),
-      { recursive: true },
+    const laneContainer = join(repo, "agents/review-pi/container");
+    await cp(join(packageRoot, "container"), laneContainer, {
+      recursive: true,
+      filter: (path) =>
+        !path.startsWith(join(packageRoot, "container/context")),
+    });
+    await mkdir(join(laneContainer, "context"));
+    await writeFile(
+      join(laneContainer, "context/bun.lock"),
+      '{"lockfileVersion":1}\n',
     );
     await cp(
       join(packageRoot, "prompts"),
@@ -2602,6 +2609,7 @@ exec /usr/bin/git "$@"
       out: join(root, "out"),
       repo,
       swarmScript: join(repo, "agents/review-pi/src/swarm.ts"),
+      laneContainer,
       state,
       reports,
       forged,
@@ -3057,6 +3065,83 @@ exec /usr/bin/git "$@"
       "the checkout root has no package.json",
     );
   }, 120_000);
+
+  const inspectedImages = async (arranged: Arranged) =>
+    new Set(
+      [
+        ...(
+          await readFile(join(arranged.state, "docker.log"), "utf8")
+        ).matchAll(/^image inspect --format \{\{\.Id\}\} (\S+)$/gm),
+      ].map((match) => match[1]),
+    );
+
+  const runQuietSwarm = async (
+    arranged: Arranged,
+    swarmId: string,
+    extra: string[] = [],
+  ) => {
+    for (const lane of ["reviewer-1", "reviewer-2", "verifier"]) {
+      await writeReport(arranged, `${swarmId}-${lane}`, answer([]));
+    }
+    return runSwarm([...swarmArguments(arranged, swarmId), ...extra], arranged);
+  };
+
+  it("keeps an explicit --image that names the legacy tag", async () => {
+    const arranged = await arrange("success");
+    const result = await runQuietSwarm(arranged, "swarm-legacy-image", [
+      "--image",
+      "review-pi-b5-swarm",
+    ]);
+
+    expect(result.code, result.output).toBe(0);
+    expect(await inspectedImages(arranged)).toEqual(
+      new Set(["review-pi-b5-swarm"]),
+    );
+  }, 120_000);
+
+  it("runs every lane on the image derived from the container sources and lockfile", async () => {
+    const arranged = await arrange("success");
+    const expected = imageReference(
+      TARGET_REPO,
+      await imageTagFromFiles(
+        arranged.laneContainer,
+        join(arranged.laneContainer, "context/bun.lock"),
+      ),
+    );
+
+    const result = await runQuietSwarm(arranged, "swarm-derived-image");
+
+    expect(result.code, result.output).toBe(0);
+    expect(await inspectedImages(arranged)).toEqual(new Set([expected]));
+  }, 120_000);
+
+  it("runs every lane on an explicit --image", async () => {
+    const arranged = await arrange("success");
+    const result = await runQuietSwarm(arranged, "swarm-explicit-image", [
+      "--image",
+      "x",
+    ]);
+
+    expect(result.code, result.output).toBe(0);
+    expect(await inspectedImages(arranged)).toEqual(new Set(["x"]));
+  }, 120_000);
+
+  it("names the missing lockfile before creating anything when no --image is given", async () => {
+    const arranged = await arrange("success");
+    const lockfile = join(
+      realpathSync(arranged.laneContainer),
+      "context/bun.lock",
+    );
+    await rm(lockfile);
+
+    const result = await runQuietSwarm(arranged, "swarm-cold-checkout");
+
+    expect(result.code).toBe(1);
+    expect(result.output).toContain(
+      `no --image was given and ${lockfile} is missing, so the sandbox image tag cannot be derived: stage it with \`bun run deploy --target <checkout>\` or pass --image`,
+    );
+    expect(existsSync(arranged.out)).toBe(false);
+  }, 60_000);
 
   it("tells a warm sandbox verifier with nothing to rule on to stand down and removes it", async () => {
     const arranged = await arrange("success");

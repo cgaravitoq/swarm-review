@@ -1,5 +1,5 @@
 import { execFileSync, spawn, spawnSync } from "node:child_process";
-import { statSync } from "node:fs";
+import { existsSync, statSync } from "node:fs";
 import {
   chmod,
   mkdir,
@@ -799,6 +799,12 @@ if [ ! -f package.json ]; then
   printf 'error: Bun could not find a package.json file to install from\\n' >&2
   exit 1
 fi
+if [ -f node_modules/.template-marker ]; then
+  printf 'present\\n' > ${join(root, "template-seen")}
+fi
+if [ "\${FAKE_BUN_NO_CHANGES:-}" = "1" ]; then
+  printf 'Checked 10 installs across 20 packages (no changes)\\n' >&2
+fi
 exit "\${FAKE_BUN_INSTALL_EXIT:-0}"
 `,
     );
@@ -853,6 +859,21 @@ child.on("exit", (code, signal) => {
 `,
     );
     await chmod(join(bin, "timeout"), 0o755);
+    // GNU cp's --reflink, which the image's template copy uses, is not an
+    // option macOS cp accepts, so the double drops it and copies with the
+    // host's own cp.
+    await writeFile(
+      join(bin, "cp"),
+      `#!/bin/bash
+args=()
+for argument in "$@"; do
+  [ "$argument" = "--reflink=auto" ] || args+=("$argument")
+done
+sleep "\${FAKE_CP_SECONDS:-0}"
+exec /bin/cp "\${args[@]}"
+`,
+    );
+    await chmod(join(bin, "cp"), 0o755);
     return {
       root,
       run,
@@ -861,6 +882,9 @@ child.on("exit", (code, signal) => {
       env: {
         ...process.env,
         PATH: `${bin}:${process.env["PATH"] ?? ""}`,
+        // A host that happens to carry /opt/review must not decide what a
+        // test without a staged template records.
+        REVIEW_TEMPLATE_ROOT: join(root, "no-template"),
       },
     };
   };
@@ -900,6 +924,9 @@ child.on("exit", (code, signal) => {
       status: "skipped",
       manifest: null,
       reason: "the checkout root has no package.json",
+      seconds: null,
+      nothingToDo: null,
+      template: null,
     });
     // Reaching the review step is only half of it: the reviewer has to have
     // been handed a prompt, and the install must never have been attempted.
@@ -940,6 +967,18 @@ child.on("exit", (code, signal) => {
       status: "installed",
       manifest: "bun.lock",
       reason: null,
+      seconds: expect.any(Number),
+      nothingToDo: false,
+      template: "absent",
+    });
+    expect(
+      JSON.parse(await readFile(join(prepared.run, "status.json"), "utf8")),
+    ).toMatchObject({
+      install: {
+        status: "installed",
+        seconds: expect.any(Number),
+        nothingToDo: false,
+      },
     });
     expect(steps.find((step) => step["step"] === "review")?.["exit"]).toBe(0);
     expect(await readFile(prepared.piArgv, "utf8")).toContain(
@@ -967,6 +1006,178 @@ child.on("exit", (code, signal) => {
     });
     expect(steps.some((step) => step["step"] === "review")).toBe(false);
   });
+
+  it("records Bun's no-changes result in status.json", async () => {
+    const prepared = await prepareRun("bun-no-changes", {
+      "package.json": '{"name":"demo"}\n',
+      "bun.lock": '{"lockfileVersion":1}\n',
+    });
+    const result = spawnSync("bash", [runnerScript, prepared.run], {
+      encoding: "utf8",
+      env: { ...prepared.env, FAKE_BUN_NO_CHANGES: "1" },
+    });
+    const status = JSON.parse(
+      await readFile(join(prepared.run, "status.json"), "utf8"),
+    );
+    expect(result.status).toBe(0);
+    expect(status.install).toMatchObject({
+      status: "installed",
+      nothingToDo: true,
+      seconds: expect.any(Number),
+    });
+  });
+
+  const stageTemplate = async (root: string, lockfile: string) => {
+    const template = join(root, "template");
+    await mkdir(join(template, "node_modules-template"), { recursive: true });
+    await writeFile(join(template, "template-bun.lock"), lockfile);
+    await writeFile(
+      join(template, "node_modules-template/.template-marker"),
+      "baked\n",
+    );
+    return template;
+  };
+
+  it("places the baked template under the clone before bun installs a matching lockfile", async () => {
+    const lockfile = '{"lockfileVersion":1}\n';
+    const prepared = await prepareRun("template-match", {
+      "package.json": '{"name":"demo"}\n',
+      "bun.lock": lockfile,
+    });
+    const template = await stageTemplate(prepared.root, lockfile);
+
+    const result = spawnSync("bash", [runnerScript, prepared.run], {
+      encoding: "utf8",
+      env: {
+        ...prepared.env,
+        REVIEW_TEMPLATE_ROOT: template,
+        FAKE_CP_SECONDS: "2",
+      },
+    });
+    const status = JSON.parse(
+      await readFile(join(prepared.run, "status.json"), "utf8"),
+    );
+
+    expect(result.status, result.stderr).toBe(0);
+    expect(await readFile(join(prepared.root, "template-seen"), "utf8")).toBe(
+      "present\n",
+    );
+    // The copy took two seconds of its own, and none of them are the install's.
+    expect(status.install).toMatchObject({
+      status: "installed",
+      template: "copied",
+      seconds: expect.any(Number),
+    });
+    expect(status.install.seconds).toBeLessThan(2);
+    expect(await readFile(prepared.bunArgv, "utf8")).toContain(
+      "install --frozen-lockfile",
+    );
+  });
+
+  it("copies nothing and still installs when the lockfile differs from the template's", async () => {
+    const prepared = await prepareRun("template-mismatch", {
+      "package.json": '{"name":"demo"}\n',
+      "bun.lock": '{"lockfileVersion":1}\n',
+    });
+    const template = await stageTemplate(
+      prepared.root,
+      '{"lockfileVersion":1,"other":true}\n',
+    );
+
+    const result = spawnSync("bash", [runnerScript, prepared.run], {
+      encoding: "utf8",
+      env: { ...prepared.env, REVIEW_TEMPLATE_ROOT: template },
+    });
+
+    expect(result.status, result.stderr).toBe(0);
+    expect(
+      JSON.parse(await readFile(join(prepared.run, "status.json"), "utf8"))
+        .install,
+    ).toMatchObject({
+      status: "installed",
+      template: "mismatch",
+      seconds: expect.any(Number),
+    });
+    expect(existsSync(join(prepared.root, "template-seen"))).toBe(false);
+    expect(existsSync(join(prepared.run, "work/repo/node_modules"))).toBe(
+      false,
+    );
+    expect(await readFile(prepared.bunArgv, "utf8")).toContain(
+      "install --frozen-lockfile",
+    );
+  });
+
+  it("records a failed template copy as the install's failure", async () => {
+    const lockfile = '{"lockfileVersion":1}\n';
+    const prepared = await prepareRun("template-copy-failure", {
+      "package.json": '{"name":"demo"}\n',
+      "bun.lock": lockfile,
+      node_modules: "a regular file where the template goes\n",
+    });
+    const template = await stageTemplate(prepared.root, lockfile);
+
+    const result = spawnSync("bash", [runnerScript, prepared.run], {
+      encoding: "utf8",
+      env: { ...prepared.env, REVIEW_TEMPLATE_ROOT: template },
+    });
+    const failed = {
+      status: "failed",
+      manifest: "bun.lock",
+      reason: "template copy: exit 1",
+      seconds: null,
+      nothingToDo: null,
+      template: null,
+    };
+
+    expect(result.status).not.toBe(0);
+    expect(
+      JSON.parse(await readFile(join(prepared.run, "install.json"), "utf8")),
+    ).toEqual(failed);
+    expect(
+      JSON.parse(await readFile(join(prepared.run, "status.json"), "utf8"))
+        .install,
+    ).toEqual(failed);
+    expect(existsSync(prepared.bunArgv)).toBe(false);
+  });
+
+  it.each([
+    ["matches", '{"lockfileVersion":1}\n'],
+    ["differs from", '{"lockfileVersion":1,"other":true}\n'],
+  ])(
+    "records an image without a template as absent when the lockfile %s the bake's",
+    async (_, bakedLockfile) => {
+      const lockfile = '{"lockfileVersion":1}\n';
+      const prepared = await prepareRun("template-absent", {
+        "package.json": '{"name":"demo"}\n',
+        "bun.lock": lockfile,
+      });
+      // The lockfile survived the bake and the tree did not, which is a broken
+      // image rather than a target whose lockfile moved.
+      const template = await stageTemplate(prepared.root, bakedLockfile);
+      await rm(join(template, "node_modules-template"), { recursive: true });
+
+      const result = spawnSync("bash", [runnerScript, prepared.run], {
+        encoding: "utf8",
+        env: { ...prepared.env, REVIEW_TEMPLATE_ROOT: template },
+      });
+
+      expect(result.status, result.stderr).toBe(0);
+      expect(
+        JSON.parse(await readFile(join(prepared.run, "status.json"), "utf8"))
+          .install,
+      ).toMatchObject({
+        status: "installed",
+        template: "absent",
+        seconds: expect.any(Number),
+      });
+      expect(existsSync(join(prepared.run, "work/repo/node_modules"))).toBe(
+        false,
+      );
+      expect(await readFile(prepared.bunArgv, "utf8")).toContain(
+        "install --frozen-lockfile",
+      );
+    },
+  );
 
   it("installs with bun when the checkout root carries the binary lockfile", async () => {
     const prepared = await prepareRun("bun-lockb-project", {
@@ -996,6 +1207,9 @@ child.on("exit", (code, signal) => {
       status: "installed",
       manifest: "bun.lockb",
       reason: null,
+      seconds: expect.any(Number),
+      nothingToDo: false,
+      template: "absent",
     });
     expect(steps.find((step) => step["step"] === "review")?.["exit"]).toBe(0);
     expect(await readFile(prepared.piArgv, "utf8")).toContain(
@@ -1025,6 +1239,9 @@ child.on("exit", (code, signal) => {
       manifest: null,
       reason:
         "the checkout root has a package.json and no bun lockfile (found package-lock.json)",
+      seconds: null,
+      nothingToDo: null,
+      template: null,
     });
     expect(await readFile(prepared.bunArgv, "utf8")).not.toContain(
       "install --frozen-lockfile",

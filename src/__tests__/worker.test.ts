@@ -5,7 +5,11 @@ import { tmpdir } from "node:os";
 import path from "node:path";
 
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { deployArguments, targetCheckout } from "../../scripts/deploy";
+import {
+  deployArguments,
+  imageBuildArguments,
+  targetCheckout,
+} from "../../scripts/deploy";
 import { gitCapability } from "../git-proxy";
 import { CONTROL_DIR, MODEL_BROKER, TARGET_UID } from "../isolation";
 import { emptyModelTotals, modelCapability } from "../model-proxy";
@@ -377,6 +381,7 @@ describe("review run lifecycle", () => {
       path.join(directory, "status.json"),
       "x".repeat(MAX_ARTIFACT_BYTES + 17),
     );
+    await writeFile(path.join(directory, "install.log"), "installed\n");
     const quotedDirectory = `'${directory.replaceAll("'", "'\\''")}'`;
     const exec = vi.fn(async (command: string) => {
       const platformCommand =
@@ -420,6 +425,11 @@ describe("review run lifecycle", () => {
               content: expect.stringMatching(
                 new RegExp(`^x{${MAX_ARTIFACT_BYTES}}$`),
               ),
+            }),
+            expect.objectContaining({
+              path: "/workspace/runs/artifact-shell/install.log",
+              exists: true,
+              content: "installed\n",
             }),
           ]),
         }),
@@ -776,10 +786,10 @@ describe("deployed container image", () => {
         "/opt/review/extensions/claude-code-provider.js",
       ],
       ["models.json", "/opt/review/pi-config/models.json"],
-      ["review-run.sh", REVIEW_RUNNER],
       ["model-broker.ts", MODEL_BROKER],
       ["response-seal.ts", "/opt/review/response-seal.ts"],
       ["response-usage.ts", "/opt/review/response-usage.ts"],
+      ["review-run.sh", REVIEW_RUNNER],
       ["Dockerfile", "/opt/review/Dockerfile"],
     ]);
   });
@@ -842,6 +852,30 @@ describe("deployed container image", () => {
     ).toEqual(["--var", "TARGET_REPOSITORY:https://github.com/acme/demo.git"]);
     expect(deployArguments(["--var", "X:1"])).toEqual(["--var", "X:1"]);
     expect(deployArguments([])).toEqual([]);
+    expect(
+      deployArguments([
+        "--target",
+        "/checkouts/demo",
+        "--repo",
+        "acme/demo",
+        "--image-only",
+      ]),
+    ).toEqual([]);
+  });
+
+  it("builds the computed image reference for the lane platform", () => {
+    expect(
+      imageBuildArguments(
+        "ghcr.io/acme/demo-swarm-review-sandbox:1234567890abcdef",
+      ),
+    ).toEqual([
+      "build",
+      "--platform",
+      "linux/amd64",
+      "-t",
+      "ghcr.io/acme/demo-swarm-review-sandbox:1234567890abcdef",
+      path.join(packageRoot, "container"),
+    ]);
   });
 });
 

@@ -3,6 +3,7 @@ import { createHash } from "node:crypto";
 import { existsSync, readFileSync, realpathSync } from "node:fs";
 import {
   chmod,
+  cp,
   link,
   mkdir,
   mkdtemp,
@@ -16,6 +17,7 @@ import { tmpdir } from "node:os";
 import { basename, dirname, join } from "node:path";
 import { fileURLToPath, pathToFileURL, URL } from "node:url";
 import { afterAll, afterEach, describe, expect, it, vi } from "vitest";
+import { imageReference, imageTagFromFiles } from "../image-tag";
 import {
   adaptModelsConfig,
   assertRunId,
@@ -213,9 +215,41 @@ const localArguments = (out: string, runId: string) => [
   "acme/demo",
   "--source",
   repoRoot,
+  "--image",
+  "review-pi-b5-local",
   "--total-timeout",
   String(RUN_BUDGET_SECONDS),
 ];
+
+/**
+ * A copy of the driver whose `container/context` holds only what the test
+ * stages, so a run without `--image` derives its tag from these bytes and not
+ * from whatever the host last deployed.
+ */
+const stageDriver = async (root: string, lockfile?: string) => {
+  const driver = join(root, "driver");
+  for (const directory of ["src", "prompts"]) {
+    await cp(join(packageRoot, directory), join(driver, directory), {
+      recursive: true,
+    });
+  }
+  const container = join(driver, "container");
+  await cp(join(packageRoot, "container"), container, {
+    recursive: true,
+    filter: (path) => !path.startsWith(join(packageRoot, "container/context")),
+  });
+  if (lockfile !== undefined) {
+    await mkdir(join(container, "context"));
+    await writeFile(join(container, "context/bun.lock"), lockfile);
+  }
+  return { script: join(driver, "src/local.ts"), container };
+};
+
+const withoutImage = (script: string, args: string[]) => {
+  const rest = args.slice(1);
+  rest.splice(rest.indexOf("--image"), 2);
+  return [script, ...rest];
+};
 
 const runLocalCli = (args: string[], env: NodeJS.ProcessEnv) =>
   new Promise<{ code: number; output: string }>((resolvePromise) => {
@@ -360,6 +394,7 @@ if [[ "$joined" == *" --detach "* ]]; then
     mv "$root/report.json.tmp" "$root/report.json"
   fi
   printf '{"type":"turn_end","stopReason":"stop"}\\n' > "$root/trace.jsonl"
+  printf 'Checked 1 install across 1 package (no changes)\\n' > "$root/install.log"
   if [[ "\${FAKE_MODE:-}" == "oversize-trace" ]]; then
     head -c 600000 /dev/zero | tr '\\0' 'x' >> "$root/trace.jsonl"
   fi
@@ -1532,6 +1567,78 @@ describe("public local CLI lifecycle", {
     expect(job["totalTimeoutSeconds"]).toBe(RUN_BUDGET_SECONDS);
   });
 
+  it("keeps an explicit --image that names the legacy tag", async () => {
+    const root = await mkdtemp(join(tmpdir(), "review-pi-cli-"));
+    temporaryDirectories.push(root);
+    const arranged = await arrangeFakeDocker(root);
+    const runId = "legacy-image";
+    const out = join(root, "out");
+
+    const result = await runLocalCli(
+      localArguments(out, runId),
+      fakeEnvironment(arranged, runId, "success"),
+    );
+
+    expect(result.code, result.output).toBe(0);
+    expect(await readFile(join(arranged.state, "docker.log"), "utf8")).toMatch(
+      /^image inspect --format \{\{\.Id\}\} review-pi-b5-local$/m,
+    );
+  });
+
+  it("runs the image derived from the container sources and lockfile unless --image names one", async () => {
+    const root = await mkdtemp(join(tmpdir(), "review-pi-cli-"));
+    temporaryDirectories.push(root);
+    const staged = await stageDriver(root, '{"lockfileVersion":1}\n');
+    const expected = imageReference(
+      "acme/demo",
+      await imageTagFromFiles(
+        staged.container,
+        join(staged.container, "context/bun.lock"),
+      ),
+    );
+    for (const [runId, extra, image] of [
+      ["derived-image", [], expected],
+      ["explicit-image", ["--image", "x"], "x"],
+    ] as const) {
+      await mkdir(join(root, runId));
+      const arranged = await arrangeFakeDocker(join(root, runId));
+      const out = join(root, runId, "out");
+      const result = await runLocalCli(
+        [...withoutImage(staged.script, localArguments(out, runId)), ...extra],
+        fakeEnvironment(arranged, runId, "success"),
+      );
+
+      expect(result.code, result.output).toBe(0);
+      expect(
+        [
+          ...(
+            await readFile(join(arranged.state, "docker.log"), "utf8")
+          ).matchAll(/^image inspect --format \{\{\.Id\}\} (\S+)$/gm),
+        ].map((match) => match[1]),
+      ).toEqual([image]);
+    }
+  });
+
+  it("names the missing lockfile before creating anything when no --image is given", async () => {
+    const root = await mkdtemp(join(tmpdir(), "review-pi-cli-"));
+    temporaryDirectories.push(root);
+    const arranged = await arrangeFakeDocker(root);
+    const staged = await stageDriver(root);
+    const runId = "cold-checkout";
+    const out = join(root, "out");
+
+    const result = await runLocalCli(
+      withoutImage(staged.script, localArguments(out, runId)),
+      fakeEnvironment(arranged, runId, "success"),
+    );
+
+    expect(result.code).toBe(1);
+    expect(result.output).toContain(
+      `no --image was given and ${join(realpathSync(staged.container), "context/bun.lock")} is missing, so the sandbox image tag cannot be derived: stage it with \`bun run deploy --target <checkout>\` or pass --image`,
+    );
+    expect(existsSync(out)).toBe(false);
+  });
+
   it("stops a lane at the input ceiling it was given, and says so in its receipt", async () => {
     const root = await mkdtemp(join(tmpdir(), "review-pi-cli-"));
     temporaryDirectories.push(root);
@@ -1596,6 +1703,9 @@ describe("public local CLI lifecycle", {
     // The runner installed in this lane, which is not the same evidence as a
     // lane that ran without dependencies.
     expect(receipt).toContain('"installSkipped": false');
+    expect(await readFile(join(out, runId, "install.log"), "utf8")).toBe(
+      "Checked 1 install across 1 package (no changes)\n",
+    );
   });
 
   it("reads a skipped install back out of the lane receipt with its reason", async () => {
