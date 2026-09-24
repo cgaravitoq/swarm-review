@@ -243,6 +243,7 @@ describe("model broker", () => {
       },
       ledgerPath: unendedLedger,
     });
+    const ends = handlerEnds(server);
     const port = await listen(server);
     const controller = new AbortController();
 
@@ -288,9 +289,12 @@ describe("model broker", () => {
 
     controller.abort();
     await pending;
-    await close(server);
     silent.closeAllConnections();
     await close(silent);
+    // The lane leaving does not end the attempt: the broker holds it until the
+    // provider goes away and records its end then, so the ledger goes after.
+    expect(await Promise.all(ends)).toEqual([null]);
+    await close(server);
     await rm(unendedScratch, { recursive: true, force: true });
   });
 
@@ -735,6 +739,7 @@ describe("a target that tries to choose the provider", () => {
       },
       ledgerPath: ledger,
     });
+    const ends = handlerEnds(server);
     const port = await listen(server);
 
     const started = Date.now();
@@ -748,6 +753,9 @@ describe("a target that tries to choose the provider", () => {
     const firstAt = Date.now() - started;
     await reader.cancel();
 
+    // The caller left after the first frame, but the broker reads the answer
+    // to its end and records it then, so the ledger is read and removed after.
+    expect(await Promise.all(ends)).toEqual([null]);
     await close(server);
     await close(provider);
     const ledgerText = await readFile(ledger, "utf8");
