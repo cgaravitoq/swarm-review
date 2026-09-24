@@ -4744,6 +4744,54 @@ await writeFile(
       expect(result.code).toBe(1);
     }, 180_000);
 
+    it("reviews the rest of the change around a binary no lane could read", async () => {
+      const arranged = await arrange("success");
+      const swarmId = "swarm-packed-binary";
+      // A font checked in beside the code that embeds it: small enough for
+      // any budget, and bytes no model reads as source.
+      const glyphs = Buffer.from(
+        Array.from({ length: 4096 }, (_, index) => index % 256),
+      );
+      await mkdir(join(arranged.repo, "assets"), { recursive: true });
+      await writeFile(join(arranged.repo, "assets/font.ttf"), glyphs);
+      execFileSync("git", ["-C", arranged.repo, "add", "assets/font.ttf"]);
+      commit(arranged.repo, "font head");
+      const head = execFileSync(
+        "git",
+        ["-C", arranged.repo, "rev-parse", "HEAD"],
+        { encoding: "utf8" },
+      ).trim();
+      const provider = await fakeProvider(() => completion(answer([])));
+      await pointUpstream(arranged, {
+        "https://api.x.ai/v1": provider.baseUrl,
+      });
+
+      const result = await runSwarm(
+        packedArguments(arranged, swarmId, ["--reviewers", "1"], { head }),
+        arranged,
+      );
+      const receipt = await readReceipt(arranged.out, swarmId);
+      const lane = reviewerRows(receipt)[0];
+      const coverage = receipt["coverage"] as Record<string, unknown>;
+      const prompt = await readFile(
+        join(arranged.out, swarmId, "prompts", "reviewer-1.txt"),
+        "utf8",
+      );
+
+      // Left out for what it is, not for its size: the default budget would
+      // have held it, and the lane would have judged its bytes as source.
+      expect(lane?.["status"]).toBe("completed");
+      expect(lane?.["assignedFiles"]).not.toContain("assets/font.ttf");
+      expect(prompt).not.toContain("# assets/font.ttf");
+      expect(coverage["changedFiles"]).toContain("assets/font.ttf");
+      expect(coverage["uncoveredFiles"]).toEqual(["assets/font.ttf"]);
+      expect(coverage["unpackableFiles"]).toMatchObject([
+        { file: "assets/font.ttf", binary: true },
+      ]);
+      expect(receipt["status"]).toBe("partial");
+      expect(result.code).toBe(1);
+    }, 180_000);
+
     it("fails the run when the provider rejects the credential", async () => {
       const arranged = await arrange("success");
       const swarmId = "swarm-packed-401";

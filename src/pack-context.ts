@@ -53,6 +53,13 @@ const MODEL_PROMPT_TOKENS = new Map<string, number>([
 
 const UNKNOWN_MODEL_PROMPT_TOKENS = 128_000;
 
+// Workers AI's own endpoint takes the model id without the gateway's prefix,
+// and the window is the same model's either way.
+const promptTokensFor = (model: string) =>
+  MODEL_PROMPT_TOKENS.get(
+    model.startsWith("@cf/") ? `workers-ai/${model}` : model,
+  ) ?? UNKNOWN_MODEL_PROMPT_TOKENS;
+
 /**
  * How much source one lane may pack.
  *
@@ -67,7 +74,7 @@ export const packBudgetChars = (
 ) =>
   (Math.min(
     SESSION_CAPS[trialKind].maxInputTokensPerRequest,
-    MODEL_PROMPT_TOKENS.get(model) ?? UNKNOWN_MODEL_PROMPT_TOKENS,
+    promptTokensFor(model),
   ) -
     PROMPT_RESERVE_TOKENS) *
   CHARS_PER_TOKEN;
@@ -94,23 +101,45 @@ export function symbolsFromDiff(diff: string) {
   return [...found];
 }
 
-const changeDiff = (
+const rangeDiff = (
   input: { repo: string; head: string; base: string },
+  args: readonly string[],
   files: readonly string[],
 ) => {
   const fileArgs = files.length > 0 ? ["--", ...files] : [];
   try {
     return git(input.repo, [
       "diff",
+      ...args,
       `${input.base}...${input.head}`,
       ...fileArgs,
     ]);
   } catch {
     return git(input.repo, [
       "diff",
+      ...args,
       `${input.base}..${input.head}`,
       ...fileArgs,
     ]);
+  }
+};
+
+const changeDiff = (
+  input: { repo: string; head: string; base: string },
+  files: readonly string[],
+) => rangeDiff(input, [], files);
+
+// `--numstat` prints `-` for both counts of a file git could not diff as text.
+const isBinaryChange = (
+  input: { repo: string; head: string; base: string },
+  file: string,
+) => rangeDiff(input, ["--numstat"], [file]).startsWith("-\t-\t");
+
+const bytesAtHead = (input: { repo: string; head: string }, file: string) => {
+  try {
+    return Number(git(input.repo, ["cat-file", "-s", `${input.head}:${file}`]));
+  } catch {
+    return 0;
   }
 };
 
@@ -209,10 +238,11 @@ export function packLaneContext(input: {
 }
 
 /**
- * The changed files no lane could pack: a diff that alone takes more than half
- * a lane's budget leaves no room for the file at head beside it, so the lane
- * it landed in would block on it and review nothing else. A fixture of that
- * size is named as not reviewed instead of costing the change its review.
+ * The changed files no lane could pack: a binary, which no model reads as
+ * text, and a file whose diff and source at head together take more than half
+ * a lane's budget, since the lane it landed in would drop the source, block on
+ * it and review nothing else. A font or a lockfile of that size is named as
+ * not reviewed instead of costing the change its review.
  */
 export function unpackableFiles(input: {
   repo: string;
@@ -221,12 +251,21 @@ export function unpackableFiles(input: {
   files: readonly string[];
   budget: number;
 }) {
-  const oversized: { file: string; diffBytes: number }[] = [];
+  const unpackable: {
+    file: string;
+    diffBytes: number;
+    headBytes: number;
+    binary: boolean;
+  }[] = [];
   for (const file of input.files) {
     const diffBytes = changeDiff(input, [file]).length;
-    if (diffBytes > input.budget / 2) oversized.push({ file, diffBytes });
+    const headBytes = bytesAtHead(input, file);
+    const binary = isBinaryChange(input, file);
+    if (binary || diffBytes + headBytes > input.budget / 2) {
+      unpackable.push({ file, diffBytes, headBytes, binary });
+    }
   }
-  return oversized;
+  return unpackable;
 }
 
 export const wholeChangePack = (input: {

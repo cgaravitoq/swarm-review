@@ -124,6 +124,8 @@ Assigned files:
 
 Judge only what is in the pack. Do not mark partial because a test could not be run. status is complete when you have judged the packed files. Empty findings with status complete means the packed change looks clean.
 
+Report at most ten findings, the most severe first: a longer answer is cut at the output ceiling and lost whole.
+
 End with one fenced JSON block and nothing after it:
 \`\`\`json
 {"status": "complete", "blockerReason": "", "findings": [{"severity": "P1", "file": "path/to/file.ts", "line": 42, "mechanism": "what breaks", "evidence": "the line or hunk", "affectedBehavior": "what callers observe"}]}
