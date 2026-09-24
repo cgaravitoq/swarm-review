@@ -1605,7 +1605,8 @@ process.stdin.on("data", (chunk) => {
     // second itself: the one it starts the runner in, or an earlier one for a
     // lane whose clock started before its bridge, as it does after a clone.
     // That lane starts at the top of a second, so the seconds its clock has
-    // already run are whole too.
+    // already run are whole too. Only that first read is the test's: every
+    // later one is the runner timing its own steps.
     if (startedSecondsEarly > 0) {
       await new Promise((resolve) =>
         setTimeout(resolve, 1000 - (Date.now() % 1000)),
@@ -1616,7 +1617,7 @@ process.stdin.on("data", (chunk) => {
     await writeFile(
       join(binDir, "date"),
       `#!/bin/sh
-if [ "$1" = "+%s" ]; then
+if [ "$1" = "+%s" ] && mkdir "${join(binDir, "date-started")}" 2>/dev/null; then
   echo ${startedAt / 1000}
   exit 0
 fi
