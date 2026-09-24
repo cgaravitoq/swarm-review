@@ -3,6 +3,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import {
+  addPackedUsage,
   canaryModel,
   canaryModels,
   completeOnce,
@@ -553,6 +554,24 @@ describe("canaryModel", () => {
       "workers-ai/@cf/deepseek-ai/deepseek-v4-flash-0731",
     ]);
     expect(upstream).toHaveBeenCalledTimes(3);
+  });
+});
+
+describe("addPackedUsage", () => {
+  it("leaves a side one answer never reported unobserved for the lane", () => {
+    expect(
+      addPackedUsage(
+        { inputTokens: 5, outputTokens: null },
+        { inputTokens: 7, outputTokens: 3 },
+      ),
+    ).toEqual({ inputTokens: 12, outputTokens: null });
+    // An answer that reported no spend at all spent both sides unobserved.
+    expect(
+      addPackedUsage(null, { inputTokens: 7, outputTokens: 3 }),
+    ).toBeNull();
+    expect(
+      addPackedUsage({ inputTokens: 7, outputTokens: 3 }, null),
+    ).toBeNull();
   });
 });
 

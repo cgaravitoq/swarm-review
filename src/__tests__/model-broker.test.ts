@@ -477,7 +477,8 @@ describe("model broker", () => {
   });
 
   it("seals a line past the Worker hop's bound, because this hop holds the lane's own memory", async () => {
-    const head = 'data: {"choices":[{"delta":{"content":"';
+    const head =
+      'data: {"usage":{"prompt_tokens":3,"completion_tokens":1},"choices":[{"delta":{"content":"';
     const tail = '"}}]}';
     const line = WORKER_SSE_LINE_CHARS + 1;
     const answer = "x".repeat(line - head.length - tail.length);
@@ -485,7 +486,10 @@ describe("model broker", () => {
 
     await call().then((response) => response.text());
 
-    expect((await requestEntry())?.["seal"]).toBe(sha256(answer));
+    const entry = await requestEntry();
+    expect(entry?.["seal"]).toBe(sha256(answer));
+    // The usage on that line is read under the same bound the seal is.
+    expect(entry?.["usage"]).toEqual({ input: 3, output: 1 });
   });
 
   it("stops calling the provider once a cumulative token cap is reached", async () => {

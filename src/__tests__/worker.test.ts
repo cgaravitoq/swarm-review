@@ -755,6 +755,10 @@ describe("cloud model session accounting", () => {
     expect(await sandbox.modelUsage()).toMatchObject({
       totals: { requests: 2, retries: 1, input: 3, output: 1, unended: 0 },
     });
+    // The 503 reported no usage at all, so each sum is one request short.
+    expect(await sandbox.modelUsage()).toMatchObject({
+      totals: { inputUnobserved: 1, outputUnobserved: 1 },
+    });
   });
 
   it("says a session total is short by the request that never reported that side", async () => {
@@ -867,7 +871,7 @@ describe("cloud model session accounting", () => {
       "fetch",
       vi.fn<typeof fetch>(() =>
         Promise.resolve(
-          new Response('data: {"usage":{"completion_tokens":1}}'),
+          new Response('data: {"choices":[{"delta":{"content":"ok"}}]}'),
         ),
       ),
     );
@@ -880,7 +884,7 @@ describe("cloud model session accounting", () => {
       requests: 2,
       retries: 0,
       input: 5,
-      output: 2,
+      output: 1,
       unended: 0,
     });
   });
