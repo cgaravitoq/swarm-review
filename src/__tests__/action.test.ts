@@ -9,7 +9,7 @@ import {
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { main } from "../action";
 import { imageReference, imageTagFromFiles } from "../image-tag";
 
@@ -17,6 +17,7 @@ const packageRoot = join(dirname(fileURLToPath(import.meta.url)), "../..");
 const roots: string[] = [];
 
 afterEach(async () => {
+  vi.restoreAllMocks();
   for (const root of roots.splice(0)) {
     await rm(root, { recursive: true, force: true });
   }
@@ -242,18 +243,20 @@ describe("composite action driver", () => {
 
   it("publishes when the failure file cannot be written", async () => {
     const fixture = await arrange("acme/demo", false);
-    await mkdir(
-      join(
-        fixture.env.RUNNER_TEMP,
-        "swarm-review",
-        "pr-42-123-1",
-        "failure.json",
-      ),
-      { recursive: true },
+    const failurePath = join(
+      fixture.env.RUNNER_TEMP,
+      "swarm-review",
+      "pr-42-123-1",
+      "failure.json",
     );
+    await mkdir(failurePath, { recursive: true });
+    const logged = vi.spyOn(console, "error").mockImplementation(() => {});
     await expect(
       main({ ...fixture.env, INPUT_MODE: "sandbox", ACTION_FAIL: "deploy" }),
     ).resolves.toBeUndefined();
+    expect(logged).toHaveBeenCalledWith(
+      expect.objectContaining({ code: "EISDIR", path: failurePath }),
+    );
     expect((await fixture.log()).at(-1)).toBe(
       `bun ${packageRoot}/src/publish.ts --receipt ${fixture.env.RUNNER_TEMP}/swarm-review/pr-42-123-1/swarm-receipt.json --repo acme/demo --pr 42 --publish --allow-moved-head`,
     );
