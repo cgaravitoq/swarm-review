@@ -70,7 +70,10 @@ afterEach(async (context) => {
       try {
         process.kill(-pid, "SIGKILL");
       } catch (error) {
-        if ((error as NodeJS.ErrnoException).code !== "ESRCH") throw error;
+        // Darwin answers EPERM for a group whose members have all exited but
+        // are not reaped yet; the wait below still fails one that stays alive.
+        const code = (error as NodeJS.ErrnoException).code;
+        if (code !== "ESRCH" && code !== "EPERM") throw error;
       }
       const deadline = Date.now() + 5_000;
       while (groupAlive(pid)) {
