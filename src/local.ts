@@ -2013,13 +2013,6 @@ async function main() {
   // them in its own metadata.
   const repo = isControlAction ? "" : requiredRepo(options.repo);
   const sourceRepo = isControlAction ? "" : requiredSource(options.source);
-  await mkdir(options.outDir, { recursive: true });
-  const outDir = join(options.outDir, options.runId);
-  await mkdir(outDir, { recursive: true });
-  const metadataPath = join(outDir, "metadata.json");
-  let containerRunDir = `/workspace/runs/${options.runId}`;
-  let containerName = `review-pi-local-${options.runId}`;
-  let ownershipId: string = randomUUID();
   const runnerPath = join(
     dirname(fileURLToPath(import.meta.url)),
     "..",
@@ -2035,6 +2028,13 @@ async function main() {
       join(containerDir, "context", "bun.lock"),
     );
   }
+  await mkdir(options.outDir, { recursive: true });
+  const outDir = join(options.outDir, options.runId);
+  await mkdir(outDir, { recursive: true });
+  const metadataPath = join(outDir, "metadata.json");
+  let containerRunDir = `/workspace/runs/${options.runId}`;
+  let containerName = `review-pi-local-${options.runId}`;
+  let ownershipId: string = randomUUID();
   const controller = new AbortController();
   let interrupted = false;
   const onSignal = () => {

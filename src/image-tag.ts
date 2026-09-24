@@ -1,4 +1,5 @@
 import { createHash } from "node:crypto";
+import { existsSync } from "node:fs";
 import { readFile } from "node:fs/promises";
 import { join } from "node:path";
 import { IMAGE_SOURCES } from "./protocol";
@@ -55,6 +56,11 @@ export async function laneImageReference(
 ): Promise<string> {
   if (requested !== undefined) {
     return requested;
+  }
+  if (!existsSync(lockfilePath)) {
+    throw new Error(
+      `no --image was given and ${lockfilePath} is missing, so the sandbox image tag cannot be derived: stage it with \`bun run deploy --target <checkout>\` or pass --image`,
+    );
   }
   return imageReference(
     repository,

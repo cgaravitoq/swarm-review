@@ -1,6 +1,6 @@
 import { execFileSync, spawn } from "node:child_process";
 import { createHash } from "node:crypto";
-import { readFileSync } from "node:fs";
+import { existsSync, readFileSync, realpathSync } from "node:fs";
 import {
   appendFile,
   chmod,
@@ -2494,10 +2494,16 @@ exec /usr/bin/git "$@"
     await cp(join(packageRoot, "src"), join(repo, "agents/review-pi/src"), {
       recursive: true,
     });
-    await cp(
-      join(packageRoot, "container"),
-      join(repo, "agents/review-pi/container"),
-      { recursive: true },
+    const laneContainer = join(repo, "agents/review-pi/container");
+    await cp(join(packageRoot, "container"), laneContainer, {
+      recursive: true,
+      filter: (path) =>
+        !path.startsWith(join(packageRoot, "container/context")),
+    });
+    await mkdir(join(laneContainer, "context"));
+    await writeFile(
+      join(laneContainer, "context/bun.lock"),
+      '{"lockfileVersion":1}\n',
     );
     await cp(
       join(packageRoot, "prompts"),
@@ -2533,6 +2539,7 @@ exec /usr/bin/git "$@"
       out: join(root, "out"),
       repo,
       swarmScript: join(repo, "agents/review-pi/src/swarm.ts"),
+      laneContainer,
       state,
       reports,
       forged,
@@ -2968,6 +2975,23 @@ exec /usr/bin/git "$@"
       new Set(["review-pi-b5-swarm"]),
     );
   }, 120_000);
+
+  it("names the missing lockfile before creating anything when no --image is given", async () => {
+    const arranged = await arrange("success");
+    const lockfile = join(
+      realpathSync(arranged.laneContainer),
+      "context/bun.lock",
+    );
+    await rm(lockfile);
+
+    const result = await runQuietSwarm(arranged, "swarm-cold-checkout");
+
+    expect(result.code).toBe(1);
+    expect(result.output).toContain(
+      `no --image was given and ${lockfile} is missing, so the sandbox image tag cannot be derived: stage it with \`bun run deploy --target <checkout>\` or pass --image`,
+    );
+    expect(existsSync(arranged.out)).toBe(false);
+  }, 60_000);
 
   it("tells a warm sandbox verifier with nothing to rule on to stand down and removes it", async () => {
     const arranged = await arrange("success");

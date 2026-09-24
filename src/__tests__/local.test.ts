@@ -3,6 +3,7 @@ import { createHash } from "node:crypto";
 import { existsSync, readFileSync, realpathSync } from "node:fs";
 import {
   chmod,
+  cp,
   link,
   mkdir,
   mkdtemp,
@@ -213,9 +214,41 @@ const localArguments = (out: string, runId: string) => [
   "acme/demo",
   "--source",
   repoRoot,
+  "--image",
+  "review-pi-b5-local",
   "--total-timeout",
   String(RUN_BUDGET_SECONDS),
 ];
+
+/**
+ * A copy of the driver whose `container/context` holds only what the test
+ * stages, so a run without `--image` derives its tag from these bytes and not
+ * from whatever the host last deployed.
+ */
+const stageDriver = async (root: string, lockfile?: string) => {
+  const driver = join(root, "driver");
+  for (const directory of ["src", "prompts"]) {
+    await cp(join(packageRoot, directory), join(driver, directory), {
+      recursive: true,
+    });
+  }
+  const container = join(driver, "container");
+  await cp(join(packageRoot, "container"), container, {
+    recursive: true,
+    filter: (path) => !path.startsWith(join(packageRoot, "container/context")),
+  });
+  if (lockfile !== undefined) {
+    await mkdir(join(container, "context"));
+    await writeFile(join(container, "context/bun.lock"), lockfile);
+  }
+  return { script: join(driver, "src/local.ts"), container };
+};
+
+const withoutImage = (script: string, args: string[]) => {
+  const rest = args.slice(1);
+  rest.splice(rest.indexOf("--image"), 2);
+  return [script, ...rest];
+};
 
 const runLocalCli = (args: string[], env: NodeJS.ProcessEnv) =>
   new Promise<{ code: number; output: string }>((resolvePromise) => {
@@ -1504,7 +1537,7 @@ describe("public local CLI lifecycle", {
     const out = join(root, "out");
 
     const result = await runLocalCli(
-      [...localArguments(out, runId), "--image", "review-pi-b5-local"],
+      localArguments(out, runId),
       fakeEnvironment(arranged, runId, "success"),
     );
 
@@ -1512,6 +1545,26 @@ describe("public local CLI lifecycle", {
     expect(await readFile(join(arranged.state, "docker.log"), "utf8")).toMatch(
       /^image inspect --format \{\{\.Id\}\} review-pi-b5-local$/m,
     );
+  });
+
+  it("names the missing lockfile before creating anything when no --image is given", async () => {
+    const root = await mkdtemp(join(tmpdir(), "review-pi-cli-"));
+    temporaryDirectories.push(root);
+    const arranged = await arrangeFakeDocker(root);
+    const staged = await stageDriver(root);
+    const runId = "cold-checkout";
+    const out = join(root, "out");
+
+    const result = await runLocalCli(
+      withoutImage(staged.script, localArguments(out, runId)),
+      fakeEnvironment(arranged, runId, "success"),
+    );
+
+    expect(result.code).toBe(1);
+    expect(result.output).toContain(
+      `no --image was given and ${join(realpathSync(staged.container), "context/bun.lock")} is missing, so the sandbox image tag cannot be derived: stage it with \`bun run deploy --target <checkout>\` or pass --image`,
+    );
+    expect(existsSync(out)).toBe(false);
   });
 
   it("accepts a missing optional artifact and requires report plus trace", async () => {
