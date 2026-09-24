@@ -2,6 +2,7 @@ import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
+import { preparationFailureReceipt } from "../attempt";
 import {
   alreadyPublished,
   assertPublishableReceipt,
@@ -1020,7 +1021,7 @@ describe("a run that publishes no review", () => {
     fetchMock.mock.calls.filter(([url]) => String(url).includes("/issues/"));
 
   const artifact = async (
-    swarm: SwarmReceipt,
+    swarm: SwarmReceipt | ReturnType<typeof preparationFailureReceipt>,
     phases: { runId: string; phase: string; state: string }[] = [],
   ) => {
     const directory = await mkdtemp(join(tmpdir(), "review-pi-refusal-"));
@@ -1421,6 +1422,57 @@ describe("a run that publishes no review", () => {
     expect(process.exitCode).toBe(1);
     expect(api.comments).toEqual([]);
     expect(issueRequests(api.fetchMock)).toHaveLength(0);
+  });
+
+  const preparationFailed = (message: string) =>
+    preparationFailureReceipt(
+      { attemptId: "attempt-1", startedAt: Date.now(), path: "attempt.json" },
+      "object-fetch",
+      new Error(message),
+      {
+        swarmId: "swarm-1",
+        requested: { head: null, base: null, pullRequest: 7 },
+      },
+    );
+
+  it("comments the failure of a run that never reached its lanes", async () => {
+    const api = github();
+    const receiptPath = await artifact(
+      preparationFailed("git fetch exited 128: repository not found"),
+    );
+
+    await expect(publish(receiptPath)).rejects.toThrow(
+      "object-fetch: git fetch exited 128: repository not found",
+    );
+
+    expect(process.exitCode).toBe(1);
+    expect(
+      issueRequests(api.fetchMock).filter(
+        ([url, init]) =>
+          url === "https://api.github.com/repos/acme/demo/issues/7/comments" &&
+          (init as RequestInit | undefined)?.method === "POST",
+      ),
+    ).toHaveLength(1);
+    expect(api.comments).toHaveLength(1);
+    expect(api.comments[0]?.body.split("\n")[2]).toBe(
+      "**swarm-review published no review.** `object-fetch: git fetch exited 128: repository not found`",
+    );
+  });
+
+  it("renders a preparation failure's message as inert text", async () => {
+    const api = github();
+    const receiptPath = await artifact(
+      preparationFailed(`bad \`ref\` ${marker}`),
+    );
+
+    await expect(publish(receiptPath)).rejects.toThrow("object-fetch: bad");
+
+    const reason = api.comments[0]?.body.split("\n")[2] ?? "";
+    expect(reason).toContain(
+      "object-fetch: bad 'ref' ‹!-- swarm-review:run:4242 --",
+    );
+    expect(reason).not.toContain("<!--");
+    expect(reason.match(/`/g)).toHaveLength(2);
   });
 
   it("comments a head that moved off the frozen SHA", async () => {
