@@ -788,11 +788,11 @@ export const fetchIssueComments = (
   pullRequest: number,
   token: string,
 ) =>
-  githubPages<{ id: number; body?: string | null }>(
-    `/repos/${repo}/issues/${pullRequest}/comments`,
-    "comments",
-    token,
-  );
+  githubPages<{
+    id: number;
+    user?: { login: string } | null;
+    body?: string | null;
+  }>(`/repos/${repo}/issues/${pullRequest}/comments`, "comments", token);
 
 export async function revalidatePullRequest(
   repo: string,
@@ -1101,7 +1101,36 @@ export async function updateIssueComment(
   }
 }
 
-/** The run's own comment, edited when it is already there and posted when not. */
+/**
+ * The login the token acts as. REST's `/user` refuses an installation token,
+ * while GraphQL's viewer answers for it and for a personal token alike.
+ */
+export async function fetchViewerLogin(token: string) {
+  const response = await fetch("https://api.github.com/graphql", {
+    method: "POST",
+    headers: {
+      ...githubHeaders(token, "application/vnd.github+json"),
+      "content-type": "application/json",
+    },
+    body: JSON.stringify({ query: "query { viewer { login } }" }),
+  });
+  if (!response.ok) {
+    throw new Error(`GitHub viewer request failed: ${response.status}`);
+  }
+  const parsed = (await response.json()) as {
+    data?: { viewer?: { login?: unknown } | null } | null;
+  };
+  const login = parsed.data?.viewer?.login;
+  return typeof login === "string" ? login : null;
+}
+
+/**
+ * The run's own comment, edited when it is already there and posted when not.
+ *
+ * Only a comment the token's identity wrote can be edited, so one carrying the
+ * marker under another author is not this run's. An edit that still fails
+ * leaves a fresh comment rather than none.
+ */
 export async function upsertRefusalComment(input: {
   repo: string;
   pullRequest: number;
@@ -1110,12 +1139,29 @@ export async function upsertRefusalComment(input: {
   body: string;
 }) {
   const marker = refusalMarker(input.runId);
+  const viewer = await fetchViewerLogin(input.token).catch(() => null);
   const existing = (
     await fetchIssueComments(input.repo, input.pullRequest, input.token)
-  ).find((comment) => (comment.body ?? "").startsWith(`${marker}\n`));
+  ).find(
+    (comment) =>
+      viewer !== null &&
+      comment.user?.login === viewer &&
+      (comment.body ?? "").startsWith(`${marker}\n`),
+  );
   if (existing) {
-    await updateIssueComment(input.repo, existing.id, input.token, input.body);
-    return "edited" as const;
+    try {
+      await updateIssueComment(
+        input.repo,
+        existing.id,
+        input.token,
+        input.body,
+      );
+      return "edited" as const;
+    } catch (error: unknown) {
+      console.error(
+        `refusal comment ${existing.id} not edited: ${error instanceof Error ? error.message : String(error)}`,
+      );
+    }
   }
   await postIssueComment(
     input.repo,
@@ -1142,22 +1188,21 @@ async function reportRefusal(input: {
   error: unknown;
 }) {
   if (!input.run || input.pullRequest === null || input.token === null) return;
-  const body = refusalCommentBody({
-    runId: input.run.runId,
-    reason: refusalReason(input.error),
-    url: input.run.url,
-    lanes: refusalLanes(
-      input.receipt?.lanes ?? [],
-      await lanePhases(input.artifactRoot),
-    ),
-  });
   try {
     const outcome = await upsertRefusalComment({
       repo: input.repo,
       pullRequest: input.pullRequest,
       token: input.token,
       runId: input.run.runId,
-      body,
+      body: refusalCommentBody({
+        runId: input.run.runId,
+        reason: refusalReason(input.error),
+        url: input.run.url,
+        lanes: refusalLanes(
+          input.receipt?.lanes ?? [],
+          await lanePhases(input.artifactRoot),
+        ),
+      }),
     });
     console.log(
       `refusal comment ${outcome} on ${input.repo}#${input.pullRequest}`,

@@ -1052,19 +1052,36 @@ describe("a run that publishes no review", () => {
       : null;
   };
 
-  const github = (moved = false) => {
-    const comments: { id: number; body: string }[] = [];
+  const bot = "github-actions[bot]";
+
+  type Comment = { id: number; user: { login: string }; body: string };
+
+  const github = ({
+    moved = false,
+    seeded = [] as Comment[],
+    editable = true,
+  } = {}) => {
+    const comments: Comment[] = [...seeded];
     const fetchMock = vi.fn(async (url: string, init?: RequestInit) => {
       const method = init?.method ?? "GET";
       const accept = String(
         (init?.headers as Record<string, string> | undefined)?.["accept"] ?? "",
       );
+      if (url === "https://api.github.com/graphql") {
+        return Response.json(
+          { data: { viewer: { login: bot } } },
+          { status: 200 },
+        );
+      }
       if (url.includes("/issues/comments/")) {
         const id = Number(commentUrl.exec(url)?.[1]);
         const comment = comments.find((entry) => entry.id === id);
         const body = method === "PATCH" ? commentBody(init) : null;
         if (!comment || body === null) {
           return Response.json({ message: "Not Found" }, { status: 404 });
+        }
+        if (!editable || comment.user.login !== bot) {
+          return Response.json({ message: "Forbidden" }, { status: 403 });
         }
         comment.body = body;
         return Response.json(comment, { status: 200 });
@@ -1078,7 +1095,7 @@ describe("a run that publishes no review", () => {
         ) {
           return Response.json({ message: "Not Found" }, { status: 404 });
         }
-        const comment = { id: comments.length + 1, body };
+        const comment = { id: comments.length + 1, user: { login: bot }, body };
         comments.push(comment);
         return Response.json(comment, { status: 201 });
       }
@@ -1292,6 +1309,68 @@ describe("a run that publishes no review", () => {
     );
   });
 
+  it("posts its own comment beside another author's that carries its marker", async () => {
+    const forged = {
+      id: 50,
+      user: { login: "mallory" },
+      body: `${marker}\n\nforged`,
+    };
+    const api = github({ seeded: [{ ...forged }] });
+    const receiptPath = await artifact(failed());
+
+    await expect(publish(receiptPath)).rejects.toThrow(
+      "publication requires a completed or partial review",
+    );
+
+    expect(api.comments[0]).toEqual(forged);
+    expect(api.comments.slice(1)).toMatchObject([
+      {
+        user: { login: bot },
+        body: expect.stringMatching(/^<!-- swarm-review:run:4242 -->\n/),
+      },
+    ]);
+    expect(
+      api.fetchMock.mock.calls.filter(([url]) =>
+        String(url).includes("/issues/comments/"),
+      ),
+    ).toHaveLength(0);
+  });
+
+  it("posts a fresh comment when its own comment refuses the edit", async () => {
+    const own = { id: 50, user: { login: bot }, body: `${marker}\n\nold` };
+    const api = github({ seeded: [{ ...own }], editable: false });
+    const receiptPath = await artifact(failed());
+
+    await expect(publish(receiptPath)).rejects.toThrow(
+      "publication requires a completed or partial review",
+    );
+
+    expect(api.comments[0]).toEqual(own);
+    expect(api.comments.slice(1)).toMatchObject([
+      {
+        user: { login: bot },
+        body: expect.stringContaining(
+          "publication requires a completed or partial review",
+        ),
+      },
+    ]);
+  });
+
+  it("keeps the refusal when the receipt's lanes cannot be read", async () => {
+    const api = github();
+    const receiptPath = await artifact({
+      ...failed(),
+      lanes: [null as never],
+    });
+
+    await expect(publish(receiptPath)).rejects.toThrow(
+      "publication requires a completed or partial review",
+    );
+
+    expect(process.exitCode).toBe(1);
+    expect(api.comments).toEqual([]);
+  });
+
   it("leaves the pull request alone on a dry run", async () => {
     const api = github();
     const receiptPath = await artifact(failed());
@@ -1320,7 +1399,7 @@ describe("a run that publishes no review", () => {
   });
 
   it("comments a head that moved off the frozen SHA", async () => {
-    const api = github(true);
+    const api = github({ moved: true });
     const receiptPath = await artifact(completed());
 
     await expect(publish(receiptPath)).rejects.toThrow(
