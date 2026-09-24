@@ -763,6 +763,144 @@ describe("local driver lifecycle", () => {
     expect(polls).toBe(2);
   });
 
+  it("fails a review that ended in error even after its runner wrote the partial report", async () => {
+    // The 402 lane: the bridge writes the review failed and exits, so the
+    // cancel meets no bridge, and the runner goes on to write the partial
+    // report and its own failed last word before it exits.
+    const head = "a".repeat(40);
+    const base = "b".repeat(40);
+    const reviewError = {
+      path: "/workspace/runs/run/review-error.json",
+      exists: true,
+      content: JSON.stringify({
+        reason: "model_error",
+        errorMessage: "402 Payment Required",
+      }),
+    };
+    const status = (phase: string) => ({
+      path: "/workspace/runs/run/status.json",
+      exists: true,
+      content: JSON.stringify({
+        phase,
+        state: "failed",
+        terminalReason: "model_error",
+        process: { alive: false },
+      }),
+    });
+    const failing = {
+      runId: "run",
+      observedAt: "",
+      placementId: null,
+      processes: [
+        {
+          id: "review",
+          command: "/opt/review/review-run.sh /workspace/runs/run",
+          status: "running",
+        },
+      ],
+      artifacts: [status("review"), reviewError],
+    };
+    const finished = {
+      runId: "run",
+      observedAt: "",
+      placementId: null,
+      processes: [],
+      artifacts: [
+        status("finished"),
+        reviewError,
+        {
+          path: "/workspace/runs/run/report.json",
+          exists: true,
+          content: JSON.stringify({
+            partial: true,
+            checkout: { checkedOutHead: head, checkedOutBase: base },
+          }),
+        },
+        {
+          path: "/workspace/runs/run/steps.jsonl",
+          exists: true,
+          content: `${JSON.stringify({ step: "report", exit: 0 })}\n`,
+        },
+      ],
+    };
+    const states = [failing, finished];
+    const sent: unknown[] = [];
+
+    await expect(
+      driveUntilComplete({
+        poll: () => Promise.resolve(states.shift() ?? finished),
+        send: (command) => {
+          sent.push(command);
+          return Promise.reject(
+            new Error("control /runs/run/command: 502 bridge unavailable"),
+          );
+        },
+        requested: { head, base },
+        role: "reviewer",
+        laneId: "lane-1",
+        candidateIds: [],
+        deadline: 600_000,
+        now: () => 0,
+        sleep: () => Promise.resolve(),
+      }),
+    ).rejects.toThrow("provider model_error: 402 Payment Required");
+    expect(controlPlaneCompletion(finished, { head, base })).toMatchObject({
+      reportOk: true,
+      reviewAlive: false,
+    });
+    expect(sent).toEqual([{ type: "cancel" }]);
+    expect(states).toHaveLength(0);
+  });
+
+  it("ends a lane that never ends at the run deadline", async () => {
+    const head = "a".repeat(40);
+    const base = "b".repeat(40);
+    const running = {
+      runId: "run",
+      observedAt: "",
+      placementId: null,
+      processes: [
+        {
+          id: "review",
+          command: "/opt/review/review-run.sh /workspace/runs/run",
+          status: "running",
+        },
+      ],
+      artifacts: [
+        {
+          path: "/workspace/runs/run/status.json",
+          exists: true,
+          content: JSON.stringify({ phase: "review", state: "running" }),
+        },
+      ],
+    };
+    let now = 0;
+    let polls = 0;
+
+    await expect(
+      driveUntilComplete({
+        poll: () => {
+          polls += 1;
+          if (polls > 100) throw new Error("the lane was never ended");
+          return Promise.resolve(running);
+        },
+        send: () => Promise.resolve({ success: true }),
+        requested: { head, base },
+        role: "reviewer",
+        laneId: "lane-1",
+        candidateIds: [],
+        deadline: 60_000,
+        now: () => now,
+        sleep: (ms) => {
+          now += ms;
+          return Promise.resolve();
+        },
+      }),
+    ).rejects.toThrow("run deadline exceeded");
+    expect(now).toBe(60_000);
+    expect(polls).toBe(12);
+  });
+
   it("spends one request telling a lane at its cap to answer with what it has", async () => {
     const head = "a".repeat(40);
     const base = "b".repeat(40);
