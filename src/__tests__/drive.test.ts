@@ -852,6 +852,72 @@ describe("local driver lifecycle", () => {
     expect(states).toHaveLength(0);
   });
 
+  it("cancels a failed review behind a failed process listing before it ends the lane", async () => {
+    // A listing the container failed to serve says nothing about the runner,
+    // so the failure is not final until the runner is seen gone: the cancel
+    // that lets it write the partial report goes out first.
+    const head = "a".repeat(40);
+    const base = "b".repeat(40);
+    const failed = {
+      path: "/workspace/runs/run/status.json",
+      exists: true,
+      content: JSON.stringify({
+        phase: "review",
+        state: "failed",
+        terminalReason: "model_error",
+        process: { alive: false },
+      }),
+    };
+    const reviewError = {
+      path: "/workspace/runs/run/review-error.json",
+      exists: true,
+      content: JSON.stringify({
+        reason: "model_error",
+        errorMessage: "402 Payment Required",
+      }),
+    };
+    const unlisted = {
+      runId: "run",
+      observedAt: "",
+      placementId: null,
+      processes: [],
+      processesError: "HTTP error! status: 500",
+      artifacts: [failed, reviewError],
+    };
+    const gone = {
+      runId: "run",
+      observedAt: "",
+      placementId: null,
+      processes: [],
+      artifacts: [failed, reviewError],
+    };
+    const states = [unlisted, gone];
+    const sent: unknown[] = [];
+
+    await expect(
+      driveUntilComplete({
+        poll: () => Promise.resolve(states.shift() ?? gone),
+        send: (command) => {
+          sent.push(command);
+          return Promise.resolve({ success: true });
+        },
+        requested: { head, base },
+        role: "reviewer",
+        laneId: "lane-1",
+        candidateIds: [],
+        deadline: 600_000,
+        now: () => 0,
+        sleep: () => Promise.resolve(),
+      }),
+    ).rejects.toThrow("provider model_error: 402 Payment Required");
+    expect(controlPlaneCompletion(unlisted, { head, base })).toMatchObject({
+      processesObserved: false,
+      reviewAlive: false,
+    });
+    expect(sent).toEqual([{ type: "cancel" }]);
+    expect(states).toHaveLength(0);
+  });
+
   it("ends a lane that never ends at the run deadline", async () => {
     const head = "a".repeat(40);
     const base = "b".repeat(40);
