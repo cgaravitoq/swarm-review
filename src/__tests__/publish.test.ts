@@ -1,3 +1,6 @@
+import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import {
   alreadyPublished,
@@ -8,6 +11,7 @@ import {
   findingBody,
   githubReviewPayload,
   headline,
+  main,
   parsePublishOptions,
   publicationDisposition,
   REVIEW_EVENT,
@@ -975,5 +979,228 @@ describe("existing reviews", () => {
     expect(upstream).toHaveBeenCalledTimes(2);
     expect(String(upstream.mock.calls[0]?.[0])).toContain("per_page=100");
     expect(alreadyPublished(reviews, "swarm-1", "abc")).toBe(true);
+  });
+});
+
+describe("a run that publishes no review", () => {
+  const head = "a".repeat(40);
+  const base = "c".repeat(40);
+  const later = "b".repeat(40);
+  const env = {
+    GITHUB_TOKEN: "token",
+    GITHUB_RUN_ID: "4242",
+    GITHUB_SERVER_URL: "https://github.com",
+    GITHUB_REPOSITORY: "acme/demo",
+  };
+  const runUrl = "https://github.com/acme/demo/actions/runs/4242";
+  const marker = "<!-- swarm-review:run:4242 -->";
+  const directories: string[] = [];
+
+  afterEach(async () => {
+    vi.unstubAllGlobals();
+    process.exitCode = 0;
+    for (const directory of directories.splice(0)) {
+      await rm(directory, { recursive: true, force: true });
+    }
+  });
+
+  const publish = (receiptPath: string) =>
+    main(
+      [
+        "--receipt",
+        receiptPath,
+        "--repo",
+        "acme/demo",
+        "--pr",
+        "7",
+        "--publish",
+      ],
+      env,
+    );
+
+  const artifact = async (
+    swarm: SwarmReceipt,
+    phases: { runId: string; phase: string; state: string }[] = [],
+  ) => {
+    const directory = await mkdtemp(join(tmpdir(), "review-pi-refusal-"));
+    directories.push(directory);
+    const suiteDir = join(directory, "swarm-1");
+    await mkdir(suiteDir, { recursive: true });
+    const receiptPath = join(suiteDir, "swarm-receipt.json");
+    await writeFile(receiptPath, JSON.stringify(swarm));
+    for (const phase of phases) {
+      await mkdir(join(suiteDir, phase.runId), { recursive: true });
+      await writeFile(
+        join(suiteDir, phase.runId, "status.json"),
+        JSON.stringify(phase),
+      );
+    }
+    return receiptPath;
+  };
+
+  const github = (moved = false) => {
+    const comments: { id: number; body: string }[] = [];
+    const fetchMock = vi.fn(async (url: string, init?: RequestInit) => {
+      const method = init?.method ?? "GET";
+      const accept = String(
+        (init?.headers as Record<string, string> | undefined)?.["accept"] ?? "",
+      );
+      if (url.includes("/issues/comments/")) {
+        const id = Number(url.split("/").at(-1));
+        const body = JSON.parse(String(init?.body)) as { body: string };
+        const comment = comments.find((entry) => entry.id === id);
+        if (comment) comment.body = body.body;
+        return Response.json(comment ?? {}, { status: 200 });
+      }
+      if (url.includes("/issues/7/comments")) {
+        if (method !== "POST") return Response.json(comments, { status: 200 });
+        const body = JSON.parse(String(init?.body)) as { body: string };
+        const comment = { id: comments.length + 1, body: body.body };
+        comments.push(comment);
+        return Response.json(comment, { status: 201 });
+      }
+      if (url.includes("/pulls/7/reviews")) {
+        return method === "POST"
+          ? Response.json(
+              {
+                id: 9,
+                html_url:
+                  "https://github.com/acme/demo/pull/7#pullrequestreview-9",
+              },
+              { status: 201 },
+            )
+          : Response.json([], { status: 200 });
+      }
+      if (url.endsWith("/pulls/7")) {
+        return Response.json(
+          {
+            state: "open",
+            draft: false,
+            merged: false,
+            head: { sha: moved ? later : head },
+            base: { sha: base },
+          },
+          { status: 200 },
+        );
+      }
+      if (accept.includes("diff")) return new Response(diff, { status: 200 });
+      if (url.includes(`/compare/${head}...${later}`)) {
+        return Response.json(
+          { status: moved ? "diverged" : "ahead" },
+          { status: 200 },
+        );
+      }
+      return Response.json(
+        { merge_base_commit: { sha: base } },
+        { status: 200 },
+      );
+    });
+    vi.stubGlobal("fetch", fetchMock);
+    return { fetchMock, comments };
+  };
+
+  const failed = (): SwarmReceipt => ({
+    swarmId: "swarm-1",
+    status: "failed",
+    requested: { head, base, pullRequest: 7 },
+    findings: [],
+    lanes: [
+      {
+        laneId: "reviewer-1",
+        runId: "swarm-1-reviewer-1",
+        role: "reviewer",
+        model: "@cf/deepseek-ai/deepseek-v4-flash-0731",
+        status: "failed",
+      },
+    ],
+  });
+
+  const completed = (): SwarmReceipt => ({
+    swarmId: "swarm-1",
+    status: "completed",
+    requested: { head, base, pullRequest: 7 },
+    findings: [],
+  });
+
+  it("comments the refusal and the phase the run died in, and still fails", async () => {
+    const api = github();
+    const receiptPath = await artifact(failed(), [
+      { runId: "swarm-1-reviewer-1", phase: "install", state: "failed" },
+    ]);
+
+    await expect(publish(receiptPath)).rejects.toThrow(
+      "publication requires a completed or partial review",
+    );
+
+    expect(process.exitCode).toBe(1);
+    expect(api.comments).toHaveLength(1);
+    const body = api.comments[0]?.body ?? "";
+    expect(body).toContain(marker);
+    expect(body).toContain(
+      "publication requires a completed or partial review",
+    );
+    expect(body).toContain("`install` failed");
+    expect(body).toContain(runUrl);
+    expect(
+      api.fetchMock.mock.calls.filter(
+        ([url, init]) =>
+          String(url).includes("/pulls/7") &&
+          (init as RequestInit | undefined)?.method === "POST",
+      ),
+    ).toHaveLength(0);
+  });
+
+  it("posts no comment when the receipt publishes a review", async () => {
+    const api = github();
+    const receiptPath = await artifact(completed());
+
+    await expect(publish(receiptPath)).resolves.toBeUndefined();
+
+    expect(api.comments).toEqual([]);
+    expect(
+      api.fetchMock.mock.calls.some(([url]) =>
+        String(url).includes("/issues/"),
+      ),
+    ).toBe(false);
+    expect(
+      api.fetchMock.mock.calls.filter(
+        ([url, init]) =>
+          String(url).includes("/pulls/7/reviews") &&
+          (init as RequestInit | undefined)?.method === "POST",
+      ),
+    ).toHaveLength(1);
+  });
+
+  it("edits its own comment when the same run reports a second time", async () => {
+    const api = github();
+    const receiptPath = await artifact(failed());
+
+    await expect(publish(receiptPath)).rejects.toThrow(
+      "publication requires a completed or partial review",
+    );
+    await expect(publish(receiptPath)).rejects.toThrow(
+      "publication requires a completed or partial review",
+    );
+
+    expect(api.comments).toHaveLength(1);
+    const methods = api.fetchMock.mock.calls
+      .filter(([url]) => String(url).includes("/issues/"))
+      .map(([, init]) => (init as RequestInit | undefined)?.method ?? "GET");
+    expect(methods.filter((method) => method === "POST")).toHaveLength(1);
+    expect(methods.filter((method) => method === "PATCH")).toHaveLength(1);
+  });
+
+  it("comments a head that moved off the frozen SHA", async () => {
+    const api = github(true);
+    const receiptPath = await artifact(completed());
+
+    await expect(publish(receiptPath)).rejects.toThrow(
+      "pull request head moved off the frozen SHA",
+    );
+
+    expect(api.comments).toHaveLength(1);
+    const body = api.comments[0]?.body ?? "";
+    expect(body).toContain("pull request head moved off the frozen SHA");
+    expect(body).toContain(runUrl);
   });
 });
