@@ -1,5 +1,5 @@
 import { execFileSync, spawn, spawnSync } from "node:child_process";
-import { statSync } from "node:fs";
+import { existsSync, statSync } from "node:fs";
 import {
   chmod,
   mkdir,
@@ -798,6 +798,9 @@ if [ ! -f package.json ]; then
   printf 'error: Bun could not find a package.json file to install from\\n' >&2
   exit 1
 fi
+if [ -f node_modules/.template-marker ]; then
+  printf 'present\\n' > ${join(root, "template-seen")}
+fi
 if [ "\${FAKE_BUN_NO_CHANGES:-}" = "1" ]; then
   printf 'Checked 10 installs across 20 packages (no changes)\\n' >&2
 fi
@@ -855,6 +858,20 @@ child.on("exit", (code, signal) => {
 `,
     );
     await chmod(join(bin, "timeout"), 0o755);
+    // GNU cp's --reflink, which the image's template copy uses, is not an
+    // option macOS cp accepts, so the double drops it and copies with the
+    // host's own cp.
+    await writeFile(
+      join(bin, "cp"),
+      `#!/bin/bash
+args=()
+for argument in "$@"; do
+  [ "$argument" = "--reflink=auto" ] || args+=("$argument")
+done
+exec /bin/cp "\${args[@]}"
+`,
+    );
+    await chmod(join(bin, "cp"), 0o755);
     return {
       root,
       run,
@@ -1001,6 +1018,64 @@ child.on("exit", (code, signal) => {
       nothingToDo: true,
       seconds: expect.any(Number),
     });
+  });
+
+  const stageTemplate = async (root: string, lockfile: string) => {
+    const template = join(root, "template");
+    await mkdir(join(template, "node_modules-template"), { recursive: true });
+    await writeFile(join(template, "template-bun.lock"), lockfile);
+    await writeFile(
+      join(template, "node_modules-template/.template-marker"),
+      "baked\n",
+    );
+    return template;
+  };
+
+  it("places the baked template under the clone before bun installs a matching lockfile", async () => {
+    const lockfile = '{"lockfileVersion":1}\n';
+    const prepared = await prepareRun("template-match", {
+      "package.json": '{"name":"demo"}\n',
+      "bun.lock": lockfile,
+    });
+    const template = await stageTemplate(prepared.root, lockfile);
+
+    const result = spawnSync("bash", [runnerScript, prepared.run], {
+      encoding: "utf8",
+      env: { ...prepared.env, REVIEW_TEMPLATE_ROOT: template },
+    });
+
+    expect(result.status, result.stderr).toBe(0);
+    expect(await readFile(join(prepared.root, "template-seen"), "utf8")).toBe(
+      "present\n",
+    );
+    expect(await readFile(prepared.bunArgv, "utf8")).toContain(
+      "install --frozen-lockfile",
+    );
+  });
+
+  it("copies nothing and still installs when the lockfile differs from the template's", async () => {
+    const prepared = await prepareRun("template-mismatch", {
+      "package.json": '{"name":"demo"}\n',
+      "bun.lock": '{"lockfileVersion":1}\n',
+    });
+    const template = await stageTemplate(
+      prepared.root,
+      '{"lockfileVersion":1,"other":true}\n',
+    );
+
+    const result = spawnSync("bash", [runnerScript, prepared.run], {
+      encoding: "utf8",
+      env: { ...prepared.env, REVIEW_TEMPLATE_ROOT: template },
+    });
+
+    expect(result.status, result.stderr).toBe(0);
+    expect(existsSync(join(prepared.root, "template-seen"))).toBe(false);
+    expect(existsSync(join(prepared.run, "work/repo/node_modules"))).toBe(
+      false,
+    );
+    expect(await readFile(prepared.bunArgv, "utf8")).toContain(
+      "install --frozen-lockfile",
+    );
   });
 
   it("installs with bun when the checkout root carries the binary lockfile", async () => {

@@ -24,6 +24,7 @@ REVIEW_ERROR="$RUN_DIR/review-error.json"
 WORK="$RUN_DIR/work"
 REPO="$WORK/repo"
 CLAUDE_CODE_PROVIDER=/opt/review/extensions/claude-code-provider.js
+TEMPLATE_ROOT="${REVIEW_TEMPLATE_ROOT:-/opt/review}"
 
 START=$(date +%s)
 
@@ -214,8 +215,8 @@ do_install() {
   fi
   local code began seconds nothing_to_do
   began=$(date +%s)
-  if [ "$manifest" = "bun.lock" ] && cmp -s "$REPO/bun.lock" /opt/review/template-bun.lock && [ -d /opt/review/node_modules-template ]; then
-    cp -a --reflink=auto /opt/review/node_modules-template "$REPO/node_modules" || return 1
+  if [ "$manifest" = "bun.lock" ] && cmp -s "$REPO/bun.lock" "$TEMPLATE_ROOT/template-bun.lock" && [ -d "$TEMPLATE_ROOT/node_modules-template" ]; then
+    cp -a --reflink=auto "$TEMPLATE_ROOT/node_modules-template" "$REPO/node_modules" || return 1
   fi
   if is_supervised; then
     bun install --frozen-lockfile > "$RUN_DIR/install.log" 2>&1
