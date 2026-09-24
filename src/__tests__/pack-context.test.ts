@@ -219,6 +219,19 @@ describe("packLaneContext", () => {
     // t1b's cap is over it, so the model does: a pack the provider refuses
     // whole is not a budget, it is a wasted run.
     expect(packBudgetChars("t1b", "grok-4.6")).toBe((500_000 - 2_000) * 3);
+    // Workers AI's own endpoint names the model without the gateway prefix,
+    // and a lane on it is held to the same window, not the unknown floor.
+    expect(
+      packBudgetChars("t1b", "@cf/deepseek-ai/deepseek-v4-flash-0731"),
+    ).toBe(
+      packBudgetChars(
+        "t1b",
+        "workers-ai/@cf/deepseek-ai/deepseek-v4-flash-0731",
+      ),
+    );
+    expect(
+      packBudgetChars("t1b", "@cf/deepseek-ai/deepseek-v4-flash-0731"),
+    ).toBeGreaterThan(packBudgetChars("t1b", "some-unknown-model"));
     expect(packBudgetChars("t1b", "some-unknown-model")).toBeLessThan(
       packBudgetChars("t1b", "grok-4.6"),
     );

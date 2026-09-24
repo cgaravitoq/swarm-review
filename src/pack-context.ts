@@ -53,6 +53,13 @@ const MODEL_PROMPT_TOKENS = new Map<string, number>([
 
 const UNKNOWN_MODEL_PROMPT_TOKENS = 128_000;
 
+// Workers AI's own endpoint takes the model id without the gateway's prefix,
+// and the window is the same model's either way.
+const promptTokensFor = (model: string) =>
+  MODEL_PROMPT_TOKENS.get(
+    model.startsWith("@cf/") ? `workers-ai/${model}` : model,
+  ) ?? UNKNOWN_MODEL_PROMPT_TOKENS;
+
 /**
  * How much source one lane may pack.
  *
@@ -67,7 +74,7 @@ export const packBudgetChars = (
 ) =>
   (Math.min(
     SESSION_CAPS[trialKind].maxInputTokensPerRequest,
-    MODEL_PROMPT_TOKENS.get(model) ?? UNKNOWN_MODEL_PROMPT_TOKENS,
+    promptTokensFor(model),
   ) -
     PROMPT_RESERVE_TOKENS) *
   CHARS_PER_TOKEN;
