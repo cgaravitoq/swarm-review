@@ -2702,9 +2702,12 @@ async function main() {
     // one: an empty finding list here means "not reached", not "clean".
     const droppedAssigned =
       packed?.droppedFiles.filter((file) => files.includes(file)) ?? [];
+    const cutTokens = receipt?.usage?.["outputTokens"];
     const cutReason =
       finishReason === "length" || finishReason === "max_tokens"
-        ? `answer cut at ${receipt?.usage?.["outputTokens"] ?? 0} output tokens`
+        ? typeof cutTokens === "number"
+          ? `answer cut at ${cutTokens} output tokens`
+          : "answer cut at an output token count that was not observed"
         : null;
     const evidenceGap = packed?.truncated
       ? "pack truncated: the assigned diff alone exceeds the pack budget"

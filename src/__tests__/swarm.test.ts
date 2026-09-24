@@ -4904,6 +4904,41 @@ await writeFile(
       expect(result.code).toBe(1);
     }, 180_000);
 
+    it("says a cut answer's output count was not observed when no frame reported it", async () => {
+      const arranged = await arrange("success");
+      const swarmId = "swarm-packed-cut-unreported";
+      const provider = await fakeProvider((prompt) =>
+        completion(
+          isVerifierPrompt(prompt)
+            ? answer([])
+            : "I will start with the changed file. The diff adds a guard that",
+          {
+            finishReason: "length",
+            ...(prompt.includes(CANARY_PROMPT)
+              ? {}
+              : { usage: { prompt_tokens: 11 } }),
+          },
+        ),
+      );
+      await pointUpstream(arranged, {
+        "https://api.x.ai/v1": provider.baseUrl,
+      });
+
+      await runSwarm(
+        packedArguments(arranged, swarmId, ["--reviewers", "1"]),
+        arranged,
+      );
+      const lane = reviewerRows(await readReceipt(arranged.out, swarmId))[0];
+
+      // The provider said the ceiling cut the answer and never said where, so
+      // the reason names no count nobody measured.
+      expect(lane?.["status"]).toBe("blocked");
+      expect(lane?.["usage"]).toEqual({ inputTokens: 11, outputTokens: null });
+      expect(lane?.["blockerReason"]).toBe(
+        "answer cut at an output token count that was not observed",
+      );
+    }, 180_000);
+
     it("records an answer the ceiling cut as cut, not as off-contract", async () => {
       const arranged = await arrange("success");
       const swarmId = "swarm-packed-cut-prose";
