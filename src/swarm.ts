@@ -78,6 +78,7 @@ import {
   unpackableFiles,
   wholeChangeFits,
 } from "./pack-context";
+import { laneCaps } from "./provider-budget";
 import { ADVISORY_SEVERITY, publicationDisposition } from "./publish";
 
 /** Distinct from the P2 tag: this image adds ripgrep, so it is not that image. */
@@ -242,6 +243,13 @@ export function parseSwarmOptions(argv: string[]) {
   const verifierProvider = flag(argv, "verifier-provider");
   const verifierModel = flag(argv, "verifier-model");
   const verifierThinking = flag(argv, "verifier-thinking");
+  // Refused at parse time, before any lane starts: a ceiling above the trial's
+  // is one no lane of this run would be cut at.
+  const rawLaneInputCap = flag(argv, "lane-input-cap");
+  const laneInputCap = laneCaps(
+    flag(argv, "trial-kind") === "t1a" ? "t1a" : "t1b",
+    rawLaneInputCap,
+  ).maxCumulativeInputTokens;
   const orca = argv.includes("--orca");
   const sandbox = sandboxFlag;
   const fastFlag = argv.includes("--fast");
@@ -257,6 +265,14 @@ export function parseSwarmOptions(argv: string[]) {
     throw new Error("--fast cannot be combined with --orca or --sandbox");
   }
   const fast = fastFlag || (!sandbox && !orca && !worker);
+  // A packed lane calls the provider from this process and a cloud lane builds
+  // its own caps, so neither has a broker this ceiling could lower. Refused
+  // rather than accepted onto a run that would not honour it.
+  if (rawLaneInputCap !== undefined && (fast || worker)) {
+    throw new Error(
+      "--lane-input-cap needs a lane with a broker: run with --sandbox or --orca",
+    );
+  }
   // One packed swarm reaches one upstream: a per-lane provider would be
   // resolved once and then recorded per lane as something it never called.
   if (
@@ -304,6 +320,7 @@ export function parseSwarmOptions(argv: string[]) {
       ? { laneMemory: flag(argv, "lane-memory") }
       : {}),
     ...(flag(argv, "lane-cpus") ? { laneCpus: flag(argv, "lane-cpus") } : {}),
+    ...(rawLaneInputCap === undefined ? {} : { laneInputCap }),
     trialKind: flag(argv, "trial-kind") ?? "t1b",
     ...(flag(argv, "pack-budget")
       ? { packBudget: Number(flag(argv, "pack-budget")) }
@@ -1904,6 +1921,11 @@ export const laneArguments = (
     ...(thinking ? ["--thinking", thinking] : []),
     "--trial-kind",
     options.trialKind,
+    // The one ceiling a lane's broker cuts it at and its notice is measured
+    // against, so the lane is told the number it will be stopped by.
+    ...(options.laneInputCap === undefined
+      ? []
+      : ["--lane-input-cap", String(options.laneInputCap)]),
     ...(options.checkCommand ? ["--check", options.checkCommand] : []),
     ...(options.laneMemory ? ["--lane-memory", options.laneMemory] : []),
     ...(options.laneCpus ? ["--lane-cpus", options.laneCpus] : []),
@@ -2137,6 +2159,13 @@ export const neverReachedModel = (evidence: {
 
 async function main() {
   const options = parseSwarmOptions(process.argv.slice(2));
+  // The input ceiling every brokered lane of this run is held to: the trial's,
+  // or the one the caller lowered it to. A packed lane calls the provider from
+  // this process and has no broker to hold it to anything.
+  const laneInputCap = laneCaps(
+    options.trialKind === "t1a" ? "t1a" : "t1b",
+    options.laneInputCap,
+  ).maxCumulativeInputTokens;
   // The target is an input, not a property of where this package sits: the
   // identity every GitHub path is built from and the checkout the diffs, packs
   // and objects are read out of. Both are required before anything is paid for.
@@ -2811,6 +2840,7 @@ async function main() {
           (options.fast ? "low" : "high"),
         reasoning: fastUpstream ? packedLaneReasoning(options, laneId) : null,
         usage: receipt?.usage ?? null,
+        laneInputCap: fastUpstream ? null : laneInputCap,
         ...attestedReportFields(report, receipt),
         wallSeconds: receipt?.wallSeconds ?? null,
         teardownSeconds: receipt?.teardownSeconds ?? null,
@@ -3101,6 +3131,8 @@ async function main() {
           receipt?.model ?? verifierLaneConfig.model ?? options.model ?? null,
         thinking: verifierLaneConfig.thinking ?? options.thinking ?? "low",
         usage: receipt?.usage ?? null,
+        // A pool lane is a cloud container: the trial's ceiling holds it.
+        laneInputCap,
         ...attestedReportFields(report, receipt),
         wallSeconds: receipt?.wallSeconds ?? null,
         teardownSeconds: receipt?.teardownSeconds ?? null,
@@ -3542,6 +3574,7 @@ async function main() {
         options.thinking ??
         (options.fast ? "low" : "high"),
       usage: verifierEvidence.receipt?.usage ?? null,
+      laneInputCap: fastUpstream ? null : laneInputCap,
       ...attestedReportFields(verifierReport, verifierEvidence.receipt),
       wallSeconds: verifierEvidence.receipt?.wallSeconds ?? null,
       teardownSeconds: verifierEvidence.receipt?.teardownSeconds ?? null,

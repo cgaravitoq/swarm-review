@@ -54,9 +54,9 @@ import {
   sourceMismatchDetail,
 } from "./protocol";
 import {
+  laneCaps,
   PROVIDER_UPSTREAM,
   readLedgerUsage,
-  SESSION_CAPS,
   type SessionCaps,
 } from "./provider-budget";
 
@@ -223,6 +223,16 @@ export function parseOptions(argv: string[]) {
     : undefined;
 
   const laneId = flag(argv, "lane-id") ?? "lane-1";
+  const trialKind = (flag(argv, "trial-kind") === "t1a" ? "t1a" : "t1b") as
+    | "t1a"
+    | "t1b";
+  // Refused at parse time, before a container exists: the number this lane is
+  // cut at is the caller's, or the run never starts.
+  const rawLaneInputCap = flag(argv, "lane-input-cap");
+  const laneInputCap = laneCaps(
+    trialKind,
+    rawLaneInputCap,
+  ).maxCumulativeInputTokens;
 
   return {
     runId: assertRunId(flag(argv, "run-id") ?? mintRunId("local")),
@@ -253,12 +263,11 @@ export function parseOptions(argv: string[]) {
       ? { laneMemory: flag(argv, "lane-memory") }
       : {}),
     ...(flag(argv, "lane-cpus") ? { laneCpus: flag(argv, "lane-cpus") } : {}),
+    ...(rawLaneInputCap === undefined ? {} : { laneInputCap }),
     ...(flag(argv, "fail-step")
       ? { failStep: flag(argv, "fail-step") as ReviewJob["failStep"] }
       : {}),
-    trialKind: (flag(argv, "trial-kind") === "t1a" ? "t1a" : "t1b") as
-      | "t1a"
-      | "t1b",
+    trialKind,
     keepContainer: argv.includes("--keep"),
     liveActivity: argv.includes("--live-activity"),
     inspect,
@@ -1590,6 +1599,7 @@ export async function readLocalReceipt(directory: string) {
     installSkipReason: optionalString(receipt, "installSkipReason"),
     truncatedArtifacts: stringList(receipt["shutdown"], "truncatedArtifacts"),
     modelRequests: optionalNumber(receipt, "modelRequests"),
+    laneInputCap: optionalNumber(receipt, "laneInputCap") ?? null,
     isolation: readIsolationEvidence(receipt),
     error: optionalString(receipt, "error"),
   };
@@ -1991,6 +2001,10 @@ export async function readActivity(
 async function main() {
   const startedAt = Date.now();
   const options = parseOptions(process.argv.slice(2));
+  // One value for the whole lane: the broker cuts it at these caps and the
+  // runner's notice is measured against the same numbers, so a lane cannot be
+  // told one budget and stopped at another.
+  const caps = laneCaps(options.trialKind, options.laneInputCap);
   const isControlAction =
     options.inspect ||
     options.cancel ||
@@ -2526,6 +2540,10 @@ async function main() {
           piVersion: null,
           usage: cancelUsage,
           modelRequests: cancelUsage?.requests ?? null,
+          // The ceiling that run recorded for itself, not this controlling
+          // invocation's own idea of one.
+          laneInputCap:
+            metadata.credentialIsolation.caps.maxCumulativeInputTokens,
           fixture: metadata.fixturePath ?? null,
           checkCommand: metadata.checkCommand,
           failStep: null,
@@ -2742,8 +2760,8 @@ async function main() {
         totalTimeoutSeconds: options.totalTimeoutSeconds,
         ...(options.failStep ? { failStep: options.failStep } : {}),
         budget: {
-          requests: SESSION_CAPS[options.trialKind].maxRequests,
-          inputTokens: SESSION_CAPS[options.trialKind].maxCumulativeInputTokens,
+          requests: caps.maxRequests,
+          inputTokens: caps.maxCumulativeInputTokens,
         },
       };
       stage = await mkdtemp(join(tmpdir(), "review-pi-local-"));
@@ -2791,7 +2809,7 @@ async function main() {
       broker = planBroker(
         options.provider,
         credentials,
-        SESSION_CAPS[options.trialKind],
+        caps,
         `${CONTROL_DIR}/provider-usage.jsonl`,
       );
       await writeFile(
@@ -3367,6 +3385,9 @@ async function main() {
     // The broker's own count: a lane cut after it spent requests is finished
     // work, not a lane that never reached the model and can be relaunched.
     modelRequests: providerUsage?.requests ?? null,
+    // The input ceiling this lane ran under, from the trial's table or the
+    // caller's own --lane-input-cap.
+    laneInputCap: caps.maxCumulativeInputTokens,
     fixture: options.fixturePath ?? null,
     checkCommand: options.checkCommand,
     failStep: options.failStep ?? null,
