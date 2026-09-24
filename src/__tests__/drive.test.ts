@@ -277,16 +277,15 @@ describe("local driver lifecycle", () => {
     expect(observedIsolation(undefined)).toBeNull();
 
     const directory = await mkdtemp(join(tmpdir(), "review-pi-receipt-"));
-    await writeFile(
-      join(directory, "receipt.json"),
-      JSON.stringify({
-        runId: "run",
-        provider: "openai-codex",
-        model: "gpt-5.4",
-        wallSeconds: 12,
-        isolation: observedIsolation(started),
-      }),
-    );
+    // Written the way the driver writes it, so the verdict reaches the row only
+    // if the receipt's control observations carry it.
+    await writeCloudReceipt(directory, {
+      runId: "run",
+      provider: "openai-codex",
+      model: "gpt-5.4",
+      wallSeconds: 12,
+      ...observedControl(started, undefined),
+    });
 
     await expect(readLaneReceipt(directory)).resolves.toMatchObject({
       isolation: {
