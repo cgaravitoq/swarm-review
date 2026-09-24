@@ -36,6 +36,7 @@ import {
   parseOptions,
   planBroker,
   prepareTransport,
+  RUN_DEADLINE_GRACE_SECONDS,
   readLaneReceipt,
   readLocalReceipt,
   redactArgs,
@@ -48,6 +49,7 @@ import {
   targetProviderEnv,
   writeLocalReceipt,
 } from "../local";
+import { IMAGE_SOURCES } from "../protocol";
 import { SESSION_CAPS } from "../provider-budget";
 import { neverReachedModel } from "../swarm";
 
@@ -102,9 +104,14 @@ execFileSync("git", ["-C", repoRoot, "add", "."]);
 commit(repoRoot, "base");
 const localScript = join(packageRoot, "src/local.ts");
 const promptPath = join(packageRoot, "prompts", "review-prompt-local.txt");
-const runnerSha = createHash("sha256")
-  .update(readFileSync(join(packageRoot, "container/review-run.sh")))
-  .digest("hex");
+const imageSources = Object.fromEntries(
+  Object.entries(IMAGE_SOURCES).map(([path, name]) => [
+    path,
+    createHash("sha256")
+      .update(readFileSync(join(packageRoot, "container", name)))
+      .digest("hex"),
+  ]),
+);
 
 const installedOpenaiCodexAdapter = () => {
   const tried: string[] = [];
@@ -180,11 +187,15 @@ const revision = (format: string) => {
 };
 
 // A stalled run has to end through its own receipt, which names the phase that
-// hung, before vitest gives up on the test: the run budget, then the teardown's
-// own budget, then a margin for the receipt write.
+// hung, before vitest gives up on the test: the run's deadline, then the
+// teardown's own budget, then a margin for the receipt write.
 const RUN_BUDGET_SECONDS = 20;
 const LIFECYCLE_TEST_TIMEOUT_MS =
-  (RUN_BUDGET_SECONDS + TEARDOWN_BUDGET_SECONDS + 10) * 1000;
+  (RUN_BUDGET_SECONDS +
+    RUN_DEADLINE_GRACE_SECONDS +
+    TEARDOWN_BUDGET_SECONDS +
+    10) *
+  1000;
 
 const localArguments = (out: string, runId: string) => [
   localScript,
@@ -280,6 +291,9 @@ if [[ "$1" == "cp" ]]; then
     /bin/cp "$2" "$root/job.json"
     /bin/cp "$2" "$root/copied-job.json"
   fi
+  if [[ "$3" == *"/review-run.sh" ]]; then
+    touch "$state/runner-uploaded"
+  fi
   exit 0
 fi
 if [[ "$joined" == *"rm --force "* && ("$joined" == *"/auth.json"* || "$joined" == *"/broker.json"*) ]]; then
@@ -312,7 +326,11 @@ if [[ "$joined" == *" mkdir -p "* || "$joined" == *" chmod "* || "$joined" == *"
   exit 0
 fi
 if [[ "$joined" == *" sha256sum "* ]]; then
-  echo "\${FAKE_RUNNER_SHA:?}"
+  sources="\${FAKE_IMAGE_SOURCES:?}"
+  if [[ -f "$state/runner-uploaded" ]]; then
+    sources=$(jq --arg p "/opt/review/review-run.sh" --arg s "\${FAKE_RUNNER_SHA:?}" '.[$p]=$s' <<< "$sources")
+  fi
+  jq -r 'to_entries[] | "\\(.value)  \\(.key)"' <<< "$sources"
   exit 0
 fi
 if [[ "$joined" == *" --detach "* ]]; then
@@ -358,6 +376,10 @@ if [[ "$1" == "exec" && "$joined" == *" --send "* ]]; then
     echo "no such file or directory: rpc.sock" >&2
     exit 1
   fi
+  if [[ "\${FAKE_CANCEL:-}" == "closes" && -f "$state/cancel-request" ]]; then
+    echo "no such file or directory: rpc.sock" >&2
+    exit 1
+  fi
   if [[ -n "\${FAKE_BRIDGE_FLAKY:-}" ]]; then
     flaky=0
     [[ -f "$state/bridge-flaky" ]] && flaky=$(cat "$state/bridge-flaky")
@@ -377,6 +399,11 @@ if [[ "$1" == "exec" && "$joined" == *" --send "* ]]; then
       [[ $index -gt $last ]] && index=$last
       current="\${states[$index]}"
       echo $(( step + 1 )) > "$state/bridge-step"
+      terminal="\${FAKE_TERMINAL_REASON:-}"
+      if [[ -f "$state/cancel-request" ]]; then
+        current=cancelled
+        terminal=$(jq -r '.reason // "cancelled"' "$state/cancel-request")
+      fi
       candidate=""
       idle=false
       if [[ "$current" == "idle" ]]; then
@@ -387,7 +414,7 @@ if [[ "$1" == "exec" && "$joined" == *" --send "* ]]; then
         fi
       fi
       printf '{"type":"response","command":"inspect","success":true,"data":{"runId":"%s","phase":"review","state":"%s","detail":"","childIdle":%s,"isStreaming":false,"inFlightTool":null,"terminalReason":"%s","lastCandidateResult":%s,"process":{"alive":true,"pid":4242},"session":{"sessionId":"fake-session","sessionFile":"/dev/null"}}}\\n' \\
-        "\${FAKE_RUN_ID:?}" "$current" "$idle" "\${FAKE_TERMINAL_REASON:-}" "$(printf '%s' "$candidate" | /usr/bin/python3 -c 'import json,sys; print(json.dumps(sys.stdin.read() or None))')"
+        "\${FAKE_RUN_ID:?}" "$current" "$idle" "$terminal" "$(printf '%s' "$candidate" | /usr/bin/python3 -c 'import json,sys; print(json.dumps(sys.stdin.read() or None))')"
       exit 0
       ;;
     prompt)
@@ -412,6 +439,7 @@ if [[ "$1" == "exec" && "$joined" == *" --send "* ]]; then
         echo "bridge is gone" >&2
         exit 1
       fi
+      printf '%s' "$payload" > "$state/cancel-request"
       printf '{"type":"response","command":"cancel","success":true,"data":{}}\\n'
       exit 0
       ;;
@@ -428,7 +456,19 @@ if [[ "$1" == "exec" && "$joined" == *" --send "* ]]; then
 fi
 if [[ "$1" == "exec" && "\${@: -2:1}" == "cat" ]]; then
   if [[ -n "\${FAKE_PREPARATION_STATUS:-}" && "\${@: -1}" == *"/status.json" ]]; then
+    if [[ -n "\${FAKE_STATUS_HANG_INTERRUPTS_FROM:-}" && $(date +%s) -ge "\${FAKE_STATUS_HANG_INTERRUPTS_FROM}" ]]; then
+      trap 'touch "$state/driver-interrupted"; kill -TERM "$PPID"; sleep 0.1; exit 143' TERM
+      sleep 600 &
+      wait
+    fi
     printf '%s\\n' "\${FAKE_PREPARATION_STATUS}"
+    exit 0
+  fi
+  if [[ -n "\${FAKE_STATUS_SEQUENCE:-}" && "\${@: -1}" == *"/status.json" ]]; then
+    reads=0
+    [[ -f "$state/status-reads" ]] && reads=$(cat "$state/status-reads")
+    echo $(( reads + 1 )) > "$state/status-reads"
+    jq -c --argjson i "$reads" '.[[$i, length - 1] | min]' <<< "\${FAKE_STATUS_SEQUENCE}"
     exit 0
   fi
   target=$(printf '%s' "\${@: -1}" | /usr/bin/sed "s#/workspace/runs/\${FAKE_RUN_ID:?}#$root#g")
@@ -1394,7 +1434,8 @@ describe("public local CLI lifecycle", {
     FAKE_CONTAINER_ROOT: arranged.container,
     FAKE_RUN_ID: runId,
     FAKE_MODE: mode,
-    FAKE_RUNNER_SHA: runnerSha,
+    FAKE_IMAGE_SOURCES: JSON.stringify(imageSources),
+    FAKE_RUNNER_SHA: imageSources["/opt/review/review-run.sh"],
     FAKE_HEAD_SHA: revision("%H"),
     FAKE_BASE_SHA: revision("%H"),
     WORKERS_AI_API_KEY: "public-cli-secret",
@@ -1857,6 +1898,505 @@ describe("public local CLI lifecycle", {
     );
     expect(receipt).not.toContain('"outcome": "cancelled"');
     expect(receipt).not.toContain("interrupted");
+  });
+
+  it("ends a lane blocked when its bridge is gone and the runner says blocked", async () => {
+    const root = await mkdtemp(join(tmpdir(), "review-pi-cli-"));
+    temporaryDirectories.push(root);
+    const arranged = await arrangeFakeDocker(root);
+    const runId = "quota-blocked";
+    const out = join(root, "out");
+    const startedAt = Date.now();
+
+    const result = await runLocalCli(localArguments(out, runId), {
+      ...fakeEnvironment(arranged, runId, "success"),
+      FAKE_BRIDGE: "unavailable",
+      FAKE_PREPARATION_STATUS: JSON.stringify({
+        runId,
+        phase: "finished",
+        state: "blocked",
+        detail: "",
+        terminalReason: "quota_blocked",
+        process: { alive: false, pid: 50 },
+      }),
+    });
+
+    expect(result.code, result.output).toBe(1);
+    expect(Date.now() - startedAt).toBeLessThan(30_000);
+    await expect(readLocalReceipt(join(out, runId))).resolves.toMatchObject({
+      outcome: "blocked",
+      error: "run blocked at finished: quota_blocked",
+    });
+  });
+
+  it("ends a lane cancelled when its bridge is gone and the runner says cancelled", async () => {
+    const root = await mkdtemp(join(tmpdir(), "review-pi-cli-"));
+    temporaryDirectories.push(root);
+    const arranged = await arrangeFakeDocker(root);
+    const runId = "runner-cancelled";
+    const out = join(root, "out");
+    const startedAt = Date.now();
+
+    const result = await runLocalCli(localArguments(out, runId), {
+      ...fakeEnvironment(arranged, runId, "success"),
+      FAKE_BRIDGE: "unavailable",
+      FAKE_PREPARATION_STATUS: JSON.stringify({
+        runId,
+        phase: "finished",
+        state: "cancelled",
+        detail: "",
+        terminalReason: "no_candidates",
+        process: { alive: false, pid: 50 },
+      }),
+    });
+
+    expect(result.code, result.output).toBe(1);
+    expect(Date.now() - startedAt).toBeLessThan(30_000);
+    await expect(readLocalReceipt(join(out, runId))).resolves.toMatchObject({
+      outcome: "cancelled",
+      error: "run cancelled at finished: no_candidates",
+    });
+  });
+
+  it("ends a lane on an empty brief cancelled whichever poll sees the cancel", async () => {
+    // The bridge answers the cancel and then closes its socket, so the next
+    // poll either still reaches it or finds only the runner's status file. The
+    // two lanes below differ in nothing else.
+    const cancelled = (phase: string) => ({
+      phase,
+      state: "cancelled",
+      detail: "",
+      terminalReason: "no_candidates",
+      process: { alive: false, pid: 50 },
+    });
+    const endOnEmptyBrief = async (runId: string, bridgeCloses: boolean) => {
+      const root = await mkdtemp(join(tmpdir(), "review-pi-cli-"));
+      temporaryDirectories.push(root);
+      const arranged = await arrangeFakeDocker(root);
+      const brief = join(root, "brief.json");
+      await writeFile(
+        brief,
+        JSON.stringify({ prompt: null, candidateIds: [] }),
+      );
+      const out = join(root, "out");
+
+      const result = await runLocalCli(
+        [...localArguments(out, runId), "--brief", brief],
+        {
+          ...fakeEnvironment(arranged, runId, "success"),
+          FAKE_BRIDGE_STATES: "idle",
+          FAKE_STATUS_SEQUENCE: JSON.stringify([
+            cancelled("review"),
+            { ...cancelled("trace"), state: "running", terminalReason: null },
+            cancelled("finished"),
+          ]),
+          ...(bridgeCloses ? { FAKE_CANCEL: "closes" } : {}),
+        },
+      );
+
+      expect(result.code, result.output).toBe(1);
+      expect(
+        JSON.parse(
+          await readFile(join(arranged.state, "cancel-request"), "utf8"),
+        ),
+      ).toEqual({ type: "cancel", reason: "no_candidates" });
+      const statusReads = await readFile(
+        join(arranged.state, "status-reads"),
+        "utf8",
+      ).catch(() => "0");
+      return {
+        receipt: await readLocalReceipt(join(out, runId)),
+        statusReads: Number(statusReads),
+      };
+    };
+
+    const bridgeAlive = await endOnEmptyBrief("empty-brief-bridge", false);
+    const bridgeGone = await endOnEmptyBrief("empty-brief-status", true);
+
+    expect([bridgeAlive, bridgeGone]).toMatchObject([
+      {
+        statusReads: 0,
+        receipt: {
+          outcome: "cancelled",
+          error: "run cancelled at review: no_candidates",
+        },
+      },
+      {
+        receipt: {
+          outcome: "cancelled",
+          error: "run cancelled at finished: no_candidates",
+        },
+      },
+    ]);
+    expect(bridgeGone.statusReads).toBeGreaterThanOrEqual(3);
+  });
+
+  it("ends a failed review on the runner's last word once the bridge is gone", async () => {
+    // The 402 lane: the bridge wrote the review failed and exited, and the
+    // runner went on to write the evidence of that failure before its own
+    // last word. Ending on the bridge's word would tear the container down
+    // under the partial report.
+    const root = await mkdtemp(join(tmpdir(), "review-pi-cli-"));
+    temporaryDirectories.push(root);
+    const arranged = await arrangeFakeDocker(root);
+    const runId = "model-error";
+    const out = join(root, "out");
+    const failed = (phase: string) => ({
+      runId,
+      phase,
+      state: "failed",
+      detail: "",
+      terminalReason: "model_error",
+      process: { alive: false, pid: 50 },
+    });
+
+    const result = await runLocalCli(localArguments(out, runId), {
+      ...fakeEnvironment(arranged, runId, "success"),
+      FAKE_BRIDGE: "unavailable",
+      FAKE_STATUS_SEQUENCE: JSON.stringify([
+        failed("review"),
+        failed("review"),
+        failed("finished"),
+      ]),
+    });
+
+    expect(result.code, result.output).toBe(1);
+    expect(result.output).toContain("review/failed");
+    expect(
+      Number(await readFile(join(arranged.state, "status-reads"), "utf8")),
+    ).toBeGreaterThanOrEqual(3);
+    await expect(readLocalReceipt(join(out, runId))).resolves.toMatchObject({
+      outcome: "failed",
+      error: "run failed at finished: model_error",
+    });
+  });
+
+  it("ends a lane whose status file says done forever at the run's deadline", async () => {
+    // The 402 hang: the bridge was gone, the runner's last word was done, and
+    // the driver never believes a done it did not hear from the bridge. The
+    // second lane is interrupted while the deadline is still unwinding its
+    // status read, and a swarm's cut is what its receipt names. Both lanes
+    // wait out the same deadline.
+    const totalSeconds = 8;
+    const deadlineSeconds = totalSeconds + RUN_DEADLINE_GRACE_SECONDS;
+    const startedAt = Date.now();
+    const pastDeadline = async (
+      runId: string,
+      environment: Record<string, string>,
+    ) => {
+      const root = await mkdtemp(join(tmpdir(), "review-pi-cli-"));
+      temporaryDirectories.push(root);
+      const arranged = await arrangeFakeDocker(root);
+      const out = join(root, "out");
+      const result = await runLocalCli(
+        [...localArguments(out, runId).slice(0, -1), String(totalSeconds)],
+        {
+          ...fakeEnvironment(arranged, runId, "success"),
+          FAKE_BRIDGE: "unavailable",
+          FAKE_PREPARATION_STATUS: JSON.stringify({
+            runId,
+            phase: "finished",
+            state: "done",
+            detail: "",
+            terminalReason: "completed",
+            process: { alive: false, pid: 50 },
+          }),
+          ...environment,
+        },
+      );
+      return {
+        result,
+        elapsedSeconds: (Date.now() - startedAt) / 1000,
+        receipt: await readLocalReceipt(join(out, runId)),
+        dockerLog: await readFile(join(arranged.state, "docker.log"), "utf8"),
+        driverInterrupted: existsSync(
+          join(arranged.state, "driver-interrupted"),
+        ),
+      };
+    };
+
+    const [expired, interrupted] = await Promise.all([
+      pastDeadline("done-forever", {}),
+      pastDeadline("interrupted-at-deadline", {
+        FAKE_STATUS_HANG_INTERRUPTS_FROM: String(
+          Math.floor(startedAt / 1000) + deadlineSeconds - 3,
+        ),
+      }),
+    ]);
+
+    expect(expired.result.code, expired.result.output).toBe(1);
+    expect(expired.elapsedSeconds).toBeGreaterThanOrEqual(deadlineSeconds);
+    expect(expired.elapsedSeconds).toBeLessThan(deadlineSeconds + 15);
+    expect(expired.receipt).toMatchObject({
+      outcome: "failed",
+      error: `run deadline exceeded after ${deadlineSeconds} s`,
+    });
+    expect(expired.dockerLog).toContain(
+      "rm --force --volumes review-pi-local-done-forever",
+    );
+    expect(interrupted.result.code, interrupted.result.output).toBe(1);
+    expect(interrupted.driverInterrupted).toBe(true);
+    expect(interrupted.elapsedSeconds).toBeGreaterThanOrEqual(deadlineSeconds);
+    expect(interrupted.receipt).toMatchObject({
+      outcome: "interrupted",
+      error: "interrupted",
+    });
+  });
+
+  it("refuses an image whose broker copy differs before the review ever starts", async () => {
+    const root = await mkdtemp(join(tmpdir(), "review-pi-cli-"));
+    temporaryDirectories.push(root);
+    const arranged = await arrangeFakeDocker(root);
+    const runId = "stale-broker-image";
+    const out = join(root, "out");
+
+    const result = await runLocalCli(localArguments(out, runId), {
+      ...fakeEnvironment(arranged, runId, "success"),
+      FAKE_IMAGE_SOURCES: JSON.stringify({
+        ...imageSources,
+        "/opt/review/model-broker.ts": "c".repeat(64),
+      }),
+    });
+
+    expect(result.code, result.output).toBe(1);
+    const receipt = JSON.parse(
+      await readFile(join(out, runId, "local-receipt.json"), "utf8"),
+    ) as Record<string, unknown>;
+    expect(receipt["outcome"]).toBe("failed");
+    expect(receipt["error"]).toMatch(
+      /^image source \/opt\/review\/model-broker\.ts differs/,
+    );
+    // Refused before any model request: the review process was never started.
+    const dockerLog = await readFile(
+      join(arranged.state, "docker.log"),
+      "utf8",
+    );
+    expect(dockerLog).not.toMatch(/--detach.*review-run\.sh/);
+  });
+
+  it("refuses an image whose own runner copy differs before the upload replaces it", async () => {
+    const root = await mkdtemp(join(tmpdir(), "review-pi-cli-"));
+    temporaryDirectories.push(root);
+    const arranged = await arrangeFakeDocker(root);
+    const runId = "stale-runner-image";
+    const out = join(root, "out");
+
+    const result = await runLocalCli(localArguments(out, runId), {
+      ...fakeEnvironment(arranged, runId, "success"),
+      FAKE_IMAGE_SOURCES: JSON.stringify({
+        ...imageSources,
+        "/opt/review/review-run.sh": "c".repeat(64),
+      }),
+    });
+
+    expect(result.code, result.output).toBe(1);
+    const receipt = JSON.parse(
+      await readFile(join(out, runId, "local-receipt.json"), "utf8"),
+    ) as Record<string, unknown>;
+    expect(receipt["outcome"]).toBe("failed");
+    expect(receipt["error"]).toMatch(
+      /^image source \/opt\/review\/review-run\.sh differs/,
+    );
+    const dockerLog = await readFile(
+      join(arranged.state, "docker.log"),
+      "utf8",
+    );
+    expect(dockerLog).not.toMatch(/--detach.*review-run\.sh/);
+  });
+
+  it("refuses an image built from another Dockerfile before the review ever starts", async () => {
+    // Every copied source agrees; only the recipe that pins pi, bun and the
+    // extension does not, which is how an image with an older pi looks.
+    const root = await mkdtemp(join(tmpdir(), "review-pi-cli-"));
+    temporaryDirectories.push(root);
+    const arranged = await arrangeFakeDocker(root);
+    const runId = "stale-recipe-image";
+    const out = join(root, "out");
+
+    const result = await runLocalCli(localArguments(out, runId), {
+      ...fakeEnvironment(arranged, runId, "success"),
+      FAKE_IMAGE_SOURCES: JSON.stringify({
+        ...imageSources,
+        "/opt/review/Dockerfile": "c".repeat(64),
+      }),
+    });
+
+    expect(result.code, result.output).toBe(1);
+    const receipt = await readLocalReceipt(join(out, runId));
+    expect(receipt.error).toBe(
+      `image source /opt/review/Dockerfile differs from the host's copy: expected ${imageSources["/opt/review/Dockerfile"]}, observed ${"c".repeat(64)}`,
+    );
+    const dockerLog = await readFile(
+      join(arranged.state, "docker.log"),
+      "utf8",
+    );
+    expect(dockerLog).toMatch(/for f in [^;]*\/opt\/review\/Dockerfile;/);
+    expect(dockerLog).not.toMatch(/--detach.*review-run\.sh/);
+  });
+
+  const broker = "/opt/review/model-broker.ts";
+  const olderBroker = "c".repeat(64);
+  const controlAction = (out: string, runId: string, action: string) => [
+    localScript,
+    "--out",
+    out,
+    "--run-id",
+    runId,
+    action,
+  ];
+
+  it("refuses to resume a lane whose checkout moved since it started, and still cancels it", async () => {
+    const root = await mkdtemp(join(tmpdir(), "review-pi-cli-"));
+    temporaryDirectories.push(root);
+    const arranged = await arrangeFakeDocker(root);
+    const runId = "moved-checkout";
+    const out = join(root, "out");
+    const authBlocked = {
+      FAKE_BRIDGE_STATES: "running,blocked",
+      FAKE_TERMINAL_REASON: "auth_blocked",
+    };
+    const started = await runLocalCli(localArguments(out, runId), {
+      ...fakeEnvironment(arranged, runId, "success"),
+      ...authBlocked,
+    });
+    expect(started.code, started.output).toBe(1);
+
+    // The lane started on an image whose broker this checkout has since
+    // replaced: the container, its job and its metadata all name the old one.
+    const metadataPath = join(out, runId, "metadata.json");
+    const metadata = JSON.parse(await readFile(metadataPath, "utf8")) as {
+      expectedSources: Record<string, string>;
+      observedSources: Record<string, string>;
+    };
+    metadata.expectedSources[broker] = olderBroker;
+    metadata.observedSources[broker] = olderBroker;
+    await writeFile(metadataPath, JSON.stringify(metadata));
+    const jobPath = join(arranged.container, "job.json");
+    const job = JSON.parse(await readFile(jobPath, "utf8")) as {
+      expectedSources: Record<string, string>;
+    };
+    job.expectedSources[broker] = olderBroker;
+    await writeFile(jobPath, JSON.stringify(job));
+    const environment = {
+      ...fakeEnvironment(arranged, runId, "success"),
+      ...authBlocked,
+      FAKE_IMAGE_SOURCES: JSON.stringify({
+        ...imageSources,
+        [broker]: olderBroker,
+      }),
+    };
+    const dockerLog = join(arranged.state, "docker.log");
+    const beforeResume = (await readFile(dockerLog, "utf8")).length;
+
+    const resumed = await runLocalCli(
+      controlAction(out, runId, "--resume"),
+      environment,
+    );
+
+    expect(resumed.code, resumed.output).toBe(1);
+    expect(resumed.output).toContain(
+      `image source ${broker} differs from the host's copy: expected ${imageSources[broker]}, observed ${olderBroker}`,
+    );
+    // Refused before the broker or pi was restarted with this checkout's staging.
+    const resumeLog = (await readFile(dockerLog, "utf8")).slice(beforeResume);
+    expect(resumeLog).not.toContain("--full model-broker.ts");
+    expect(existsSync(join(arranged.state, "restarted"))).toBe(false);
+
+    const cancelled = await runLocalCli(
+      controlAction(out, runId, "--cancel"),
+      environment,
+    );
+    expect(cancelled.code, cancelled.output).toBe(0);
+    expect(existsSync(join(arranged.state, "cancelled"))).toBe(true);
+  });
+
+  it("refuses to reattach to a container that no longer holds what its lane started with", async () => {
+    const root = await mkdtemp(join(tmpdir(), "review-pi-cli-"));
+    temporaryDirectories.push(root);
+    const arranged = await arrangeFakeDocker(root);
+    const runId = "drifted-container";
+    const out = join(root, "out");
+    const kept = await runLocalCli(
+      [...localArguments(out, runId), "--keep"],
+      fakeEnvironment(arranged, runId, "success"),
+    );
+    expect(kept.code, kept.output).toBe(0);
+
+    const inspected = await runLocalCli(
+      controlAction(out, runId, "--inspect"),
+      {
+        ...fakeEnvironment(arranged, runId, "success"),
+        FAKE_IMAGE_SOURCES: JSON.stringify({
+          ...imageSources,
+          [broker]: olderBroker,
+        }),
+      },
+    );
+
+    expect(inspected.code, inspected.output).toBe(1);
+    expect(inspected.output).toContain(
+      `image source ${broker} differs from the host's copy: expected ${imageSources[broker]}, observed ${olderBroker}`,
+    );
+  });
+
+  it("reports the runner's phase while the bridge socket is not up yet", async () => {
+    const root = await mkdtemp(join(tmpdir(), "review-pi-cli-"));
+    temporaryDirectories.push(root);
+    const arranged = await arrangeFakeDocker(root);
+    const runId = "preparation-phase";
+    const out = join(root, "out");
+
+    const result = await runLocalCli(localArguments(out, runId), {
+      ...fakeEnvironment(arranged, runId, "success"),
+      FAKE_BRIDGE_FLAKY: "2",
+      FAKE_BRIDGE_STATES: "done",
+      FAKE_PREPARATION_STATUS: JSON.stringify({
+        runId,
+        phase: "install",
+        state: "running",
+        detail: "",
+        process: { alive: true, pid: 50 },
+      }),
+    });
+
+    expect(result.code, result.output).toBe(0);
+    // A socket that does not exist yet is not an uncertain observation: the
+    // runner's own status file says which phase the lane is dying in.
+    expect(result.output).not.toContain("status observation uncertain");
+    expect(result.output).toContain("install/running");
+  });
+
+  it("never takes a status file's done for the lane's end while the bridge is gone", async () => {
+    // The run directory belongs to the target's uid, so anything the install
+    // or the check runs can write status.json. A failure it claims only ends
+    // its own review; a success it claims would end the review for it.
+    const root = await mkdtemp(join(tmpdir(), "review-pi-cli-"));
+    temporaryDirectories.push(root);
+    const arranged = await arrangeFakeDocker(root);
+    const runId = "claimed-done";
+    const out = join(root, "out");
+
+    const result = await runLocalCli(localArguments(out, runId), {
+      ...fakeEnvironment(arranged, runId, "success"),
+      FAKE_BRIDGE_FLAKY: "2",
+      FAKE_BRIDGE_STATES: "running,done",
+      FAKE_PREPARATION_STATUS: JSON.stringify({
+        runId,
+        phase: "install",
+        state: "done",
+        detail: "",
+        process: { alive: false, pid: 50 },
+      }),
+    });
+
+    expect(result.code, result.output).toBe(0);
+    expect(result.output).toContain("status observation uncertain");
+    expect(result.output).not.toContain("install/done");
+    // The lane ended where the bridge said it did, after it said running.
+    expect(result.output).toContain("review/running");
+    expect(await readFile(join(arranged.state, "bridge-step"), "utf8")).toBe(
+      "2\n",
+    );
   });
 
   it("keeps waiting when the bridge is briefly unreachable but the run is alive", async () => {

@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -12,6 +13,7 @@ import {
   FINALIZE_REPORT_MARGIN_MS,
   FINALIZE_REQUEST_RESERVE,
   type LaneBrief,
+  main,
   observedIsolation,
   observedModelRequests,
   promptFailure,
@@ -27,7 +29,12 @@ import {
   readLaneReceipt,
   targetProviderEnv,
 } from "../local";
+import { IMAGE_SOURCES } from "../protocol";
 import { SESSION_CAPS } from "../provider-budget";
+
+const expectedSources = Object.fromEntries(
+  Object.keys(IMAGE_SOURCES).map((path) => [path, "b".repeat(64)]),
+);
 
 afterEach(() => {
   vi.unstubAllGlobals();
@@ -756,6 +763,210 @@ describe("local driver lifecycle", () => {
     expect(polls).toBe(2);
   });
 
+  it("fails a review that ended in error even after its runner wrote the partial report", async () => {
+    // The 402 lane: the bridge writes the review failed and exits, so the
+    // cancel meets no bridge, and the runner goes on to write the partial
+    // report and its own failed last word before it exits.
+    const head = "a".repeat(40);
+    const base = "b".repeat(40);
+    const reviewError = {
+      path: "/workspace/runs/run/review-error.json",
+      exists: true,
+      content: JSON.stringify({
+        reason: "model_error",
+        errorMessage: "402 Payment Required",
+      }),
+    };
+    const status = (phase: string) => ({
+      path: "/workspace/runs/run/status.json",
+      exists: true,
+      content: JSON.stringify({
+        phase,
+        state: "failed",
+        terminalReason: "model_error",
+        process: { alive: false },
+      }),
+    });
+    const failing = {
+      runId: "run",
+      observedAt: "",
+      placementId: null,
+      processes: [
+        {
+          id: "review",
+          command: "/opt/review/review-run.sh /workspace/runs/run",
+          status: "running",
+        },
+      ],
+      artifacts: [status("review"), reviewError],
+    };
+    const finished = {
+      runId: "run",
+      observedAt: "",
+      placementId: null,
+      processes: [],
+      artifacts: [
+        status("finished"),
+        reviewError,
+        {
+          path: "/workspace/runs/run/report.json",
+          exists: true,
+          content: JSON.stringify({
+            partial: true,
+            checkout: { checkedOutHead: head, checkedOutBase: base },
+          }),
+        },
+        {
+          path: "/workspace/runs/run/steps.jsonl",
+          exists: true,
+          content: `${JSON.stringify({ step: "report", exit: 0 })}\n`,
+        },
+      ],
+    };
+    const states = [failing, finished];
+    const sent: unknown[] = [];
+
+    await expect(
+      driveUntilComplete({
+        poll: () => Promise.resolve(states.shift() ?? finished),
+        send: (command) => {
+          sent.push(command);
+          return Promise.reject(
+            new Error("control /runs/run/command: 502 bridge unavailable"),
+          );
+        },
+        requested: { head, base },
+        role: "reviewer",
+        laneId: "lane-1",
+        candidateIds: [],
+        deadline: 600_000,
+        now: () => 0,
+        sleep: () => Promise.resolve(),
+      }),
+    ).rejects.toThrow("provider model_error: 402 Payment Required");
+    expect(controlPlaneCompletion(finished, { head, base })).toMatchObject({
+      reportOk: true,
+      reviewAlive: false,
+    });
+    expect(sent).toEqual([{ type: "cancel" }]);
+    expect(states).toHaveLength(0);
+  });
+
+  it("cancels a failed review behind a failed process listing before it ends the lane", async () => {
+    // A listing the container failed to serve says nothing about the runner,
+    // so the failure is not final until the runner is seen gone: the cancel
+    // that lets it write the partial report goes out first.
+    const head = "a".repeat(40);
+    const base = "b".repeat(40);
+    const failed = {
+      path: "/workspace/runs/run/status.json",
+      exists: true,
+      content: JSON.stringify({
+        phase: "review",
+        state: "failed",
+        terminalReason: "model_error",
+        process: { alive: false },
+      }),
+    };
+    const reviewError = {
+      path: "/workspace/runs/run/review-error.json",
+      exists: true,
+      content: JSON.stringify({
+        reason: "model_error",
+        errorMessage: "402 Payment Required",
+      }),
+    };
+    const unlisted = {
+      runId: "run",
+      observedAt: "",
+      placementId: null,
+      processes: [],
+      processesError: "HTTP error! status: 500",
+      artifacts: [failed, reviewError],
+    };
+    const gone = {
+      runId: "run",
+      observedAt: "",
+      placementId: null,
+      processes: [],
+      artifacts: [failed, reviewError],
+    };
+    const states = [unlisted, gone];
+    const sent: unknown[] = [];
+
+    await expect(
+      driveUntilComplete({
+        poll: () => Promise.resolve(states.shift() ?? gone),
+        send: (command) => {
+          sent.push(command);
+          return Promise.resolve({ success: true });
+        },
+        requested: { head, base },
+        role: "reviewer",
+        laneId: "lane-1",
+        candidateIds: [],
+        deadline: 600_000,
+        now: () => 0,
+        sleep: () => Promise.resolve(),
+      }),
+    ).rejects.toThrow("provider model_error: 402 Payment Required");
+    expect(controlPlaneCompletion(unlisted, { head, base })).toMatchObject({
+      processesObserved: false,
+      reviewAlive: false,
+    });
+    expect(sent).toEqual([{ type: "cancel" }]);
+    expect(states).toHaveLength(0);
+  });
+
+  it("ends a lane that never ends at the run deadline", async () => {
+    const head = "a".repeat(40);
+    const base = "b".repeat(40);
+    const running = {
+      runId: "run",
+      observedAt: "",
+      placementId: null,
+      processes: [
+        {
+          id: "review",
+          command: "/opt/review/review-run.sh /workspace/runs/run",
+          status: "running",
+        },
+      ],
+      artifacts: [
+        {
+          path: "/workspace/runs/run/status.json",
+          exists: true,
+          content: JSON.stringify({ phase: "review", state: "running" }),
+        },
+      ],
+    };
+    let now = 0;
+    let polls = 0;
+
+    await expect(
+      driveUntilComplete({
+        poll: () => {
+          polls += 1;
+          if (polls > 100) throw new Error("the lane was never ended");
+          return Promise.resolve(running);
+        },
+        send: () => Promise.resolve({ success: true }),
+        requested: { head, base },
+        role: "reviewer",
+        laneId: "lane-1",
+        candidateIds: [],
+        deadline: 60_000,
+        now: () => now,
+        sleep: (ms) => {
+          now += ms;
+          return Promise.resolve();
+        },
+      }),
+    ).rejects.toThrow("run deadline exceeded");
+    expect(now).toBe(60_000);
+    expect(polls).toBe(12);
+  });
+
   it("spends one request telling a lane at its cap to answer with what it has", async () => {
     const head = "a".repeat(40);
     const base = "b".repeat(40);
@@ -1082,6 +1293,7 @@ describe("local driver lifecycle", () => {
       job: {
         runId: "run-1",
         expectedRunnerSha: "b".repeat(64),
+        expectedSources: expectedSources,
         head: { sha: "a".repeat(40) },
         base: { sha: "c".repeat(40) },
         provider: "xai",
@@ -1122,6 +1334,7 @@ describe("local driver lifecycle", () => {
       job: {
         runId: "run-1",
         expectedRunnerSha: "b".repeat(64),
+        expectedSources: expectedSources,
         head: { sha: "a".repeat(40) },
         base: { sha: "c".repeat(40) },
         provider: "cloudflare-workers-ai",
@@ -1146,6 +1359,87 @@ describe("local driver lifecycle", () => {
     expect(parseCloudRunRequest(payload).job.targetEnv).toEqual({
       CLOUDFLARE_ACCOUNT_ID: "0630089e",
     });
+  });
+});
+
+describe("cloud driver entry", () => {
+  it("hands the Worker the host's hash of every image source", async () => {
+    const containerDir = join(import.meta.dirname, "..", "..", "container");
+    const hostSources = Object.fromEntries(
+      await Promise.all(
+        Object.entries(IMAGE_SOURCES).map(async ([path, name]) => [
+          path,
+          createHash("sha256")
+            .update(await readFile(join(containerDir, name)))
+            .digest("hex"),
+        ]),
+      ),
+    );
+    const out = await mkdtemp(join(tmpdir(), "review-pi-drive-"));
+    const runId = "drive-sources";
+    const started: { job: Record<string, unknown> }[] = [];
+    vi.stubEnv("GITHUB_TOKEN", "github-token");
+    vi.stubEnv("REVIEW_PI_CONTROL_SECRET", "control-secret");
+    vi.stubEnv("OPENCODE_API_KEY", "opencode-key");
+    vi.stubGlobal(
+      "fetch",
+      vi.fn((input: string, init?: RequestInit) => {
+        if (
+          input.startsWith("https://api.github.com/repos/acme/demo/commits/")
+        ) {
+          return Promise.resolve(
+            Response.json({ sha: input.split("/").pop() }),
+          );
+        }
+        if (input === "https://review.invalid/runs") {
+          started.push(JSON.parse(String(init?.body)));
+          return Promise.resolve(
+            Response.json({ error: "source_mismatch" }, { status: 409 }),
+          );
+        }
+        if (input === `https://review.invalid/runs/${runId}/stop`) {
+          return Promise.resolve(
+            Response.json({
+              artifacts: [],
+              shutdown: { destroy: { acknowledged: true } },
+            }),
+          );
+        }
+        return Promise.reject(new Error(`unexpected request to ${input}`));
+      }),
+    );
+    const argv = process.argv;
+    process.argv = [
+      "bun",
+      "drive.ts",
+      "--run-id",
+      runId,
+      "--out",
+      out,
+      "--worker",
+      "https://review.invalid",
+      "--repo",
+      "acme/demo",
+      "--head",
+      "a".repeat(40),
+      "--base",
+      "c".repeat(40),
+      "--provider",
+      "opencode-go",
+      "--model",
+      "deepseek-v4.1-flash",
+      "--canary",
+    ];
+    try {
+      await expect(main()).rejects.toThrow("control /runs: 409");
+    } finally {
+      process.argv = argv;
+      vi.unstubAllEnvs();
+      await rm(out, { recursive: true, force: true });
+    }
+
+    expect(started).toHaveLength(1);
+    expect(started[0]?.job["expectedSources"]).toEqual(hostSources);
   });
 });
 

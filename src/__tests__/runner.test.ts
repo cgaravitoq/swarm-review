@@ -325,6 +325,106 @@ describe("Pi event boundary", () => {
     expect(report.completion).toBe("complete");
   });
 
+  it("keeps how the review ended in the runner's last word, from main or the window", async () => {
+    // The bridge writes a review it never handed back as an answer and exits;
+    // whichever of the runner's two last words comes after it, it must not
+    // say the lane completed.
+    const runner = fileURLToPath(
+      new URL("../../container/review-run.sh", import.meta.url),
+    );
+    const endings = [
+      ["failed", "model_error"],
+      ["failed", "process_spawn_error"],
+      ["failed", "stdin_error"],
+      ["failed", "process_exit"],
+      ["blocked", "auth_blocked"],
+      ["blocked", "quota_blocked"],
+      ["blocked", "budget_exhausted"],
+      ["cancelled", "no_candidates"],
+    ] as const;
+    for (const lastWord of ["on_window_spent", "write_final_status"]) {
+      for (const [state, reason] of endings) {
+        const root = await prepareReportRun(`${state}-${reason}`);
+        await writeFile(join(root, "pi-raw.jsonl"), "");
+        await writeFile(join(root, "steps.jsonl"), "");
+        // Main speaks after the review step recorded its exit; the window
+        // handler can cut the step before it does.
+        if (lastWord === "write_final_status") {
+          await writeFile(join(root, "review.exit"), "1\n");
+        }
+        await writeFile(
+          join(root, "status.json"),
+          JSON.stringify({ phase: "review", state, terminalReason: reason }),
+        );
+
+        const result = spawnSync(
+          "bash",
+          ["-c", `source "$1" "$2"; ${lastWord}`, "runner-test", runner, root],
+          { encoding: "utf8", env: { ...process.env, SUPERVISED: "1" } },
+        );
+        const status = JSON.parse(
+          await readFile(join(root, "status.json"), "utf8"),
+        );
+
+        expect(result.status, `${lastWord} ${reason}`).toBe(0);
+        expect(status, `${lastWord} ${reason}`).toMatchObject({
+          phase: "finished",
+          state,
+          terminalReason: reason,
+          process: { alive: false },
+        });
+      }
+    }
+  });
+
+  it("fails a review step that ended without a word from the bridge", async () => {
+    // A bridge that dies without writing leaves the step's own running status
+    // behind; its exit code is the only witness, and it is not a success.
+    const runner = fileURLToPath(
+      new URL("../../container/review-run.sh", import.meta.url),
+    );
+    const cases = [
+      [null, "exit 137"],
+      [{ reason: "auth_blocked" }, "auth_blocked"],
+    ] as const;
+    for (const [reviewError, reason] of cases) {
+      const root = await prepareReportRun("bridge-died");
+      await writeFile(join(root, "review.exit"), "137\n");
+      await writeFile(
+        join(root, "status.json"),
+        JSON.stringify({ phase: "review", state: "running" }),
+      );
+      if (reviewError) {
+        await writeFile(
+          join(root, "review-error.json"),
+          JSON.stringify(reviewError),
+        );
+      }
+
+      const result = spawnSync(
+        "bash",
+        [
+          "-c",
+          'source "$1" "$2"; write_final_status',
+          "runner-test",
+          runner,
+          root,
+        ],
+        { encoding: "utf8", env: { ...process.env, SUPERVISED: "1" } },
+      );
+      const status = JSON.parse(
+        await readFile(join(root, "status.json"), "utf8"),
+      );
+
+      expect(result.status).toBe(0);
+      expect(status).toMatchObject({
+        phase: "finished",
+        state: "failed",
+        terminalReason: reason,
+      });
+    }
+  });
+
   it("rejects a JSON-mode model error and preserves bounded evidence", async () => {
     const root = await mkdtemp(join(tmpdir(), "review-pi-events-"));
     temporaryDirectories.push(root);
@@ -878,10 +978,13 @@ describe("supervised native Pi RPC lifecycle", { timeout: 120_000 }, () => {
     provider = "openai-codex",
     jobExtra: Record<string, unknown> = {},
     piEnv: Record<string, string> = {},
+    entry: "bridge" | "main" = "bridge",
   ) => {
     const root = await mkdtemp(join(tmpdir(), "review-pi-supervised-"));
     temporaryDirectories.push(root);
-    const repo = join(root, "work/repo");
+    // The runner's own main clones its checkout, so it is handed a remote
+    // instead of a checkout already in place.
+    const repo = join(root, entry === "main" ? "source" : "work/repo");
     await mkdir(repo, { recursive: true });
     execFileSync("git", ["init", "-q", repo]);
     await writeFile(join(repo, "tracked.txt"), "base\n");
@@ -902,6 +1005,10 @@ describe("supervised native Pi RPC lifecycle", { timeout: 120_000 }, () => {
     const sha = execFileSync("git", ["-C", repo, "rev-parse", "HEAD"], {
       encoding: "utf8",
     }).trim();
+    const remote = join(root, "origin.git");
+    if (entry === "main") {
+      execFileSync("git", ["clone", "-q", "--bare", repo, remote]);
+    }
 
     const binDir = join(root, "bin");
     await mkdir(binDir, { recursive: true });
@@ -1079,6 +1186,7 @@ process.stdin.on("data", (chunk) => {
             type: "agent_end",
             messages: [{ role: "assistant", content: [{ type: "text", text: "RAPID_FINAL" }] }],
           }),
+          JSON.stringify({ type: "agent_settled" }),
         ].join("\\n") + "\\n");
         continue;
       }
@@ -1102,6 +1210,7 @@ process.stdin.on("data", (chunk) => {
             type: "agent_end",
             messages: [{ role: "assistant", content: [{ type: "text", text: "UNICODE_FINAL" }] }],
           }) + "\\n");
+          process.stdout.write(JSON.stringify({ type: "agent_settled" }) + "\\n");
         }, 20);
         continue;
       }
@@ -1112,6 +1221,13 @@ process.stdin.on("data", (chunk) => {
           toolCallId: "call_tool_1",
           toolName: "bash",
           args: { command: "check.sh" },
+        }) + "\\n");
+        process.stdout.write(JSON.stringify({
+          type: "tool_execution_update",
+          toolCallId: "call_tool_1",
+          toolName: "bash",
+          args: { command: "check.sh" },
+          partialResult: { content: [{ type: "text", text: "partial output" }] },
         }) + "\\n");
 
         setTimeout(() => {
@@ -1130,6 +1246,7 @@ process.stdin.on("data", (chunk) => {
             type: "agent_end",
             messages: [{ role: "assistant", content: [{ type: "text", text: "Tool review finished" }] }],
           }) + "\\n");
+          process.stdout.write(JSON.stringify({ type: "agent_settled" }) + "\\n");
         }, 80);
       } else if (cmd.message.includes("crash now")) {
         process.stderr.write("fatal model failure in pi child\\n");
@@ -1147,6 +1264,7 @@ process.stdin.on("data", (chunk) => {
             type: "agent_end",
             messages: [],
           }) + "\\n");
+          process.stdout.write(JSON.stringify({ type: "agent_settled" }) + "\\n");
           setTimeout(() => process.exit(1), 10);
         }, 30);
       } else if (cmd.message.includes("simulate quota blocked")) {
@@ -1160,6 +1278,7 @@ process.stdin.on("data", (chunk) => {
             type: "agent_end",
             messages: [],
           }) + "\\n");
+          process.stdout.write(JSON.stringify({ type: "agent_settled" }) + "\\n");
           setTimeout(() => process.exit(1), 10);
         }, 30);
       } else if (cmd.message.includes("simulate budget exhausted")) {
@@ -1172,6 +1291,7 @@ process.stdin.on("data", (chunk) => {
             type: "agent_end",
             messages: [],
           }) + "\\n");
+          process.stdout.write(JSON.stringify({ type: "agent_settled" }) + "\\n");
           setTimeout(() => process.exit(1), 10);
         }, 30);
       } else if (cmd.message.includes("simulate oauth 403")) {
@@ -1187,6 +1307,7 @@ process.stdin.on("data", (chunk) => {
             type: "agent_end",
             messages: [],
           }) + "\\n");
+          process.stdout.write(JSON.stringify({ type: "agent_settled" }) + "\\n");
         }, 30);
       } else if (cmd.message.includes("model error then exit")) {
         setTimeout(() => {
@@ -1198,7 +1319,8 @@ process.stdin.on("data", (chunk) => {
             type: "agent_end",
             messages: [],
           }) + "\\n");
-          setTimeout(() => process.exit(1), 10);
+          process.stdout.write(JSON.stringify({ type: "agent_settled" }) + "\\n");
+          setTimeout(() => process.exit(1), Number(process.env.PI_EXIT_DELAY_MS || 10));
         }, 30);
       } else if (cmd.message.includes("active descendant")) {
         const descendant = spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)"], {
@@ -1211,6 +1333,21 @@ process.stdin.on("data", (chunk) => {
           toolName: "bash",
           args: { command: "long-running-command" },
         }) + "\\n");
+      } else if (cmd.message.includes("candidate then model error")) {
+        setTimeout(() => {
+          process.stdout.write(JSON.stringify({
+            type: "turn_end",
+            message: { stopReason: "stop", usage: { input: 3, output: 3, totalTokens: 6 } },
+          }) + "\\n");
+          process.stdout.write(JSON.stringify({
+            type: "agent_end",
+            messages: [{ role: "assistant", content: [{ type: "text", text: "candidate before the error" }] }],
+          }) + "\\n");
+          process.stdout.write(JSON.stringify({
+            type: "turn_end",
+            message: { stopReason: "error", errorMessage: "provider model error" },
+          }) + "\\n");
+        }, 30);
       } else if (cmd.message.includes("candidate then continue")) {
         setTimeout(() => {
           process.stdout.write(JSON.stringify({
@@ -1221,6 +1358,7 @@ process.stdin.on("data", (chunk) => {
             type: "agent_end",
             messages: [{ role: "assistant", content: [{ type: "text", text: "candidate partial review" }] }],
           }) + "\\n");
+          process.stdout.write(JSON.stringify({ type: "agent_settled" }) + "\\n");
         }, 30);
       } else if (cmd.message.includes("provide final conclusion")) {
         setTimeout(() => {
@@ -1232,6 +1370,55 @@ process.stdin.on("data", (chunk) => {
             type: "agent_end",
             messages: [{ role: "assistant", content: [{ type: "text", text: "ACCEPTED_FINAL_CONCLUSION" }] }],
           }) + "\\n");
+          process.stdout.write(JSON.stringify({ type: "agent_settled" }) + "\\n");
+        }, 30);
+      } else if (cmd.message.includes("documented events")) {
+        setTimeout(() => {
+          for (const event of [
+            { type: "agent_start" },
+            { type: "turn_start" },
+            { type: "queue_update", steering: [], followUp: [] },
+            { type: "message_start" },
+            { type: "message_update" },
+            { type: "bash_execution_update", id: "req-1", delta: "total 0" },
+            { type: "auto_retry_start", attempt: 1, maxAttempts: 3, delayMs: 0, errorMessage: "429 rate_limit_error" },
+            { type: "auto_retry_end", success: true, attempt: 1 },
+            { type: "extension_error", extensionPath: "/opt/review/extensions/claude-code-provider.js", event: "tool_call", error: "401 unauthorized" },
+            { type: "message_end" },
+            {
+              type: "turn_end",
+              message: { stopReason: "stop", usage: { input: 2, output: 2, totalTokens: 4 } },
+            },
+            {
+              type: "agent_end",
+              messages: [{ role: "assistant", content: [{ type: "text", text: "DOCUMENTED_FINAL" }] }],
+              willRetry: false,
+            },
+            { type: "compaction_start", reason: "threshold" },
+            { type: "summarization_retry_scheduled", attempt: 1, maxAttempts: 3, delayMs: 0, errorMessage: "terminated" },
+            { type: "summarization_retry_attempt_start", source: "compaction", reason: "threshold" },
+            { type: "summarization_retry_finished" },
+            { type: "compaction_end", reason: "threshold", result: null, aborted: false, willRetry: false },
+          ]) {
+            process.stdout.write(JSON.stringify(event) + "\\n");
+          }
+          setTimeout(() => {
+            process.stdout.write(JSON.stringify({ type: "agent_settled" }) + "\\n");
+          }, 750);
+        }, 30);
+      } else if (cmd.message.includes("settle later")) {
+        setTimeout(() => {
+          process.stdout.write(JSON.stringify({
+            type: "turn_end",
+            message: { stopReason: "stop", usage: { input: 4, output: 4, totalTokens: 8 } },
+          }) + "\\n");
+          process.stdout.write(JSON.stringify({
+            type: "agent_end",
+            messages: [{ role: "assistant", content: [{ type: "text", text: "SETTLE_LATER" }] }],
+          }) + "\\n");
+          setTimeout(() => {
+            process.stdout.write(JSON.stringify({ type: "agent_settled" }) + "\\n");
+          }, 750);
         }, 30);
       } else {
         setTimeout(() => {
@@ -1248,6 +1435,7 @@ process.stdin.on("data", (chunk) => {
             type: "agent_end",
             messages: [{ role: "assistant", content: [{ type: "text", text: "standby ready" }] }],
           }) + "\\n");
+          process.stdout.write(JSON.stringify({ type: "agent_settled" }) + "\\n");
         }, 30);
       }
     }
@@ -1269,6 +1457,7 @@ process.stdin.on("data", (chunk) => {
         model: "gpt-5.6-sol",
         ...(initialPrompt === null ? {} : { prompt: initialPrompt }),
         checkCommand: "git --no-pager diff --stat base..HEAD",
+        ...(entry === "main" ? { gitRemote: remote } : {}),
         ...jobExtra,
       }),
     );
@@ -1283,7 +1472,8 @@ process.stdin.on("data", (chunk) => {
       new URL("../../container/review-run.sh", import.meta.url),
     );
 
-    const runnerProc = spawn("bash", [runner, root, "--bridge"], {
+    const argv = entry === "main" ? [runner, root] : [runner, root, "--bridge"];
+    const runnerProc = spawn("bash", argv, {
       env: {
         ...process.env,
         PATH: `${binDir}:${process.env.PATH}`,
@@ -1313,7 +1503,9 @@ process.stdin.on("data", (chunk) => {
     });
 
     const sockPath = join(root, "rpc.sock");
-    await waitForSocket(sockPath);
+    // Main clones and checks before the socket exists, and a lane that fails
+    // its first turn closes it again before a poll could see it.
+    if (entry === "bridge") await waitForSocket(sockPath);
 
     return { root, sockPath, runnerProc };
   };
@@ -1663,7 +1855,7 @@ process.stdin.on("data", (chunk) => {
       );
       await waitForStatus(
         statusPath,
-        (s) => s["state"] === "idle" && s["lastEvent"] === "agent_end",
+        (s) => s["state"] === "idle" && s["lastEvent"] === "agent_settled",
       );
 
       const traceContent = await readFile(join(root, "trace.jsonl"), "utf8");
@@ -1690,6 +1882,14 @@ process.stdin.on("data", (chunk) => {
         toolName: "bash",
         isError: false,
       });
+      // A partial tool result is an event pi documents; recording it as a
+      // protocol error would leave a healthy lane's receipt saying the
+      // stream broke when it did not.
+      const toolStatus = JSON.parse(
+        await readFile(statusPath, "utf8"),
+      ) as Record<string, unknown>;
+      expect(toolStatus["detail"]).toBe("");
+      expect(toolStatus["lastEvent"]).toBe("agent_settled");
 
       await sendCommand(sockPath, { type: "accept" });
       await waitForExit(runnerProc);
@@ -1729,7 +1929,7 @@ process.stdin.on("data", (chunk) => {
         });
         await waitForStatus(
           statusPath,
-          (s) => s["state"] === "idle" && s["lastEvent"] === "agent_end",
+          (s) => s["state"] === "idle" && s["lastEvent"] === "agent_settled",
         );
       }
       await waitForTrace(
@@ -1796,7 +1996,7 @@ process.stdin.on("data", (chunk) => {
 
       await waitForStatus(
         statusPath,
-        (s) => s["state"] === "idle" && s["lastEvent"] === "agent_end",
+        (s) => s["state"] === "idle" && s["lastEvent"] === "agent_settled",
       );
       await sendCommand(sockPath, { type: "accept" });
       await waitForExit(runnerProc);
@@ -1944,6 +2144,100 @@ process.stdin.on("data", (chunk) => {
     }
   });
 
+  it("ends the review where pi settled, not at its last spoken event", async () => {
+    const { root, sockPath, runnerProc } = await prepareSupervisedRun(
+      "settle-gate",
+      "settle later",
+    );
+    try {
+      const statusPath = join(root, "status.json");
+      await waitForStatus(
+        statusPath,
+        (s) =>
+          s["lastEvent"] === "agent_end" &&
+          s["lastCandidateResult"] === "SETTLE_LATER",
+      );
+      const premature = await sendCommand(sockPath, { type: "accept" });
+      expect(premature["success"]).toBe(false);
+      expect(String(premature["error"])).toContain("not idle");
+
+      await waitForStatus(
+        statusPath,
+        (s) =>
+          s["state"] === "idle" &&
+          s["lastEvent"] === "agent_settled" &&
+          s["childIdle"] === true,
+      );
+      const accepted = await sendCommand(sockPath, { type: "accept" });
+      expect(accepted["success"]).toBe(true);
+      expect(await waitForExit(runnerProc)).toBe(0);
+    } finally {
+      runnerProc.kill();
+    }
+  });
+
+  it("admits every event pi documents and still ends the review where pi settled", async () => {
+    const { root, sockPath, runnerProc } = await prepareSupervisedRun(
+      "documented-events",
+      "documented events",
+    );
+    try {
+      const statusPath = join(root, "status.json");
+      // The table in pi 0.85.1's own docs/rpc.md: a retry, a compaction and an
+      // extension error are what a healthy lane can see, not a broken stream.
+      // The retry and the extension error name a 429 and a 401 before the
+      // turn ends, so a runner that read their text into the stderr it
+      // classifies a turn by would block this lane instead of idling it.
+      const unsettled = await waitForStatus(
+        statusPath,
+        (s) =>
+          s["lastEvent"] === "compaction_end" &&
+          s["lastCandidateResult"] === "DOCUMENTED_FINAL",
+      );
+      expect(unsettled["detail"]).toBe("");
+      expect(unsettled["childIdle"]).toBe(false);
+      const premature = await sendCommand(sockPath, { type: "accept" });
+      expect(premature["success"]).toBe(false);
+
+      const settled = await waitForStatus(
+        statusPath,
+        (s) => s["state"] === "idle" && s["lastEvent"] === "agent_settled",
+      );
+      expect(settled["detail"]).toBe("");
+      const stderr = await readFile(join(root, "pi.stderr"), "utf8");
+      expect(stderr).not.toContain("unknown event type");
+      const accepted = await sendCommand(sockPath, { type: "accept" });
+      expect(accepted["success"]).toBe(true);
+      expect(await waitForExit(runnerProc)).toBe(0);
+    } finally {
+      runnerProc.kill();
+    }
+  });
+
+  it("records pi's settled event instead of calling it a protocol error", async () => {
+    const { root, sockPath, runnerProc } = await prepareSupervisedRun(
+      "settled-quiet",
+      "standby",
+    );
+    try {
+      const statusPath = join(root, "status.json");
+      const settled = await waitForStatus(
+        statusPath,
+        (s) =>
+          s["state"] === "idle" &&
+          s["lastEvent"] === "agent_settled" &&
+          s["lastCandidateResult"] === "standby ready",
+      );
+      expect(settled["detail"]).toBe("");
+      const stderr = await readFile(join(root, "pi.stderr"), "utf8");
+      expect(stderr).not.toContain("unknown event type");
+      await sendCommand(sockPath, { type: "accept" });
+      expect(await waitForExit(runnerProc)).toBe(0);
+    } finally {
+      runnerProc.kill();
+    }
+  });
+
   it("distinguishes explicit cancellation from process failure with distinct terminal reasons", async () => {
     const cancelSetup = await prepareSupervisedRun("cancel-run");
     try {
@@ -2010,7 +2304,7 @@ process.stdin.on("data", (chunk) => {
 
       await waitForStatus(
         statusPath,
-        (s) => s["state"] === "idle" && s["lastEvent"] === "agent_end",
+        (s) => s["state"] === "idle" && s["lastEvent"] === "agent_settled",
       );
       const inspect1 = await sendCommand(sockPath, { type: "inspect" });
       const inspect1Data = objectValue(inspect1["data"]);
@@ -2035,7 +2329,7 @@ process.stdin.on("data", (chunk) => {
         statusPath,
         (s) =>
           s["state"] === "idle" &&
-          s["lastEvent"] === "agent_end" &&
+          s["lastEvent"] === "agent_settled" &&
           !s["inFlightTool"],
       );
       const inspect2 = await sendCommand(sockPath, { type: "inspect" });
@@ -2215,29 +2509,163 @@ process.stdin.on("data", (chunk) => {
       quota.runnerProc.kill();
     }
 
-    const modelError = await prepareSupervisedRun(
-      "model-error-exit",
+    // pi exits 10 ms after its error turn, or a second after it. The bridge
+    // exits 100 ms after it decides to, so the slow child is the order in
+    // which a bridge that did not wait for it left alive: true behind; the
+    // margin keeps that order under a loaded event loop.
+    for (const exitDelay of ["10", "1000"]) {
+      const modelError = await prepareSupervisedRun(
+        "model-error-exit",
+        "model error then exit",
+        "openai-codex",
+        {},
+        { PI_EXIT_DELAY_MS: exitDelay },
+      );
+      try {
+        expect(await waitForExit(modelError.runnerProc)).toBe(1);
+        const status = JSON.parse(
+          await readFile(join(modelError.root, "status.json"), "utf8"),
+        );
+        expect(status, `pi exits after ${exitDelay} ms`).toMatchObject({
+          state: "failed",
+          terminalReason: "model_error",
+          process: { alive: false },
+        });
+        const evidence = JSON.parse(
+          await readFile(join(modelError.root, "review-error.json"), "utf8"),
+        );
+        expect(evidence).toMatchObject({
+          reason: "model_error",
+          errorMessage: "provider model error",
+        });
+      } finally {
+        modelError.runnerProc.kill();
+      }
+    }
+  });
+
+  it("keeps a failed or blocked review's ending through the cancel that ends it", async () => {
+    // A driver cancels a review the provider already refused so the runner
+    // writes its evidence and stops; the cancel is not why the review ended.
+    const cases = [
+      ["simulate quota blocked", "blocked", "quota_blocked"],
+      ["candidate then model error", "failed", "model_error"],
+    ] as const;
+    for (const [prompt, state, reason] of cases) {
+      const lane = await prepareSupervisedRun(`cancel-after-${reason}`, prompt);
+      try {
+        const statusPath = join(lane.root, "status.json");
+        await waitForStatus(
+          statusPath,
+          (status) =>
+            status["state"] === state && status["terminalReason"] === reason,
+        );
+        await sendCommand(lane.sockPath, {
+          type: "cancel",
+          reason: "cancelled_by_conductor",
+        });
+        expect(await waitForExit(lane.runnerProc)).toBe(130);
+        expect(
+          JSON.parse(await readFile(statusPath, "utf8")),
+          prompt,
+        ).toMatchObject({
+          state,
+          terminalReason: reason,
+          process: { alive: false },
+        });
+      } finally {
+        lane.runnerProc.kill();
+      }
+    }
+  });
+
+  it("leaves a review that ended in error failed in the runner's last status", async () => {
+    // The real lane: pi's first turn ended 402, the bridge wrote model_error
+    // and exited, and the steps after it left finished/done/completed, which
+    // no driver believes and none could end on.
+    const lane = await prepareSupervisedRun(
+      "model-error-main",
       "model error then exit",
+      "openai-codex",
+      {},
+      {},
+      "main",
     );
     try {
-      expect(await waitForExit(modelError.runnerProc)).toBe(1);
+      expect(await waitForExit(lane.runnerProc, SUPERVISED_WAIT_MS)).toBe(0);
+      const steps = (await readFile(join(lane.root, "steps.jsonl"), "utf8"))
+        .split("\n")
+        .filter(Boolean)
+        .map((line) => JSON.parse(line) as Record<string, unknown>);
+      expect(steps.map((step) => step["step"])).toEqual([
+        "clone",
+        "install",
+        "check",
+        "review",
+        "checkout_delta",
+        "trace",
+        "report",
+      ]);
+      expect(steps[3]).toMatchObject({ step: "review", exit: 1 });
+      const report = JSON.parse(
+        await readFile(join(lane.root, "report.json"), "utf8"),
+      );
+      expect(report).toMatchObject({ completion: "partial" });
+      expect(report.partialReason).toContain("model_error");
       const status = JSON.parse(
-        await readFile(join(modelError.root, "status.json"), "utf8"),
+        await readFile(join(lane.root, "status.json"), "utf8"),
       );
       expect(status).toMatchObject({
+        phase: "finished",
         state: "failed",
         terminalReason: "model_error",
         process: { alive: false },
       });
-      const evidence = JSON.parse(
-        await readFile(join(modelError.root, "review-error.json"), "utf8"),
+    } finally {
+      lane.runnerProc.kill();
+    }
+  });
+
+  it("leaves a blocked review blocked in the runner's last status after the cancel that ends it", async () => {
+    // The cloud driver cancels a lane the provider refused. The bridge exits
+    // 130 on that cancel, and the review is blocked, not failed on an exit.
+    const lane = await prepareSupervisedRun(
+      "quota-blocked-main",
+      "simulate quota blocked",
+      "openai-codex",
+      {},
+      {},
+      "main",
+    );
+    try {
+      const statusPath = join(lane.root, "status.json");
+      await waitForSocket(lane.sockPath);
+      await waitForStatus(
+        statusPath,
+        (status) =>
+          status["state"] === "blocked" &&
+          status["terminalReason"] === "quota_blocked",
       );
-      expect(evidence).toMatchObject({
-        reason: "model_error",
-        errorMessage: "provider model error",
+      await sendCommand(lane.sockPath, {
+        type: "cancel",
+        reason: "cancelled_by_conductor",
+      });
+      expect(await waitForExit(lane.runnerProc, SUPERVISED_WAIT_MS)).toBe(0);
+      const steps = (await readFile(join(lane.root, "steps.jsonl"), "utf8"))
+        .split("\n")
+        .filter(Boolean)
+        .map((line) => JSON.parse(line) as Record<string, unknown>);
+      expect(steps.find((step) => step["step"] === "review")).toMatchObject({
+        exit: 130,
+      });
+      expect(JSON.parse(await readFile(statusPath, "utf8"))).toMatchObject({
+        phase: "finished",
+        state: "blocked",
+        terminalReason: "quota_blocked",
+        process: { alive: false },
       });
     } finally {
-      modelError.runnerProc.kill();
+      lane.runnerProc.kill();
     }
   });
 
