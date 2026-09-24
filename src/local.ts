@@ -25,6 +25,7 @@ import {
 } from "node:fs/promises";
 import { homedir, tmpdir } from "node:os";
 import { basename, dirname, join } from "node:path";
+import { StringDecoder } from "node:string_decoder";
 import { setTimeout as sleep } from "node:timers/promises";
 import { fileURLToPath } from "node:url";
 import { forceRefreshClaudeCodeCreds } from "@cgaravitoq/claude-code-core";
@@ -977,7 +978,7 @@ const messageOf = (error: unknown) =>
     redactions,
   );
 
-const execute = (
+export const execute = (
   file: string,
   args: string[],
   timeoutMs: number,
@@ -995,8 +996,12 @@ const execute = (
       stdio: ["ignore", "pipe", "pipe"],
       ...(cwd ? { cwd } : {}),
     });
-    child.stdout.setEncoding("utf8");
-    child.stderr.setEncoding("utf8");
+    // Decoded here rather than with `setEncoding`: Bun 1.4.2's own utf8
+    // decoder at times never ends a stream whose chunk ends mid-character, and
+    // a stream that never ends never emits `close`, so the driver would wait
+    // forever for a child that already exited.
+    const stdoutDecoder = new StringDecoder("utf8");
+    const stderrDecoder = new StringDecoder("utf8");
     const killGroup = (signalName: NodeJS.Signals) => {
       if (!child.pid) return;
       try {
@@ -1037,20 +1042,24 @@ const execute = (
       if (error) reject(error);
       else resolvePromise(stdout);
     };
-    child.stdout.on("data", (chunk) => {
-      stdout += chunk;
+    child.stdout.on("data", (chunk: Buffer) => {
+      stdout += stdoutDecoder.write(chunk);
       if (stdout.length + stderr.length > 32 * 1024 * 1024) {
         terminate(new Error("command output exceeded 32 MiB"));
       }
     });
-    child.stderr.on("data", (chunk) => {
-      stderr += chunk;
+    child.stderr.on("data", (chunk: Buffer) => {
+      stderr += stderrDecoder.write(chunk);
       if (stdout.length + stderr.length > 32 * 1024 * 1024) {
         terminate(new Error("command output exceeded 32 MiB"));
       }
     });
     child.once("error", (error) => finish(stopError ?? error));
     child.once("close", (code, signalName) => {
+      // A stream that ends mid-character still contributes its replacement
+      // character, so a clipped tail is never silently dropped.
+      stdout += stdoutDecoder.end();
+      stderr += stderrDecoder.end();
       if (stopError) finish(stopError);
       else if (code === 0) finish();
       else
