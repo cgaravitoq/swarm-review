@@ -92,11 +92,19 @@ export const CLOUD_MODEL = "workers-ai/@cf/deepseek-ai/deepseek-v4-flash-0731";
 export const TEARDOWN_BUDGET_SECONDS = 90;
 
 /**
- * Bound for a single control request against a live run. The supervised review
- * itself has no wall deadline: the container owns Pi and its tools, so a slow
- * or failed observation is uncertainty about the run, never the end of it.
+ * Bound for a single control request against a live run. The container owns Pi
+ * and its tools, so a slow or failed observation is uncertainty about the run,
+ * never the end of it: only the run's deadline ends a lane nobody can see.
  */
 export const CONTROL_REQUEST_BUDGET_SECONDS = 60;
+
+/**
+ * How far past `--total-timeout` a driver holds a lane, on either transport.
+ * The lane's window is measured from the runner's start, which the driver's
+ * own preparation delays, and a swarm cuts its lanes at their window plus
+ * LANE_CUT_GRACE_SECONDS, so a driver's own deadline comes after both.
+ */
+export const RUN_DEADLINE_GRACE_SECONDS = 60;
 
 /** Off-contract finals are corrected in the same session, never indefinitely. */
 export const MAX_FORMAT_CORRECTIONS = 2;
@@ -1974,11 +1982,11 @@ async function main() {
     options.resume ||
     Boolean(options.steer);
   /**
-   * Preparation and one-shot control actions are bounded; the supervised review
-   * is not. `--total-timeout` names that preparation bound.
+   * Preparation and one-shot control actions draw from `--total-timeout`; the
+   * review ends at the run's deadline.
    */
   const budget = createBudget(startedAt, options.totalTimeoutSeconds);
-  /** A fresh bound per control request; the review itself is never deadlined. */
+  /** A fresh bound per control request inside the run's deadline. */
   const controlBudget = () =>
     createBudget(Date.now(), CONTROL_REQUEST_BUDGET_SECONDS);
   // A run names both halves of its target: the GitHub identity its revisions
@@ -2011,6 +2019,19 @@ async function main() {
   // A closed Orca tab reaches the driver as SIGHUP, and an unhandled SIGHUP
   // would end it before teardown - leaving the container it owns running.
   process.once("SIGHUP", onSignal);
+  // A runner that never ends, a container that stops answering and a status
+  // file that says done forever all end here, with the usual teardown.
+  const deadlineSeconds =
+    options.totalTimeoutSeconds + RUN_DEADLINE_GRACE_SECONDS;
+  let deadlineReached = false;
+  const deadlineTimer = setTimeout(
+    () => {
+      deadlineReached = true;
+      controller.abort(new Error("run deadline exceeded"));
+    },
+    startedAt + deadlineSeconds * 1000 - Date.now(),
+  );
+  deadlineTimer.unref();
 
   let revisions: { head: { sha: string }; base: { sha: string } } | undefined;
   let stage: string | undefined;
@@ -2020,13 +2041,15 @@ async function main() {
   let reviewStarted = false;
   let finalAccepted = false;
   // Where the runner itself stopped, when the driver saw it stop. A container
-  // whose end was observed is disposed of like an accepted one; a container
-  // the driver lost sight of is kept with its evidence, and an auth-blocked
-  // one is kept because it is the one kind of end a resume can pick up.
+  // whose end was observed, or whose deadline passed, is disposed of like an
+  // accepted one; a container the driver lost sight of is kept with its
+  // evidence, and an auth-blocked one is kept because it is the one kind of
+  // end a resume can pick up.
   let runnerTerminalReason: string | null = null;
   const containerDisposable = () =>
     options.cancel ||
     finalAccepted ||
+    deadlineReached ||
     !reviewStarted ||
     (runnerTerminalReason !== null && runnerTerminalReason !== "auth_blocked");
   let imageId: string | null = null;
@@ -3212,6 +3235,10 @@ async function main() {
     }
   } catch (error) {
     runError = interrupted ? "interrupted" : messageOf(error);
+  }
+  clearTimeout(deadlineTimer);
+  if (deadlineReached && !interrupted) {
+    runError = `run deadline exceeded after ${deadlineSeconds} s`;
   }
 
   const teardownBeganAt = Date.now();
