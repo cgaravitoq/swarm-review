@@ -2393,7 +2393,7 @@ if [[ "$1" == "exec" && "$joined" == *"cat /opt/review/control/provider-usage.js
   else
     seal=$(printf '%s' "$final" | shasum -a 256 | cut -d' ' -f1)
   fi
-  if [[ -n "\${FAKE_LEDGER_TOTALS:-}" ]]; then ledger_totals="$FAKE_LEDGER_TOTALS"; else ledger_totals='{"requests":1,"retries":0,"input":0,"output":0,"unended":0}'; fi
+  if [[ -n "\${FAKE_LEDGER_TOTALS:-}" ]]; then ledger_totals="$FAKE_LEDGER_TOTALS"; else ledger_totals='{"requests":1,"retries":0,"input":0,"output":0,"unended":0,"inputUnobserved":0,"outputUnobserved":0}'; fi
   printf '{"event":"provider_request","seal":"%s","totals":%s}\n' "$seal" "$ledger_totals"
   exit 0
 fi
@@ -2874,6 +2874,8 @@ exec /usr/bin/git "$@"
         input: 111,
         output: 222,
         unended: 1,
+        inputUnobserved: 1,
+        outputUnobserved: 2,
       }),
     });
     const receipt = await readReceipt(arranged.out, swarmId);
@@ -2889,6 +2891,8 @@ exec /usr/bin/git "$@"
       outputTokens: 222,
       denials: 0,
       unended: 1,
+      inputUnobserved: 1,
+      outputUnobserved: 2,
     });
   }, 120_000);
 

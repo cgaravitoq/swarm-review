@@ -149,6 +149,8 @@ describe("local driver lifecycle", () => {
             input: 40,
             output: 8,
             unended: 1,
+            inputUnobserved: 1,
+            outputUnobserved: 0,
           },
         }),
       ),
@@ -158,6 +160,8 @@ describe("local driver lifecycle", () => {
       inputTokens: 40,
       outputTokens: 8,
       unended: 1,
+      inputUnobserved: 1,
+      outputUnobserved: 0,
     });
     // A session whose responses carried no usage frame has no token count: the
     // row records that as unobserved rather than as tokens measured at zero.
@@ -173,6 +177,8 @@ describe("local driver lifecycle", () => {
       inputTokens: null,
       outputTokens: null,
       unended: null,
+      inputUnobserved: null,
+      outputUnobserved: null,
     });
     // A Worker deployed before a count existed never reports it, and a count
     // nobody reported is unobserved, not a zero that reads as measured.
@@ -186,6 +192,8 @@ describe("local driver lifecycle", () => {
       inputTokens: 40,
       outputTokens: 8,
       unended: null,
+      inputUnobserved: null,
+      outputUnobserved: null,
     });
     expect(observedModelUsage(state({ totals: {} }))).toBeNull();
     expect(observedModelUsage(state({}))).toBeNull();
@@ -199,6 +207,8 @@ describe("local driver lifecycle", () => {
       input: null,
       output: null,
       unended: 1,
+      inputUnobserved: 1,
+      outputUnobserved: 1,
     };
     const directory = await mkdtemp(join(tmpdir(), "review-pi-receipt-"));
     await writeCloudReceipt(directory, {
@@ -225,6 +235,8 @@ describe("local driver lifecycle", () => {
         inputTokens: null,
         outputTokens: null,
         unended: 1,
+        inputUnobserved: 1,
+        outputUnobserved: 1,
       },
     });
     await rm(directory, { recursive: true, force: true });

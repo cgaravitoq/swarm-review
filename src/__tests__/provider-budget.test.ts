@@ -169,7 +169,15 @@ describe("actual usage accounting", () => {
       event: "provider_request",
       status: 200,
       usage: { input: 2000, output: 300 },
-      totals: { requests: 3, retries: 1, input: 3000, output: 400, unended: 1 },
+      totals: {
+        requests: 3,
+        retries: 1,
+        input: 3000,
+        output: 400,
+        unended: 1,
+        inputUnobserved: 1,
+        outputUnobserved: 0,
+      },
     }),
     JSON.stringify({ event: "denied", reason: "max_requests" }),
   ].join("\n");
@@ -185,6 +193,10 @@ describe("actual usage accounting", () => {
       // never seen to end: the tokens beside it are one request short, and the
       // row has to say so rather than price a request it never read.
       unended: 1,
+      // One ended request never reported its input, so the input sum is one
+      // request short as well, and only this count says so.
+      inputUnobserved: 1,
+      outputUnobserved: 0,
     });
   });
 
@@ -203,6 +215,23 @@ describe("actual usage accounting", () => {
     expect(
       readLedgerUsage(JSON.stringify({ event: "broker_start" })),
     ).toMatchObject({ requests: 0, unended: 0 });
+  });
+
+  it("reads the unobserved sides a ledger never counted as unobserved", () => {
+    const before = [
+      JSON.stringify({ event: "broker_start" }),
+      JSON.stringify({
+        event: "provider_request",
+        totals: { requests: 2, retries: 0, input: 10, output: 4, unended: 0 },
+      }),
+    ].join("\n");
+    expect(readLedgerUsage(before)).toMatchObject({
+      inputUnobserved: null,
+      outputUnobserved: null,
+    });
+    expect(
+      readLedgerUsage(JSON.stringify({ event: "broker_start" })),
+    ).toMatchObject({ inputUnobserved: 0, outputUnobserved: 0 });
   });
 
   it("keeps the reservation beside the settled actual cost", () => {

@@ -2010,6 +2010,8 @@ describe("public local CLI lifecycle", {
             input: 0,
             output: 0,
             unended: 1,
+            inputUnobserved: 0,
+            outputUnobserved: 0,
           },
         }),
         JSON.stringify({
@@ -2022,6 +2024,8 @@ describe("public local CLI lifecycle", {
             input: 111,
             output: 222,
             unended: 0,
+            inputUnobserved: 0,
+            outputUnobserved: 0,
           },
         }),
         "",
@@ -2044,6 +2048,8 @@ describe("public local CLI lifecycle", {
       outputTokens: 222,
       denials: 0,
       unended: 0,
+      inputUnobserved: 0,
+      outputUnobserved: 0,
     });
     expect(receipt.modelRequests).toBe(1);
   });

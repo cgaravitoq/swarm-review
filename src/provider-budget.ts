@@ -249,13 +249,15 @@ export function reserveTrial(request: TrialReservationRequest):
 export type LedgerEntry = {
   event: string;
   status?: number;
-  usage?: { input: number; output: number } | null;
+  usage?: { input: number | null; output: number | null } | null;
   totals?: {
     requests: number;
     retries: number;
     input: number;
     output: number;
     unended?: number;
+    inputUnobserved?: number;
+    outputUnobserved?: number;
   };
 };
 
@@ -280,6 +282,12 @@ export function readLedgerUsage(ledger: string) {
     // admission writes totals, so a ledger without them admitted nothing, and
     // totals from a broker that predates the count never observed it.
     unended: last === undefined ? 0 : (last.totals?.unended ?? null),
+    // The ended requests whose response never reported that side: the token
+    // sums above are short by these, read the same way as `unended`.
+    inputUnobserved:
+      last === undefined ? 0 : (last.totals?.inputUnobserved ?? null),
+    outputUnobserved:
+      last === undefined ? 0 : (last.totals?.outputUnobserved ?? null),
   };
 }
 

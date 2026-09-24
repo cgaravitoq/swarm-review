@@ -269,7 +269,8 @@ const asRecord = (value: unknown) =>
  * are the lane's usage. `inputTokens` and `outputTokens` are null until a
  * response carried a usage frame: a lane that was admitted and never answered
  * spent requests and no observed tokens, and a zero there would read as tokens
- * that were measured.
+ * that were measured. `inputUnobserved` and `outputUnobserved` say how many
+ * requests each sum is short by.
  */
 export const observedModelUsage = (state: RunState | undefined) => {
   const totals = asRecord(asRecord(state?.control?.modelUsage)?.["totals"]);
@@ -284,6 +285,8 @@ export const observedModelUsage = (state: RunState | undefined) => {
     inputTokens: numberOrNull(totals["input"]),
     outputTokens: numberOrNull(totals["output"]),
     unended: numberOrNull(totals["unended"]),
+    inputUnobserved: numberOrNull(totals["inputUnobserved"]),
+    outputUnobserved: numberOrNull(totals["outputUnobserved"]),
   };
 };
 
