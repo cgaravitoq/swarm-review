@@ -158,6 +158,7 @@ const ARTIFACTS = [
   "trace.jsonl",
   "review-error.json",
   "run.log",
+  "install.log",
 ] as const;
 const RPC_TIMEOUT_MS = 60_000;
 

@@ -381,6 +381,7 @@ describe("review run lifecycle", () => {
       path.join(directory, "status.json"),
       "x".repeat(MAX_ARTIFACT_BYTES + 17),
     );
+    await writeFile(path.join(directory, "install.log"), "installed\n");
     const quotedDirectory = `'${directory.replaceAll("'", "'\\''")}'`;
     const exec = vi.fn(async (command: string) => {
       const platformCommand =
@@ -424,6 +425,11 @@ describe("review run lifecycle", () => {
               content: expect.stringMatching(
                 new RegExp(`^x{${MAX_ARTIFACT_BYTES}}$`),
               ),
+            }),
+            expect.objectContaining({
+              path: "/workspace/runs/artifact-shell/install.log",
+              exists: true,
+              content: "installed\n",
             }),
           ]),
         }),

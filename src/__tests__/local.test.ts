@@ -394,6 +394,7 @@ if [[ "$joined" == *" --detach "* ]]; then
     mv "$root/report.json.tmp" "$root/report.json"
   fi
   printf '{"type":"turn_end","stopReason":"stop"}\\n' > "$root/trace.jsonl"
+  printf 'Checked 1 install across 1 package (no changes)\\n' > "$root/install.log"
   if [[ "\${FAKE_MODE:-}" == "oversize-trace" ]]; then
     head -c 600000 /dev/zero | tr '\\0' 'x' >> "$root/trace.jsonl"
   fi
@@ -1628,6 +1629,9 @@ describe("public local CLI lifecycle", {
     // The runner installed in this lane, which is not the same evidence as a
     // lane that ran without dependencies.
     expect(receipt).toContain('"installSkipped": false');
+    expect(await readFile(join(out, runId, "install.log"), "utf8")).toBe(
+      "Checked 1 install across 1 package (no changes)\n",
+    );
   });
 
   it("reads a skipped install back out of the lane receipt with its reason", async () => {

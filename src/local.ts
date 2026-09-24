@@ -118,6 +118,7 @@ export const EXPORTED_ARTIFACTS = [
   "trace.jsonl",
   "review-error.json",
   "run.log",
+  "install.log",
   "diff.stat",
   "check.log",
   "prompt.txt",
