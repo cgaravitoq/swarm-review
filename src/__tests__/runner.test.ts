@@ -1103,9 +1103,11 @@ process.stdin.on("data", (chunk) => {
     const cmdId = cmd.id;
 
     if (cmd.type === "get_state") {
-      const delay = stateAnswers === 0 ? Number(process.env.PI_STATE_DELAY_MS || 0) : 0;
+      const first = stateAnswers === 0;
+      const delay = first ? Number(process.env.PI_STATE_DELAY_MS || 0) : 0;
+      const gate = first ? process.env.PI_STATE_GATE : undefined;
       stateAnswers += 1;
-      setTimeout(() => process.stdout.write(JSON.stringify({
+      const answer = () => process.stdout.write(JSON.stringify({
         id: cmdId,
         type: "response",
         command: "get_state",
@@ -1116,7 +1118,10 @@ process.stdin.on("data", (chunk) => {
           isStreaming: false,
           messageCount: 0,
         },
-      }) + "\\n"), delay);
+      }) + "\\n");
+      const answerOnceOpen = () =>
+        !gate || fs.existsSync(gate) ? answer() : setTimeout(answerOnceOpen, 20);
+      setTimeout(answerOnceOpen, delay);
     } else if (cmd.type === "steer") {
       if (process.env.PI_STEER_LOG) {
         fs.appendFileSync(process.env.PI_STEER_LOG, cmd.message + "\\n");
@@ -1934,26 +1939,38 @@ process.stdin.on("data", (chunk) => {
     // prompt has nothing else to move it: the 2026-09-15 sandbox verifier
     // stayed "running" with an idle child for the whole run and was never
     // briefed. The answer settles the state whenever it arrives.
+    const gateDir = await mkdtemp(join(tmpdir(), "review-pi-state-gate-"));
+    temporaryDirectories.push(gateDir);
+    const gate = join(gateDir, "open");
     const { root, sockPath, runnerProc } = await prepareSupervisedRun(
       "late-first-state",
       null,
       "openai-codex",
       {},
-      { PI_STATE_DELAY_MS: "6000" },
+      { PI_STATE_DELAY_MS: "6000", PI_STATE_GATE: gate },
     );
     try {
       const statusPath = join(root, "status.json");
+      // Pi holds its first answer until the gate opens, so the state read
+      // before it is the one the lane has with no answer at all, however late
+      // a loaded host lets this test read it.
       const early = await waitForStatus(
         statusPath,
         (s) => objectValue(s["process"])["alive"] === true,
       );
       expect(early["state"]).toBe("running");
+      await writeFile(gate, "");
       const settled = await waitForStatus(
         statusPath,
         (s) => s["childIdle"] === true,
         10_000,
       );
       expect(settled["state"]).toBe("idle");
+      // The bridge had stopped waiting: an answer inside the init wait would
+      // have resolved that wait instead of arriving unmatched.
+      expect(await readFile(join(root, "pi.stderr"), "utf8")).toContain(
+        "unmatched response from pi",
+      );
 
       await sendCommand(sockPath, {
         id: "brief",
