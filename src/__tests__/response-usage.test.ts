@@ -1,4 +1,4 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import { readUsage, usageReader } from "../../container/response-usage";
 
 const claudeCode = [
@@ -74,6 +74,16 @@ describe("response usage", () => {
     expect(reader.read()).toEqual({ input: 12, output: 3 });
   });
 
+  it("reads past a frame that is not an object", () => {
+    const stream = [
+      'data: {"usage":{"input_tokens":10}}',
+      "data: null",
+      'data: {"usage":{"output_tokens":4}}',
+    ].join("\n");
+
+    expect(readUsage(stream)).toEqual({ input: 10, output: 4 });
+  });
+
   it("answers both sides unobserved once a line is past the hop's bound", () => {
     // The long line may have carried either side, so what the earlier frames
     // reported is no longer the whole reading.
@@ -93,5 +103,17 @@ describe("response usage", () => {
     const fits = usageReader({ lineChars: long.length });
     fits.write(`${opening}${long}\n\n`);
     expect(fits.read()).toEqual({ input: 5, output: 9 });
+  });
+
+  it("stops reading a response once a line is past its bound", () => {
+    const reader = usageReader({ lineChars: 16 });
+    reader.write(`data: {"pad":"${"x".repeat(16)}"}\n`);
+    const parse = vi.spyOn(JSON, "parse");
+    reader.write("data: {}\n");
+    const parsed = parse.mock.calls.length;
+    parse.mockRestore();
+
+    expect(parsed).toBe(0);
+    expect(reader.read()).toEqual({ input: null, output: null });
   });
 });
