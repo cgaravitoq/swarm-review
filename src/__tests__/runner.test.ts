@@ -965,6 +965,7 @@ describe("supervised native Pi RPC lifecycle", { timeout: 120_000 }, () => {
     provider = "openai-codex",
     jobExtra: Record<string, unknown> = {},
     piEnv: Record<string, string> = {},
+    startedSecondsEarly = 0,
   ) => {
     const root = await mkdtemp(join(tmpdir(), "review-pi-supervised-"));
     temporaryDirectories.push(root);
@@ -1101,6 +1102,9 @@ process.stdin.on("data", (chunk) => {
     }
 
     const cmdId = cmd.id;
+    if (process.env.PI_CLOCK_LOG) {
+      fs.appendFileSync(process.env.PI_CLOCK_LOG, JSON.stringify({ type: cmd.type, at: Date.now() }) + "\\n");
+    }
 
     if (cmd.type === "get_state") {
       const first = stateAnswers === 0;
@@ -1375,7 +1379,30 @@ process.stdin.on("data", (chunk) => {
       new URL("../../container/review-run.sh", import.meta.url),
     );
 
-    const spawnedAt = Date.now();
+    // A lane's window counts down from the whole second the runner's
+    // `date +%s` read, which no test can observe, so the test names that
+    // second itself: the one it starts the runner in, or an earlier one for a
+    // lane whose clock started before its bridge, as it does after a clone.
+    // That lane starts at the top of a second, so the seconds its clock has
+    // already run are whole too.
+    if (startedSecondsEarly > 0) {
+      await new Promise((resolve) =>
+        setTimeout(resolve, 1000 - (Date.now() % 1000)),
+      );
+    }
+    const startedAt =
+      (Math.floor(Date.now() / 1000) - startedSecondsEarly) * 1000;
+    await writeFile(
+      join(binDir, "date"),
+      `#!/bin/sh
+if [ "$1" = "+%s" ]; then
+  echo ${startedAt / 1000}
+  exit 0
+fi
+exec /bin/date "$@"
+`,
+    );
+    await chmod(join(binDir, "date"), 0o755);
     const runnerProc = spawn("bash", [runner, root, "--bridge"], {
       env: {
         ...process.env,
@@ -1384,6 +1411,7 @@ process.stdin.on("data", (chunk) => {
         PI_ARGS_LOG: join(root, "pi-args.jsonl"),
         PI_STEER_LOG: join(root, "pi-steer.log"),
         PI_PROMPT_LOG: join(root, "pi-prompt.log"),
+        PI_CLOCK_LOG: join(root, "pi-clock.jsonl"),
         PI_DESCENDANT_PID: join(root, "descendant.pid"),
         ...piEnv,
       },
@@ -1408,7 +1436,7 @@ process.stdin.on("data", (chunk) => {
     const sockPath = join(root, "rpc.sock");
     await waitForSocket(sockPath);
 
-    return { root, sockPath, runnerProc, spawnedAt };
+    return { root, sockPath, runnerProc, startedAt };
   };
 
   /** The arguments of the first Pi this run spawned, as it logged them. */
@@ -1551,17 +1579,34 @@ process.stdin.on("data", (chunk) => {
     throw new Error(`Predicate on ${tracePath} not met after ${timeoutMs}ms`);
   };
 
+  /** When Pi read the bridge's nth command of a type, by Pi's own clock. */
+  const piReadAt = async (root: string, type: string, nth = 0) => {
+    const read = (await readFile(join(root, "pi-clock.jsonl"), "utf8"))
+      .trim()
+      .split("\n")
+      .map((line) => JSON.parse(line) as { type: string; at: number })
+      .filter((line) => line.type === type)[nth];
+    if (!read) throw new Error(`Pi read no ${type} #${nth}`);
+    return read.at;
+  };
+
   /**
-   * The seconds the runner's window can have lost by now.
+   * The windows the bridge can have printed at a briefing.
    *
-   * The bridge counts a window down from the whole second the shell read as the
-   * runner started, so a prompt carries `total - elapsed`. Elapsed cannot be
-   * more than the wall time this test has watched the runner live, which bounds
-   * the number exactly: a loaded host moves the bound with it instead of
-   * printing a number no assertion named.
+   * It prints `total` less the whole seconds since the start the test pinned,
+   * reading its own clock once, after `earliest` and before `latest`. Both are
+   * instants this test saw, so the two ends meet on one value unless that span
+   * crosses a whole second, and a loaded host moves them with it.
    */
-  const elapsedSecondsBound = (spawnedAt: number) =>
-    Math.floor((Date.now() - Math.floor(spawnedAt / 1000) * 1000) / 1000);
+  const windowBetween = (
+    total: number,
+    startedAt: number,
+    earliest: number,
+    latest: number,
+  ) => ({
+    most: Math.max(0, total - Math.floor((earliest - startedAt) / 1000)),
+    least: Math.max(0, total - Math.floor((latest - startedAt) / 1000)),
+  });
 
   /** The window the runner appended to the first prompt it sent. */
   const promptWindow = (prompt: string) => {
@@ -1827,7 +1872,7 @@ process.stdin.on("data", (chunk) => {
     // A lane that reaches a cap is cut without an answer. The notice is what
     // turns "budget spent" into "answer with what you have", so it must reach
     // Pi as a steer at a tool boundary before the request that would cross it.
-    const { root, sockPath, runnerProc, spawnedAt } =
+    const { root, sockPath, runnerProc, startedAt } =
       await prepareSupervisedRun("budget-requests", "standby", "openai-codex", {
         budget: { requests: 4, inputTokens: 1_000_000 },
         totalTimeoutSeconds: 100_000,
@@ -1838,14 +1883,18 @@ process.stdin.on("data", (chunk) => {
       const firstPrompt = await readFile(join(root, "pi-prompt.log"), "utf8");
       const window = promptWindow(firstPrompt);
       expect(window.requests).toBe(4);
-      // The lane's window is counted down from the runner's own start, so what
-      // the model is told is the total minus the seconds the runner has been
-      // alive: bounded by this test's own watch of it, never by a list of the
-      // numbers a loaded host can print.
-      expect(window.seconds).toBeLessThanOrEqual(100_000);
-      expect(window.seconds).toBeGreaterThanOrEqual(
-        100_000 - elapsedSecondsBound(spawnedAt),
+      // The bridge briefs the lane once Pi has answered its first state, so
+      // the window it is told is what was left between Pi reading that state
+      // request and Pi reading the prompt: never a list of the numbers a
+      // loaded host can print.
+      const briefed = windowBetween(
+        100_000,
+        startedAt,
+        await piReadAt(root, "get_state"),
+        await piReadAt(root, "prompt"),
       );
+      expect(window.seconds).toBeLessThanOrEqual(briefed.most);
+      expect(window.seconds).toBeGreaterThanOrEqual(briefed.least);
 
       // The standby turn was request 1. Two tool turns more: the notice fires
       // at the end of the third turn's tool, when 3 of 4 have been spent.
@@ -1890,19 +1939,43 @@ process.stdin.on("data", (chunk) => {
   });
 
   it("tells the model to finish when three quarters of its window are gone", async () => {
-    // The runner's own start is a whole second and its own startup is not
-    // free, so the model is told the three seconds or what that left of them.
-    const { root, sockPath, runnerProc, spawnedAt } =
-      await prepareSupervisedRun("budget-seconds", "standby", "openai-codex", {
-        budget: { requests: 1_000, inputTokens: 1_000_000 },
-        totalTimeoutSeconds: 3,
-      });
+    // The runner's clock started a second before its bridge, so the lane is
+    // told four of its five seconds, or less on a startup slower than a
+    // second, and the notice is measured against the window it was told
+    // rather than the one it started with.
+    const { root, sockPath, runnerProc, startedAt } =
+      await prepareSupervisedRun(
+        "budget-seconds",
+        "standby",
+        "openai-codex",
+        {
+          budget: { requests: 1_000, inputTokens: 1_000_000 },
+          totalTimeoutSeconds: 5,
+        },
+        {},
+        1,
+      );
     try {
       const statusPath = join(root, "status.json");
       await waitForStandbySettled(statusPath);
-      // Past the whole window before the tool turn, so the boundary the
-      // notice is measured at is on the far side of it.
-      await new Promise((resolve) => setTimeout(resolve, 3_100));
+      const window = promptWindow(
+        await readFile(join(root, "pi-prompt.log"), "utf8"),
+      );
+      const briefedAfter = await piReadAt(root, "get_state");
+      const briefedBefore = await piReadAt(root, "prompt");
+      const briefed = windowBetween(5, startedAt, briefedAfter, briefedBefore);
+      expect(window.seconds).toBeLessThanOrEqual(briefed.most);
+      expect(window.seconds).toBeGreaterThanOrEqual(briefed.least);
+      // A startup that spent the whole window leaves no notice to send.
+      expect(window.seconds).toBeGreaterThan(0);
+      // The tool turn starts once three quarters of that window are gone by
+      // Pi's clock, which is late enough for the notice and, for a four
+      // second window, too early for one that waited for all of it.
+      const threeQuarters =
+        briefedBefore + Math.ceil(window.seconds * 0.75) * 1000 + 100;
+      await new Promise((resolve) =>
+        setTimeout(resolve, Math.max(0, threeQuarters - Date.now())),
+      );
       await sendCommand(sockPath, {
         id: "tool-1",
         type: "prompt",
@@ -1915,13 +1988,17 @@ process.stdin.on("data", (chunk) => {
       );
       const steers = await readFile(join(root, "pi-steer.log"), "utf8");
       const notice = secondsNotice(steers);
-      // The notice fires at the first tool boundary where three quarters of the
-      // window are gone, and the window is what the lane had left when it was
-      // briefed. The two numbers are bound to each other and to the wall time
-      // this test has watched, not to the numbers a 3 s window can print.
-      expect(notice.cap).toBeLessThanOrEqual(3);
-      expect(notice.spent).toBeGreaterThanOrEqual(Math.ceil(notice.cap * 0.75));
-      expect(notice.spent).toBeLessThanOrEqual(elapsedSecondsBound(spawnedAt));
+      expect(notice.cap).toBe(window.seconds);
+      // What the notice says was spent is the time from the briefing to the
+      // tool boundary it fired at, bracketed by what Pi read on either side.
+      const toolPromptedAt = await piReadAt(root, "prompt", 1);
+      const steeredAt = await piReadAt(root, "steer");
+      expect(notice.spent).toBeGreaterThanOrEqual(
+        Math.floor((toolPromptedAt - briefedBefore) / 1000),
+      );
+      expect(notice.spent).toBeLessThanOrEqual(
+        Math.floor((steeredAt - briefedAfter) / 1000),
+      );
 
       await waitForStatus(
         statusPath,
@@ -1990,7 +2067,7 @@ process.stdin.on("data", (chunk) => {
     // prompt, and a briefed lane idles for most of the run before it has one.
     // The 2026-09-15 sandbox lanes were told 355 s of a 508 s window after a
     // 308 s install, so the notice keyed to it never came.
-    const { root, sockPath, runnerProc, spawnedAt } =
+    const { root, sockPath, runnerProc, startedAt } =
       await prepareSupervisedRun("budget-window-left", null, "openai-codex", {
         budget: { requests: 1_000, inputTokens: 1_000_000 },
         totalTimeoutSeconds: 5,
@@ -1998,8 +2075,8 @@ process.stdin.on("data", (chunk) => {
     try {
       const statusPath = join(root, "status.json");
       await waitForStatus(statusPath, (s) => s["childIdle"] === true);
-      const idleMs = 2_100;
-      await new Promise((resolve) => setTimeout(resolve, idleMs));
+      await new Promise((resolve) => setTimeout(resolve, 2_100));
+      const briefedAfter = Date.now();
       await sendCommand(sockPath, {
         id: "brief",
         type: "prompt",
@@ -2009,14 +2086,18 @@ process.stdin.on("data", (chunk) => {
       const prompt = await readFile(join(root, "pi-prompt.log"), "utf8");
       const window = promptWindow(prompt);
       expect(window.requests).toBe(1_000);
-      // The lane idled past half of its 5 s window before it was briefed, so
-      // the window it is told is at most what is left of that: the one it
-      // started with is not a window it can be told. The lower bound is the
-      // total minus the seconds this test has watched the runner live.
-      expect(window.seconds).toBeLessThanOrEqual(5 - Math.floor(idleMs / 1000));
-      expect(window.seconds).toBeGreaterThanOrEqual(
-        5 - elapsedSecondsBound(spawnedAt),
+      // The lane idled past half of its 5 s window before it was briefed, and
+      // the bridge read its clock between this test sending the brief and Pi
+      // reading it, so the window it is told is what was left then: at most
+      // three seconds, never the five it started with.
+      const briefed = windowBetween(
+        5,
+        startedAt,
+        briefedAfter,
+        await piReadAt(root, "prompt"),
       );
+      expect(window.seconds).toBeLessThanOrEqual(briefed.most);
+      expect(window.seconds).toBeGreaterThanOrEqual(briefed.least);
 
       await sendCommand(sockPath, { type: "accept" });
       await waitForExit(runnerProc);
