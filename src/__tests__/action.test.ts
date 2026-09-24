@@ -40,7 +40,7 @@ async function arrange(headRepo: string, pullSucceeds: boolean) {
   );
   await writeFile(
     join(bin, "bun"),
-    '#!/bin/sh\nprintf "bun %s\\n" "$*" >> "$ACTION_LOG"\nif [ "$1" = "$ACTION_ROOT/src/swarm.ts" ]; then printf "%s\\0" "$@" > "$ACTION_ARGS"; fi\n',
+    '#!/bin/sh\nprintf "bun %s\\n" "$*" >> "$ACTION_LOG"\nif [ "$1" = "$ACTION_ROOT/src/swarm.ts" ]; then printf "%s\\0" "$@" > "$ACTION_ARGS"; [ "$ACTION_FAIL" = swarm ] && exit 1; fi\nexit 0\n',
   );
   for (const name of ["gh", "docker", "bun"]) {
     await chmod(join(bin, name), 0o755);
@@ -172,6 +172,37 @@ describe("composite action driver", () => {
     expect(log).toContain(`docker push ${image}`);
     expect(log.indexOf(`docker push ${image}`)).toBeLessThan(
       log.findIndex((line) => line.includes("src/swarm.ts")),
+    );
+  });
+
+  it("publishes the receipt path when the swarm exits non-zero", async () => {
+    const fixture = await arrange("acme/demo", true);
+    await main({ ...fixture.env, INPUT_MODE: "packed", ACTION_FAIL: "swarm" });
+    const log = await fixture.log();
+    expect(log.at(-1)).toBe(
+      `bun ${packageRoot}/src/publish.ts --receipt ${fixture.env.RUNNER_TEMP}/swarm-review/pr-42-123-1/swarm-receipt.json --repo acme/demo --pr 42 --publish --allow-moved-head`,
+    );
+  });
+
+  it("runs a fork forced to sandbox without the packed fork note", async () => {
+    const fixture = await arrange("contributor/demo", true);
+    await main({ ...fixture.env, INPUT_MODE: "sandbox" });
+    const log = await fixture.log();
+    expect(log.find((line) => line.includes("src/swarm.ts"))).toContain(
+      " --sandbox --image ",
+    );
+    expect(log.at(-1)).toBe(
+      `bun ${packageRoot}/src/publish.ts --receipt ${fixture.env.RUNNER_TEMP}/swarm-review/pr-42-123-1/swarm-receipt.json --repo acme/demo --pr 42 --publish --allow-moved-head`,
+    );
+  });
+
+  it("refuses an unknown mode before reviewing or publishing", async () => {
+    const fixture = await arrange("acme/demo", true);
+    await expect(
+      main({ ...fixture.env, INPUT_MODE: "sandox" }),
+    ).rejects.toThrow("mode must be auto, packed or sandbox: sandox");
+    await expect(readFile(fixture.env.ACTION_LOG, "utf8")).rejects.toThrow(
+      "ENOENT",
     );
   });
 });
