@@ -1336,6 +1336,28 @@ describe("a run that publishes no review", () => {
     ).toHaveLength(0);
   });
 
+  it("claims only a comment its marker opens", async () => {
+    const quoting = {
+      id: 50,
+      user: { login: bot },
+      body: `a note quoting ${marker}\nnothing more`,
+    };
+    const api = github({ seeded: [{ ...quoting }] });
+    const receiptPath = await artifact(failed());
+
+    await expect(publish(receiptPath)).rejects.toThrow(
+      "publication requires a completed or partial review",
+    );
+
+    expect(api.comments[0]).toEqual(quoting);
+    expect(api.comments.slice(1)).toMatchObject([
+      {
+        user: { login: bot },
+        body: expect.stringMatching(/^<!-- swarm-review:run:4242 -->\n/),
+      },
+    ]);
+  });
+
   it("posts a fresh comment when its own comment refuses the edit", async () => {
     const own = { id: 50, user: { login: bot }, body: `${marker}\n\nold` };
     const api = github({ seeded: [{ ...own }], editable: false });
@@ -1388,11 +1410,14 @@ describe("a run that publishes no review", () => {
     const api = github();
     const receiptPath = await artifact(failed());
     const { GITHUB_RUN_ID: _, ...anonymous } = env;
+    const errors = vi.spyOn(console, "error").mockImplementation(() => {});
 
     await expect(publish(receiptPath, anonymous)).rejects.toThrow(
       "publication requires a completed or partial review",
     );
 
+    expect(errors).not.toHaveBeenCalled();
+    errors.mockRestore();
     expect(process.exitCode).toBe(1);
     expect(api.comments).toEqual([]);
     expect(issueRequests(api.fetchMock)).toHaveLength(0);
