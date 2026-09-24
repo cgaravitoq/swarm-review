@@ -1145,7 +1145,8 @@ describe("a run that publishes no review", () => {
     moved = false,
     seeded = [] as Comment[],
     editable = true,
-    reviews = [] as { id: number; body: string }[],
+    viewerFails = false,
+    reviews = [] as { id: number; html_url: string; body: string }[],
   } = {}) => {
     const comments: Comment[] = [...seeded];
     const fetchMock = vi.fn(async (url: string, init?: RequestInit) => {
@@ -1154,10 +1155,12 @@ describe("a run that publishes no review", () => {
         (init?.headers as Record<string, string> | undefined)?.["accept"] ?? "",
       );
       if (url === "https://api.github.com/graphql") {
-        return Response.json(
-          { data: { viewer: { login: bot } } },
-          { status: 200 },
-        );
+        return viewerFails
+          ? Response.json({ message: "Bad credentials" }, { status: 401 })
+          : Response.json(
+              { data: { viewer: { login: bot } } },
+              { status: 200 },
+            );
       }
       if (url.includes("/issues/comments/")) {
         const id = Number(commentUrl.exec(url)?.[1]);
@@ -1276,18 +1279,21 @@ describe("a run that publishes no review", () => {
     ).toHaveLength(0);
   });
 
-  it("posts no comment when the receipt publishes a review", async () => {
+  it("names the published review on the run's comment instead of a refusal", async () => {
     const api = github();
     const receiptPath = await artifact(completed());
 
     await expect(publish(receiptPath)).resolves.toBeUndefined();
 
-    expect(api.comments).toEqual([]);
-    expect(
-      api.fetchMock.mock.calls.some(([url]) =>
-        String(url).includes("/issues/"),
-      ),
-    ).toBe(false);
+    expect(api.comments).toHaveLength(1);
+    const body = api.comments[0]?.body ?? "";
+    expect(body.split("\n")[0]).toBe(marker);
+    expect(body).toContain("**swarm-review published a review.**");
+    expect(body).toContain(
+      "https://github.com/acme/demo/pull/7#pullrequestreview-9",
+    );
+    expect(body).toContain(runUrl);
+    expect(body).not.toContain("published no review");
     expect(
       api.fetchMock.mock.calls.filter(
         ([url, init]) =>
@@ -1295,6 +1301,76 @@ describe("a run that publishes no review", () => {
           (init as RequestInit | undefined)?.method === "POST",
       ),
     ).toHaveLength(1);
+  });
+
+  it("edits the status comment the run opened once the review is published", async () => {
+    const status = {
+      id: 30,
+      user: { login: bot },
+      body: `${marker}\n\n**swarm-review is reviewing** this pull request with \`packed\` lanes.`,
+    };
+    const api = github({ seeded: [{ ...status }] });
+    const receiptPath = await artifact(completed());
+
+    await expect(publish(receiptPath)).resolves.toBeUndefined();
+
+    expect(api.comments).toHaveLength(1);
+    const body = api.comments[0]?.body ?? "";
+    expect(body).not.toContain("is reviewing");
+    expect(body).toContain("**swarm-review published a review.**");
+    expect(body).toContain(
+      "https://github.com/acme/demo/pull/7#pullrequestreview-9",
+    );
+    expect(
+      issueRequests(api.fetchMock)
+        .filter(
+          ([, init]) => (init as RequestInit | undefined)?.method === "PATCH",
+        )
+        .map(([url]) => url),
+    ).toEqual(["https://api.github.com/repos/acme/demo/issues/comments/30"]);
+  });
+
+  it("edits every comment the run opened, not only the first attempt's", async () => {
+    const reviewing = `${marker}\n\n**swarm-review is reviewing** this pull request with \`packed\` lanes.`;
+    const api = github({
+      seeded: [
+        { id: 30, user: { login: bot }, body: reviewing },
+        { id: 31, user: { login: bot }, body: reviewing },
+      ],
+    });
+    const receiptPath = await artifact(completed());
+
+    await expect(publish(receiptPath)).resolves.toBeUndefined();
+
+    expect(api.comments.map((comment) => comment.body)).toEqual([
+      expect.stringContaining("published a review"),
+      expect.stringContaining("published a review"),
+    ]);
+    expect(
+      issueRequests(api.fetchMock)
+        .filter(
+          ([, init]) => (init as RequestInit | undefined)?.method === "PATCH",
+        )
+        .map(([url]) => url),
+    ).toEqual([
+      "https://api.github.com/repos/acme/demo/issues/comments/30",
+      "https://api.github.com/repos/acme/demo/issues/comments/31",
+    ]);
+  });
+
+  it("logs a viewer lookup that failed instead of claiming silence", async () => {
+    const api = github({ viewerFails: true });
+    const receiptPath = await artifact(completed());
+    const errors = vi.spyOn(console, "error").mockImplementation(() => {});
+
+    await expect(publish(receiptPath)).resolves.toBeUndefined();
+
+    expect(errors).toHaveBeenCalledWith(
+      "viewer lookup failed, so the run's comment cannot be claimed: GitHub viewer request failed: 401",
+    );
+    errors.mockRestore();
+    expect(api.comments).toHaveLength(1);
+    expect(api.comments[0]?.body).toContain("published a review");
   });
 
   it("comments the stage and message the action recorded when no receipt was written", async () => {
@@ -1665,10 +1741,15 @@ describe("a run that publishes no review", () => {
     expect(reason.match(/`/g)).toHaveLength(2);
   });
 
-  it("fails without a review or a comment when this run's review is already published", async () => {
+  it("names the review already on the pull request and posts no second one", async () => {
+    const earlier = "https://github.com/acme/demo/pull/7#pullrequestreview-3";
     const api = github({
       reviews: [
-        { id: 3, body: `${reviewMarker("swarm-1", head)}\nearlier review` },
+        {
+          id: 3,
+          html_url: earlier,
+          body: `${reviewMarker("swarm-1", head)}\nearlier review`,
+        },
       ],
     });
     const receiptPath = await artifact(completed());
@@ -1685,7 +1766,11 @@ describe("a run that publishes no review", () => {
           (init as RequestInit | undefined)?.method === "POST",
       ),
     ).toHaveLength(0);
-    expect(issueRequests(api.fetchMock)).toHaveLength(0);
+    expect(api.comments).toHaveLength(1);
+    const body = api.comments[0]?.body ?? "";
+    expect(body.split("\n")[0]).toBe(marker);
+    expect(body).toContain("published a review");
+    expect(body).toContain(earlier);
   });
 
   it("comments a head that moved off the frozen SHA", async () => {
