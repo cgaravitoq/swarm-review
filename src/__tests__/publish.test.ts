@@ -17,6 +17,7 @@ import {
   publicationDisposition,
   REVIEW_EVENT,
   REVIEW_SIDE,
+  readRunNotes,
   refusalReason,
   revalidatePullRequest,
   reviewMarker,
@@ -850,6 +851,36 @@ describe("publish options", () => {
   });
 });
 
+describe("run notes", () => {
+  const directories: string[] = [];
+
+  afterEach(async () => {
+    for (const directory of directories.splice(0)) {
+      await rm(directory, { recursive: true, force: true });
+    }
+  });
+
+  const notesFor = async (raw: string | null) => {
+    const directory = await mkdtemp(join(tmpdir(), "review-pi-notes-"));
+    directories.push(directory);
+    if (raw !== null) await writeFile(join(directory, "run.json"), raw);
+    return readRunNotes(directory);
+  };
+
+  it("reads the fork and the runner the action recorded", async () => {
+    expect(await notesFor('{"fork":true,"packedRunner":"ARM64"}')).toEqual({
+      fork: true,
+      packedRunner: "ARM64",
+    });
+  });
+
+  it("carries no note the action did not write", async () => {
+    expect(await notesFor('{"fork":false}')).toEqual({ fork: false });
+    expect(await notesFor(null)).toEqual({ fork: false });
+    expect(await notesFor("not json")).toEqual({ fork: false });
+  });
+});
+
 describe("moved head", () => {
   const head = "a".repeat(40);
   const later = "b".repeat(40);
@@ -1065,10 +1096,12 @@ describe("a run that publishes no review", () => {
   const artifact = async (
     swarm: SwarmReceipt | ReturnType<typeof preparationFailureReceipt>,
     phases: { runId: string; phase: string; state: string }[] = [],
+    notes: { fork?: boolean; packedRunner?: string } = {},
   ) => {
     const suiteDir = await artifactDirectory();
     const receiptPath = join(suiteDir, "swarm-receipt.json");
     await writeFile(receiptPath, JSON.stringify(swarm));
+    await writeFile(join(suiteDir, "run.json"), JSON.stringify(notes));
     for (const phase of phases) {
       await mkdir(join(suiteDir, phase.runId), { recursive: true });
       await writeFile(
@@ -1323,11 +1356,11 @@ describe("a run that publishes no review", () => {
     expect(body).toContain("| `reviewer-2` | `failed` | no status.json |");
   });
 
-  it("publishes the packed fork note in the review body", async () => {
+  it("publishes the packed fork note the run recorded", async () => {
     const api = github();
-    const receiptPath = await artifact(completed());
+    const receiptPath = await artifact(completed(), [], { fork: true });
 
-    await publish(receiptPath, env, ["--publish", "--fork"]);
+    await publish(receiptPath);
 
     const request = api.fetchMock.mock.calls.find(
       ([url, init]) =>
@@ -1343,16 +1376,14 @@ describe("a run that publishes no review", () => {
     expect(payload.body).toContain("- fork reviewed with packed lanes");
   });
 
-  it("publishes both packed lane notes when the runner cannot run the sandbox image", async () => {
+  it("publishes both packed lane notes the run recorded", async () => {
     const api = github();
-    const receiptPath = await artifact(completed());
+    const receiptPath = await artifact(completed(), [], {
+      fork: true,
+      packedRunner: "ARM64",
+    });
 
-    await publish(receiptPath, env, [
-      "--publish",
-      "--fork",
-      "--packed-runner",
-      "ARM64",
-    ]);
+    await publish(receiptPath);
 
     const request = api.fetchMock.mock.calls.find(
       ([url, init]) =>

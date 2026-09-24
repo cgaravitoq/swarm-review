@@ -1,8 +1,9 @@
 import { execFile, spawn } from "node:child_process";
-import { mkdir, writeFile } from "node:fs/promises";
+import { appendFile, mkdir, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { promisify } from "node:util";
 import { imageReference, imageTagFromFiles } from "./image-tag";
+import { runIdentity, runningCommentBody } from "./publish";
 
 const exec = promisify(execFile);
 type Env = Record<string, string | undefined>;
@@ -33,6 +34,9 @@ const lastLine = (stderr: string) => {
   }
   return "";
 };
+
+const reason = (error: unknown) =>
+  error instanceof Error ? error.message : String(error);
 
 function run(command: string, args: string[], env: Env, input?: string) {
   return new Promise<void>((resolve, reject) => {
@@ -92,9 +96,14 @@ export async function main(env: Env = process.env): Promise<void> {
   const out = join(required(env, "RUNNER_TEMP"), "swarm-review");
   const swarmId = `pr-${pullRequest}-${required(env, "GITHUB_RUN_ID")}-${required(env, "GITHUB_RUN_ATTEMPT")}`;
   const swarmDir = join(out, swarmId);
+  const receiptPath = join(swarmDir, "swarm-receipt.json");
+  // The publish step runs whatever this step does, so the one place that knows
+  // where the artifact lands is here.
+  await appendFile(
+    required(env, "GITHUB_ENV"),
+    `SWARM_RECEIPT=${receiptPath}\n`,
+  );
   let stage: Stage = "pull request lookup";
-  let packedFork = false;
-  let packedRunner: string | undefined;
   let runEnv = env;
   try {
     const { stdout } = await exec(
@@ -122,9 +131,23 @@ export async function main(env: Env = process.env): Promise<void> {
         `sandbox mode needs an X64 runner: RUNNER_ARCH is ${runnerArch}`,
       );
     }
-    packedFork = fork && selected === "packed";
-    packedRunner =
+    const packedFork = fork && selected === "packed";
+    const packedRunner =
       selected === "packed" && !runsSandboxImage ? runnerArch : undefined;
+    try {
+      await postRunComment(env, repository, pullRequest, selected);
+    } catch (error) {
+      console.error(`run comment not posted: ${reason(error)}`);
+    }
+    try {
+      await mkdir(swarmDir, { recursive: true });
+      await writeFile(
+        join(swarmDir, "run.json"),
+        JSON.stringify({ fork: packedFork, packedRunner }),
+      );
+    } catch (error) {
+      console.error(`run notes not written: ${reason(error)}`);
+    }
     stage = "account lookup";
     runEnv = { ...env, CLOUDFLARE_ACCOUNT_ID: await accountId(env) };
     const args = [
@@ -230,23 +253,32 @@ export async function main(env: Env = process.env): Promise<void> {
         ),
       )
       .catch((writeError: unknown) => console.error(writeError));
+    // The review did not run, so the step fails; the publish step runs anyway
+    // and names the stage on the run's comment.
+    throw error;
   }
+}
+
+/** Opens the run's comment, the one publish replaces with the outcome. */
+async function postRunComment(
+  env: Env,
+  repository: string,
+  pullRequest: string,
+  mode: string,
+) {
+  const identity = runIdentity(env);
+  if (!identity) return;
   await run(
-    "bun",
+    "gh",
     [
-      join(actionPath, "src", "publish.ts"),
-      "--receipt",
-      join(out, swarmId, "swarm-receipt.json"),
-      "--repo",
-      repository,
-      "--pr",
-      pullRequest,
-      "--publish",
-      "--allow-moved-head",
-      ...(packedFork ? ["--fork"] : []),
-      ...(packedRunner ? ["--packed-runner", packedRunner] : []),
+      "api",
+      `repos/${repository}/issues/${pullRequest}/comments`,
+      "--method",
+      "POST",
+      "-f",
+      `body=${runningCommentBody({ runId: identity.runId, mode, url: identity.url })}`,
     ],
-    runEnv,
+    env,
   );
 }
 

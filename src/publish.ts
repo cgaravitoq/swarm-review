@@ -147,7 +147,6 @@ export function parsePublishOptions(argv: string[]) {
   const pullRequest = flag(argv, "pr");
   const expectedHead = flag(argv, "expected-head");
   const expectedMergeBase = flag(argv, "expected-merge-base");
-  const packedRunner = flag(argv, "packed-runner");
   return {
     receiptPath,
     repo,
@@ -156,8 +155,6 @@ export function parsePublishOptions(argv: string[]) {
     ...(expectedMergeBase ? { expectedMergeBase } : {}),
     publish: argv.includes("--publish"),
     allowMovedHead: argv.includes("--allow-moved-head"),
-    fork: argv.includes("--fork"),
-    ...(packedRunner ? { packedRunner } : {}),
     minSeverity: flag(argv, "min-severity") ?? "P2",
   };
 }
@@ -932,11 +929,10 @@ export const runIdentity = (env: Record<string, string | undefined>) => {
 
 export type RunIdentity = NonNullable<ReturnType<typeof runIdentity>>;
 
-const REFUSAL_MARKER_PREFIX = "<!-- swarm-review:run:";
+const RUN_MARKER_PREFIX = "<!-- swarm-review:run:";
 
 /** One comment per run: the marker is what a re-run finds and edits. */
-export const refusalMarker = (runId: string) =>
-  `${REFUSAL_MARKER_PREFIX}${runId} -->`;
+export const runMarker = (runId: string) => `${RUN_MARKER_PREFIX}${runId} -->`;
 
 /** The step a lane was in when it stopped, as its own status.json records it. */
 export type LanePhase = {
@@ -1020,6 +1016,34 @@ const runFailure = async (
     : null;
 };
 
+/**
+ * What the action recorded for the review it is about to run.
+ *
+ * The notes travel beside the receipt rather than as flags, so publish reads
+ * the same run's own record whatever the review step did with them.
+ */
+export type RunNotes = { fork: boolean; packedRunner?: string };
+
+export async function readRunNotes(artifactRoot: string): Promise<RunNotes> {
+  const raw = await readFile(join(artifactRoot, "run.json"), "utf8").catch(
+    () => null,
+  );
+  if (raw === null) return { fork: false };
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(raw);
+  } catch {
+    return { fork: false };
+  }
+  if (typeof parsed !== "object" || parsed === null) return { fork: false };
+  const record = parsed as Record<string, unknown>;
+  const packedRunner = record["packedRunner"];
+  return {
+    fork: record["fork"] === true,
+    ...(typeof packedRunner === "string" ? { packedRunner } : {}),
+  };
+}
+
 /** One lane as the comment names it. */
 export type RefusalLane = {
   lane: string;
@@ -1095,7 +1119,7 @@ export const refusalCommentBody = (input: {
   lanes: readonly RefusalLane[];
 }) =>
   [
-    refusalMarker(input.runId),
+    runMarker(input.runId),
     "",
     `**swarm-review published no review.** \`${input.reason}\``,
     ...(input.lanes.length === 0
@@ -1109,6 +1133,25 @@ export const refusalCommentBody = (input: {
               `| ${statusCell(lane.lane)} | ${statusCell(lane.status)} | ${phaseCell(lane.phase)} |`,
           ),
         ]),
+    "",
+    `[Run artifact](${input.url})`,
+  ].join("\n");
+
+/**
+ * What the run's comment says while the lanes are reading the change.
+ *
+ * `action.ts` opens it as soon as the mode is chosen, so a reader who asked
+ * for the review sees one run's answer in one place, from the first minute.
+ */
+export const runningCommentBody = (input: {
+  runId: string;
+  mode: string;
+  url: string;
+}) =>
+  [
+    runMarker(input.runId),
+    "",
+    `**swarm-review is reviewing** this pull request with \`${input.mode}\` lanes.`,
     "",
     `[Run artifact](${input.url})`,
   ].join("\n");
@@ -1198,7 +1241,7 @@ export async function upsertRefusalComment(input: {
   runId: string;
   body: string;
 }) {
-  const marker = refusalMarker(input.runId);
+  const marker = runMarker(input.runId);
   const viewer = await fetchViewerLogin(input.token).catch(() => null);
   const existing = (
     await fetchIssueComments(input.repo, input.pullRequest, input.token)
@@ -1299,6 +1342,7 @@ export async function main(
   const token = env["GITHUB_TOKEN"] ?? env["GH_TOKEN"] ?? null;
   const run = runIdentity(env);
   const artifactRoot = dirname(options.receiptPath);
+  const notes = await readRunNotes(artifactRoot);
   let receipt: SwarmReceipt | null = null;
   let pullRequest: number | null = options.pullRequest ?? null;
   try {
@@ -1337,8 +1381,8 @@ export async function main(
       commentableLines(validated.diff),
       options.repo,
       options.minSeverity,
-      options.fork,
-      options.packedRunner,
+      notes.fork,
+      notes.packedRunner,
     );
     const payload = githubReviewPayload(built);
     const superseded = supersededReviews(validated.reviews);
