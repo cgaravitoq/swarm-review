@@ -1852,8 +1852,12 @@ export async function readContainerStatus(
   }
 }
 
-/** States the runner never leaves. */
-export const TERMINAL_RUNNER_STATES = ["failed", "cancelled", "done"] as const;
+/** Runner states that end a lane whose bridge is gone. */
+const LANE_ENDING_STATES: readonly string[] = [
+  "failed",
+  "blocked",
+  "cancelled",
+];
 
 /** Live events worth a line; the rest of the raw stream is per-token noise. */
 const ACTIVITY_TYPES = [
@@ -2968,7 +2972,10 @@ async function main() {
         // only witness for a run that died before Pi came up, and a lane that
         // has already failed must not be waited on for the rest of the run.
         // Its done is never believed: the target's uid can write this file,
-        // and only the bridge may say that a review ended well.
+        // and only the bridge may say that a review ended well. A failure it
+        // claims only ends the target's own lane. One the bridge wrote at the
+        // review is followed by the runner's own last word once its evidence
+        // is written, and the lane ends on that.
         const runnerStatus = await readContainerStatus(
           containerName,
           containerRunDir,
@@ -2976,10 +2983,8 @@ async function main() {
         );
         if (
           runnerStatus &&
-          (TERMINAL_RUNNER_STATES as readonly string[]).includes(
-            runnerStatus.state,
-          ) &&
-          runnerStatus.state !== "done"
+          LANE_ENDING_STATES.includes(runnerStatus.state) &&
+          runnerStatus.phase !== "review"
         ) {
           status = {
             runId: options.runId,
@@ -2993,14 +2998,10 @@ async function main() {
           break;
         }
         // The socket exists only once Pi is up. While the runner is still
-        // cloning, installing or checking, its own status file is a
-        // truthful observation of the lane, not a lost one.
-        if (
-          runnerStatus &&
-          !(TERMINAL_RUNNER_STATES as readonly string[]).includes(
-            runnerStatus.state,
-          )
-        ) {
+        // cloning, installing or checking, or writing a failed review's
+        // evidence, its own status file is a truthful observation of the
+        // lane, not a lost one.
+        if (runnerStatus && runnerStatus.state !== "done") {
           status = {
             runId: options.runId,
             phase: runnerStatus.phase,
