@@ -444,6 +444,27 @@ if [[ "$1" == "exec" ]]; then
     printf '\\263p"}\\n'
     exit 0
   fi
+  if [[ "\${FAKE_MODE:-}" == "split-utf8-burst" && "$joined" == *"review-pi-present"* && "$joined" == *"/trace.jsonl"* ]]; then
+    printf 'review-pi-present\\n'
+    i=0
+    while [ "$i" -lt 200 ]; do
+      printf '{"type":"turn_end","stopReason":"st'
+      printf '\\303'
+      sleep 0.002
+      printf '\\263p"}\\n'
+      i=$((i + 1))
+    done
+    exit 0
+  fi
+  if [[ "\${FAKE_MODE:-}" == "split-utf8-tail" && "$joined" == *"review-pi-present"* && "$joined" == *"/trace.jsonl"* ]]; then
+    printf 'review-pi-present\\n{"type":"turn_end","stopReason":"st'
+    printf '\\303'
+    exit 0
+  fi
+  if [[ "\${FAKE_MODE:-}" == "split-utf8-stderr" && "$joined" == *"review-pi-present"* && "$joined" == *"/trace.jsonl"* ]]; then
+    printf 'partial\\303' >&2
+    exit 3
+  fi
   rewritten=$(printf '%s' "$command" | /usr/bin/sed "s#/workspace/runs/\${FAKE_RUN_ID:?}#$root#g")
   /bin/sh -c "$rewritten"
   exit $?
@@ -2161,6 +2182,73 @@ describe("public local CLI lifecycle", {
     expect(await readFile(join(out, runId, "trace.jsonl"), "utf8")).toBe(
       '{"type":"turn_end","stopReason":"stóp"}\n',
     );
+  });
+
+  it("settles a run whose export splits a multibyte character two hundred times", async () => {
+    const root = await mkdtemp(join(tmpdir(), "review-pi-cli-"));
+    temporaryDirectories.push(root);
+    const arranged = await arrangeFakeDocker(root);
+    const runId = "split-utf8-burst";
+    const out = join(root, "out");
+    const child = spawn("bun", localArguments(out, runId), {
+      cwd: repoRoot,
+      env: fakeEnvironment(arranged, runId, "split-utf8-burst"),
+      stdio: ["ignore", "ignore", "ignore"],
+    });
+    // On the unfixed driver the export's stdout stream never ends, so the run
+    // is cut here rather than left to a vitest timeout that reports nothing
+    // about which phase stopped moving.
+    const code = await new Promise<number | null>((resolvePromise) => {
+      const giveUp = setTimeout(() => child.kill("SIGKILL"), 30_000);
+      child.once("close", (status) => {
+        clearTimeout(giveUp);
+        resolvePromise(status);
+      });
+    });
+
+    expect(code, "the driver never settled the run").toBe(0);
+    const line = '{"type":"turn_end","stopReason":"stóp"}';
+    expect(await readFile(join(out, runId, "trace.jsonl"), "utf8")).toBe(
+      `${Array.from({ length: 200 }, () => line).join("\n")}\n`,
+    );
+  });
+
+  it("keeps a stdout stream that ends mid-character", async () => {
+    const root = await mkdtemp(join(tmpdir(), "review-pi-cli-"));
+    temporaryDirectories.push(root);
+    const arranged = await arrangeFakeDocker(root);
+    const runId = "split-utf8-tail";
+    const out = join(root, "out");
+
+    const result = await runLocalCli(
+      localArguments(out, runId),
+      fakeEnvironment(arranged, runId, "split-utf8-tail"),
+    );
+
+    expect(result.code, result.output).toBe(1);
+    expect(await readFile(join(out, runId, "trace.jsonl"), "utf8")).toBe(
+      '{"type":"turn_end","stopReason":"st\uFFFD',
+    );
+  });
+
+  it("keeps a stderr stream that ends mid-character in the failure it reports", async () => {
+    const root = await mkdtemp(join(tmpdir(), "review-pi-cli-"));
+    temporaryDirectories.push(root);
+    const arranged = await arrangeFakeDocker(root);
+    const runId = "split-utf8-stderr";
+    const out = join(root, "out");
+
+    const result = await runLocalCli(
+      localArguments(out, runId),
+      fakeEnvironment(arranged, runId, "split-utf8-stderr"),
+    );
+
+    expect(result.code, result.output).toBe(1);
+    const receipt = await readFile(
+      join(out, runId, "local-receipt.json"),
+      "utf8",
+    );
+    expect(receipt).toContain("partial\uFFFD");
   });
 
   it("redacts a credential-bearing command failure from output and receipt", async () => {
