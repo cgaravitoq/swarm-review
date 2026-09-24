@@ -213,17 +213,22 @@ do_install() {
       '{status:"skipped", manifest:null, reason:$reason, seconds:null, nothingToDo:null, template:null}' > "$RUN_DIR/install.json"
     return 0
   fi
-  local code began seconds nothing_to_do template=false
-  if [ "$manifest" = "bun.lock" ] && cmp -s "$REPO/bun.lock" "$TEMPLATE_ROOT/template-bun.lock" && [ -d "$TEMPLATE_ROOT/node_modules-template" ]; then
-    cp -a --reflink=auto "$TEMPLATE_ROOT/node_modules-template" "$REPO/node_modules"
-    code=$?
-    if [ "$code" -ne 0 ]; then
-      jq -cn --arg manifest "$manifest" --argjson exit "$code" \
-        '{status:"failed", manifest:$manifest, reason:"template copy: exit \($exit)",
-          seconds:null, nothingToDo:null, template:false}' > "$RUN_DIR/install.json"
-      return "$code"
+  local code began seconds nothing_to_do template=absent
+  # An image whose bake left no template says `absent`, so a broken bake is not
+  # read as a target whose lockfile moved.
+  if [ -f "$TEMPLATE_ROOT/template-bun.lock" ] && [ -d "$TEMPLATE_ROOT/node_modules-template" ]; then
+    template=mismatch
+    if [ "$manifest" = "bun.lock" ] && cmp -s "$REPO/bun.lock" "$TEMPLATE_ROOT/template-bun.lock"; then
+      cp -a --reflink=auto "$TEMPLATE_ROOT/node_modules-template" "$REPO/node_modules"
+      code=$?
+      if [ "$code" -ne 0 ]; then
+        jq -cn --arg manifest "$manifest" --argjson exit "$code" \
+          '{status:"failed", manifest:$manifest, reason:"template copy: exit \($exit)",
+            seconds:null, nothingToDo:null, template:null}' > "$RUN_DIR/install.json"
+        return "$code"
+      fi
+      template=copied
     fi
-    template=true
   fi
   began=$(date +%s)
   if is_supervised; then
@@ -239,7 +244,7 @@ do_install() {
     nothing_to_do=true
   fi
   jq -cn --arg manifest "$manifest" --argjson seconds "$seconds" \
-    --argjson nothingToDo "$nothing_to_do" --argjson template "$template" --argjson exit "$code" \
+    --argjson nothingToDo "$nothing_to_do" --arg template "$template" --argjson exit "$code" \
     '{status:(if $exit == 0 then "installed" else "failed" end), manifest:$manifest,
       reason:(if $exit == 0 then null else "exit \($exit)" end), seconds:$seconds,
       nothingToDo:$nothingToDo, template:$template}' > "$RUN_DIR/install.json"
