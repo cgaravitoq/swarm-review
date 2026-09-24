@@ -1,5 +1,5 @@
 name: swarm-review
-description: Review a pull request with packed Workers AI lanes and publish the confirmed findings as a pull request review.
+description: Review a pull request with Workers AI lanes and publish the confirmed findings as a pull request review.
 
 inputs:
   workers-ai-api-key:
@@ -11,6 +11,9 @@ inputs:
   pull-request:
     description: The pull request to review.
     default: ${{ github.event.issue.number || github.event.pull_request.number }}
+  mode:
+    description: Use sandbox lanes, packed lanes, or choose sandbox except for forks.
+    default: auto
 
 runs:
   using: composite
@@ -19,6 +22,7 @@ runs:
       with:
         path: swarm-review-source
         fetch-depth: 0
+        ref: refs/pull/${{ inputs.pull-request }}/head
 
     - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
       with:
@@ -36,23 +40,8 @@ runs:
         CLOUDFLARE_ACCOUNT_ID: ${{ inputs.cloudflare-account-id }}
         GITHUB_TOKEN: ${{ github.token }}
         PULL_REQUEST: ${{ inputs.pull-request }}
-      run: |
-        if [ -z "$CLOUDFLARE_ACCOUNT_ID" ]; then
-          CLOUDFLARE_ACCOUNT_ID=$(curl -fsS -H "authorization: Bearer $WORKERS_AI_API_KEY" https://api.cloudflare.com/client/v4/accounts \
-            | jq -er 'if (.result | length) == 1 then .result[0].id else error("the key reaches \(.result | length) accounts, not one: pass cloudflare-account-id") end')
-        fi
-        swarm_id="pr-$PULL_REQUEST-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"
-        out="$RUNNER_TEMP/swarm-review"
-        # A partial run still carries what its verifier confirmed, and publish
-        # is what refuses a run that confirmed nothing.
-        bun "$GITHUB_ACTION_PATH/src/swarm.ts" --repo "$GITHUB_REPOSITORY" \
-          --source "$GITHUB_WORKSPACE/swarm-review-source" --pr "$PULL_REQUEST" \
-          --provider cloudflare-workers-ai --model @cf/deepseek-ai/deepseek-v4-flash-0731 \
-          --reviewers 3 --swarm-id "$swarm_id" --out "$out" || true
-        # A pull request that merges while its review runs still gets the
-        # review, posted at the commit the lanes read.
-        bun "$GITHUB_ACTION_PATH/src/publish.ts" --receipt "$out/$swarm_id/swarm-receipt.json" \
-          --repo "$GITHUB_REPOSITORY" --pr "$PULL_REQUEST" --publish --allow-moved-head
+        INPUT_MODE: ${{ inputs.mode }}
+      run: bun "$GITHUB_ACTION_PATH/src/action.ts"
 
     - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
       if: always()

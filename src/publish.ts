@@ -155,6 +155,7 @@ export function parsePublishOptions(argv: string[]) {
     ...(expectedMergeBase ? { expectedMergeBase } : {}),
     publish: argv.includes("--publish"),
     allowMovedHead: argv.includes("--allow-moved-head"),
+    fork: argv.includes("--fork"),
     minSeverity: flag(argv, "min-severity") ?? "P2",
   };
 }
@@ -474,6 +475,7 @@ export function buildReview(
   commentable: Map<string, Set<number>>,
   repo: string,
   minSeverity = "P2",
+  fork = false,
 ) {
   const head = receipt.requested.head;
   const comments: {
@@ -610,6 +612,7 @@ export function buildReview(
       outOfDiff: outOfDiff.length,
     }),
   );
+  if (fork) summary.push("- fork reviewed with packed lanes");
   if (receipt.coverage && receipt.coverage.uncoveredFiles.length > 0) {
     summary.push(
       `- not reviewed: ${receipt.coverage.uncoveredFiles.map((file) => `\`${file}\``).join(", ")}`,
@@ -1283,6 +1286,7 @@ export async function main(
       commentableLines(validated.diff),
       options.repo,
       options.minSeverity,
+      options.fork,
     );
     const payload = githubReviewPayload(built);
     const superseded = supersededReviews(validated.reviews);
