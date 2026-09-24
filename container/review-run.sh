@@ -57,7 +57,7 @@ write_status() {
       detail:$detail, inFlightTool:(if $inFlightTool == "" then null else $inFlightTool end),
       lastEvent:(if $lastEvent == "" then null else $lastEvent end),
       terminalReason:(if $terminalReason == "" then null else $terminalReason end),
-      process:{alive:(if $state == "done" or $state == "cancelled" or $state == "failed" then false else true end), pid:$pid}}' \
+      process:{alive:(if $state == "done" or $state == "cancelled" or $state == "failed" or $state == "blocked" then false else true end), pid:$pid}}' \
     > "$STATUS.tmp"
   mv "$STATUS.tmp" "$STATUS"
 }
@@ -680,7 +680,7 @@ function handlePiEvent(child, rawLine) {
     return;
   }
 
-  if (["agent_start", "turn_start", "message_start", "message_update", "message_end"].includes(event.type)) {
+  if (["agent_start", "turn_start", "message_start", "message_update", "message_end", "tool_execution_update"].includes(event.type)) {
     lastEvent = event.type;
     childIdle = false;
     isStreaming = true;
@@ -763,7 +763,7 @@ function handlePiEvent(child, rawLine) {
       terminalReason = "model_error";
       writeReviewError("model_error", stopReason, errorMessage);
       writeStatus();
-      if (!lastCandidateResult) shutdownBridge(1);
+      if (!lastCandidateResult) shutdownBridge(1, child);
       return;
     }
     writeStatus();
@@ -775,8 +775,6 @@ function handlePiEvent(child, rawLine) {
     lastEvent = "agent_end";
     inFlightTool = null;
     inFlightToolName = "";
-    childIdle = true;
-    isStreaming = false;
     let candidateText = "";
     if (Array.isArray(event.messages)) {
       const assistantMsgs = event.messages.filter(m => m.role === "assistant");
@@ -788,9 +786,42 @@ function handlePiEvent(child, rawLine) {
       }
     }
     lastCandidateResult = candidateText;
+    writeStatus();
+    return;
+  }
+
+  // Automatic work - a retry, overflow recovery, a queued message - can still
+  // follow agent_end and replace the candidate it carried. agent_settled is
+  // pi's own word that none of it is left, so the lane goes idle only there.
+  if (event.type === "agent_settled") {
+    lastEvent = "agent_settled";
+    inFlightTool = null;
+    inFlightToolName = "";
+    childIdle = true;
+    isStreaming = false;
     if (state === "running") {
       state = "idle";
     }
+    writeStatus();
+    return;
+  }
+
+  // The rest of the event table pi 0.85.1 documents for rpc mode. None of
+  // them ends a turn or settles the agent, so each is only the last thing pi
+  // said. The stderr a turn is classified by never hears of them.
+  if ([
+    "bash_execution_update",
+    "queue_update",
+    "compaction_start",
+    "compaction_end",
+    "auto_retry_start",
+    "auto_retry_end",
+    "summarization_retry_scheduled",
+    "summarization_retry_attempt_start",
+    "summarization_retry_finished",
+    "extension_error",
+  ].includes(event.type)) {
+    lastEvent = event.type;
     writeStatus();
     return;
   }
@@ -949,8 +980,12 @@ const server = net.createServer((socket) => {
           socket.write(JSON.stringify({ id: reqId, type: "response", command: "cancel", success: false, error: "missing_or_invalid_reason" }) + "\n");
           continue;
         }
-        state = "cancelled";
-        terminalReason = req.reason || "cancelled";
+        // A driver cancels a failed or blocked review to end it, and the
+        // cancel is not what ended it.
+        if (state !== "failed" && state !== "blocked") {
+          state = "cancelled";
+          terminalReason = req.reason || "cancelled";
+        }
         socket.write(JSON.stringify({
           id: reqId,
           type: "response",
@@ -1091,11 +1126,19 @@ const server = net.createServer((socket) => {
 });
 
 let isShuttingDown = false;
-function shutdownBridge(exitCode) {
+async function shutdownBridge(exitCode, liveChild = null) {
   if (isShuttingDown) return;
   isShuttingDown = true;
   try { server.close(); } catch {}
   try { fs.unlinkSync(sockPath); } catch {}
+  // A bridge that exits ahead of its child leaves a last status calling the
+  // child alive after both are gone, so a child still running goes first.
+  if (liveChild) {
+    if (!(await stopExactChild(liveChild, true))) {
+      detail = "child process-group termination unverified";
+    }
+    writeStatus();
+  }
   setTimeout(() => {
     try { fs.closeSync(rawFd); } catch {}
     try { fs.closeSync(traceFd); } catch {}
@@ -1381,6 +1424,43 @@ do_partial_report() {
   write_report partial "${1:-$(partial_reason)}"
 }
 
+REVIEW_STATE=""
+REVIEW_REASON=""
+
+# How the review itself ended, kept before the steps after it rewrite
+# status.json. The bridge writes a review it never handed back as an answer
+# as failed, blocked or cancelled and then exits; a review step that failed
+# without a word from the bridge failed all the same.
+keep_review_ending() {
+  [ -z "$REVIEW_STATE" ] || return 0
+  if [ "$(jq -r '.phase' "$STATUS" 2>/dev/null)" = review ]; then
+    case "$(jq -r '.state' "$STATUS" 2>/dev/null)" in
+      failed|blocked|cancelled)
+        REVIEW_STATE=$(jq -r '.state' "$STATUS")
+        REVIEW_REASON=$(jq -r '.terminalReason // .state' "$STATUS")
+        return 0
+        ;;
+    esac
+  fi
+  local code
+  code=$(cat "$RUN_DIR/review.exit" 2>/dev/null) || return 0
+  if [ "$code" != 0 ]; then
+    REVIEW_STATE=failed
+    REVIEW_REASON=$(jq -r '.reason // empty' "$REVIEW_ERROR" 2>/dev/null)
+    REVIEW_REASON=${REVIEW_REASON:-exit $code}
+  fi
+}
+
+# The runner's last word, and a failed review is still failed in it.
+write_final_status() {
+  keep_review_ending
+  if [ -n "$REVIEW_STATE" ]; then
+    write_status finished "$REVIEW_STATE" "" "" "" "$REVIEW_REASON"
+  else
+    write_status finished done "" "" "" "completed"
+  fi
+}
+
 # The outer `timeout` cuts this whole process group at the lane's window and
 # gives it 15 s more before the KILL. Writing the report from the handler is
 # what makes a lane cut at its deadline leave evidence instead of nothing.
@@ -1389,7 +1469,7 @@ on_window_spent() {
     write_report partial "$(partial_reason)"
     record report 0 0 "cut at the lane's window"
   fi
-  write_status finished done "" "" "" "completed"
+  write_final_status
   exit 0
 }
 
@@ -1410,6 +1490,7 @@ main() {
   # A review that ended without a report - the provider refused, the cap was
   # reached, the child died - is reported as a cut lane, not as no lane.
   step_soft review do_review
+  keep_review_ending
   step_soft checkout_delta do_checkout_delta
   # Soft on purpose: a lane killed mid-line leaves a truncated raw stream, and
   # a trace that cannot be cut is not a reason to lose the report as well.
@@ -1418,11 +1499,7 @@ main() {
     step_soft report do_report
   fi
   [ -s "$REPORT" ] || step report do_partial_report
-  if ! is_supervised; then
-    write_status finished done
-  else
-    write_status finished done "" "" "" "completed"
-  fi
+  write_final_status
 }
 
 if [ "${BASH_SOURCE[0]}" = "$0" ]; then

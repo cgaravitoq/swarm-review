@@ -9,7 +9,12 @@ import { deployArguments, targetCheckout } from "../../scripts/deploy";
 import { gitCapability } from "../git-proxy";
 import { CONTROL_DIR, MODEL_BROKER, TARGET_UID } from "../isolation";
 import { emptyModelTotals, modelCapability } from "../model-proxy";
-import { MAX_ARTIFACT_BYTES, REVIEW_RUNNER, runDir } from "../protocol";
+import {
+  IMAGE_SOURCES,
+  MAX_ARTIFACT_BYTES,
+  REVIEW_RUNNER,
+  runDir,
+} from "../protocol";
 
 const getSandbox = vi.hoisted(() => vi.fn());
 
@@ -45,6 +50,19 @@ const envWithoutTarget = { ...env, TARGET_REPOSITORY: undefined };
 const sha40 = "a".repeat(40);
 const sha64 = "b".repeat(64);
 
+const expectedSources = (observed: Readonly<Record<string, string>> = {}) => ({
+  ...Object.fromEntries(
+    Object.keys(IMAGE_SOURCES).map((path) => [path, sha64]),
+  ),
+  ...observed,
+});
+
+/** What the fingerprint exec answers: one line per image source, then the versions. */
+const fingerprintStdout = (observed: Readonly<Record<string, string>> = {}) =>
+  `${Object.entries(expectedSources(observed))
+    .map(([path, sha]) => `${sha}  ${path}`)
+    .join("\n")}\npi 0.85.0\n1.4.0\ngit version 2.34.1\n`;
+
 const broker = {
   port: 8317,
   handle: "review-pi-handle",
@@ -63,6 +81,7 @@ const broker = {
 const job = {
   runId: "run",
   expectedRunnerSha: sha64,
+  expectedSources: expectedSources(),
   head: { sha: sha40 },
   base: { sha: sha40 },
   provider: "xai",
@@ -111,9 +130,7 @@ const sandboxForStart = () => {
   getSandbox.mockReturnValue({
     exec: vi.fn((command: string) => {
       if (command.includes("sha256sum")) {
-        return Promise.resolve({
-          stdout: `${sha64}\npi 0.85.0\n1.4.0\ngit version 2.34.1\n`,
-        });
+        return Promise.resolve({ stdout: fingerprintStdout() });
       }
       if (command.includes("/api/execute")) {
         return Promise.resolve({ stdout: "403" });
@@ -152,9 +169,7 @@ const sandboxForProbeStart = (probe: {
   const destroy = vi.fn(() => Promise.resolve());
   const exec = vi.fn((command: string) => {
     if (command.includes("sha256sum")) {
-      return Promise.resolve({
-        stdout: `${sha64}\npi 0.85.0\n1.4.0\ngit version 2.34.1\n`,
-      });
+      return Promise.resolve({ stdout: fingerprintStdout() });
     }
     if (command.includes("/api/execute")) {
       return Promise.resolve({ stdout: probe.status });
@@ -414,7 +429,7 @@ describe("review run lifecycle", () => {
     }
   });
 
-  it("destroys a sandbox rejected by the runner fingerprint gate", async () => {
+  it("destroys a sandbox rejected by the source fingerprint gate", async () => {
     const destroy = vi.fn(() => Promise.resolve());
     getSandbox.mockReturnValue({
       exec: vi.fn(() =>
@@ -434,7 +449,118 @@ describe("review run lifecycle", () => {
     );
 
     expect(response.status).toBe(409);
+    expect(await response.json()).toMatchObject({
+      error: "source_mismatch",
+      file: REVIEW_RUNNER,
+    });
     expect(destroy).toHaveBeenCalledOnce();
+  });
+
+  it("refuses a job whose expectedSources leave out an image source", async () => {
+    const { "/opt/review/response-seal.ts": _omitted, ...incomplete } =
+      job.expectedSources;
+    const response = await handler.fetch(
+      authorized("https://review.invalid/runs", {
+        method: "POST",
+        body: JSON.stringify({
+          job: { ...job, expectedSources: incomplete },
+          broker,
+          modelsJson: JSON.stringify({
+            providers: { xai: { apiKey: "review-pi-handle" } },
+          }),
+        }),
+      }),
+      env,
+    );
+    expect(response.status).toBe(400);
+    expect(await response.json()).toMatchObject({
+      error: "invalid_run",
+      detail: expect.stringContaining("/opt/review/response-seal.ts"),
+    });
+  });
+
+  it("refuses an image whose broker copy differs before any model request", async () => {
+    const startProcess = vi.fn((_command: string) =>
+      Promise.resolve({ id: "review" }),
+    );
+    const putModelSession = vi.fn(() => Promise.resolve());
+    const destroy = vi.fn(() => Promise.resolve());
+    const write = vi.fn((_path: string, _content: string) => Promise.resolve());
+    getSandbox.mockReturnValue({
+      exec: vi.fn((command: string) =>
+        command.includes("sha256sum")
+          ? Promise.resolve({
+              stdout: fingerprintStdout({
+                "/opt/review/model-broker.ts": "c".repeat(64),
+              }),
+            })
+          : Promise.resolve({ stdout: "" }),
+      ),
+      startProcess,
+      putModelSession,
+      destroy,
+      mkdir: vi.fn(() => Promise.resolve()),
+      writeFile: write,
+      getContainerPlacementId: vi.fn(() => Promise.resolve("placement")),
+    });
+
+    const response = await handler.fetch(
+      authorized("https://review.invalid/runs", {
+        method: "POST",
+        body: startBody(),
+      }),
+      env,
+    );
+
+    expect(response.status).toBe(409);
+    expect(await response.json()).toMatchObject({
+      error: "source_mismatch",
+      file: "/opt/review/model-broker.ts",
+    });
+    expect(destroy).toHaveBeenCalledOnce();
+    // Before any model request: no model session armed, no review process, no staged job.
+    expect(putModelSession).not.toHaveBeenCalled();
+    expect(startProcess).not.toHaveBeenCalled();
+    expect(write).not.toHaveBeenCalled();
+  });
+
+  it("refuses an image built from another Dockerfile before any model request", async () => {
+    const exec = vi.fn((command: string) =>
+      command.includes("sha256sum")
+        ? Promise.resolve({
+            stdout: fingerprintStdout({
+              "/opt/review/Dockerfile": "c".repeat(64),
+            }),
+          })
+        : Promise.resolve({ stdout: "" }),
+    );
+    const putModelSession = vi.fn(() => Promise.resolve());
+    const startProcess = vi.fn(() => Promise.resolve({ id: "review" }));
+    getSandbox.mockReturnValue({
+      exec,
+      startProcess,
+      putModelSession,
+      destroy: vi.fn(() => Promise.resolve()),
+    });
+
+    const response = await handler.fetch(
+      authorized("https://review.invalid/runs", {
+        method: "POST",
+        body: startBody(),
+      }),
+      env,
+    );
+
+    expect(response.status).toBe(409);
+    expect(await response.json()).toMatchObject({
+      error: "source_mismatch",
+      file: "/opt/review/Dockerfile",
+      expected: sha64,
+      observed: "c".repeat(64),
+    });
+    expect(exec.mock.calls[0]?.[0]).toContain("/opt/review/Dockerfile");
+    expect(putModelSession).not.toHaveBeenCalled();
+    expect(startProcess).not.toHaveBeenCalled();
   });
 
   it("destroys on explicit stop when artifact retrieval fails", async () => {
@@ -653,7 +779,37 @@ describe("deployed container image", () => {
       ["review-run.sh", REVIEW_RUNNER],
       ["model-broker.ts", MODEL_BROKER],
       ["response-seal.ts", "/opt/review/response-seal.ts"],
+      ["Dockerfile", "/opt/review/Dockerfile"],
     ]);
+  });
+
+  it("compares every file the image is built from, the Dockerfile included", () => {
+    const tracked = spawnSync("git", ["ls-files", "container"], {
+      cwd: packageRoot,
+      encoding: "utf8",
+    })
+      .stdout.split("\n")
+      .filter(Boolean)
+      .map((file) => path.relative("container", file));
+
+    expect(tracked.sort()).toEqual(Object.values(IMAGE_SOURCES).sort());
+  });
+
+  it("pins what the image installs in the Dockerfile's own bytes", async () => {
+    const dockerfile = await readFile(
+      path.join(packageRoot, "container", "Dockerfile"),
+      "utf8",
+    );
+    const manifest = JSON.parse(
+      await readFile(path.join(packageRoot, "package.json"), "utf8"),
+    ) as { dependencies: Record<string, string> };
+
+    // A build argument would move pi, bun or the base without moving the
+    // bytes the gate compares.
+    expect(dockerfile).not.toMatch(/^\s*ARG\s/m);
+    expect(dockerfile).toContain(
+      `FROM docker.io/cloudflare/sandbox:${manifest.dependencies["@cloudflare/sandbox"]} AS bun`,
+    );
   });
 
   it("keeps the generated bake context out of git", () => {
