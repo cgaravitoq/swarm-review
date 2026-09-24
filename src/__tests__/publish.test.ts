@@ -1061,6 +1061,18 @@ describe("a run that publishes no review", () => {
     return receiptPath;
   };
 
+  /** The artifact of a run that died before `swarm.ts` could write a receipt. */
+  const artifactWithoutReceipt = async (failure?: {
+    stage: string;
+    message: string;
+  }) => {
+    const suiteDir = await artifactDirectory();
+    if (failure) {
+      await writeFile(join(suiteDir, "failure.json"), JSON.stringify(failure));
+    }
+    return join(suiteDir, "swarm-receipt.json");
+  };
+
   const commentUrl =
     /^https:\/\/api\.github\.com\/repos\/acme\/demo\/issues\/comments\/(\d+)$/;
 
@@ -1232,6 +1244,36 @@ describe("a run that publishes no review", () => {
           (init as RequestInit | undefined)?.method === "POST",
       ),
     ).toHaveLength(1);
+  });
+
+  it("comments the stage and message the action recorded when no receipt was written", async () => {
+    const api = github();
+    const receiptPath = await artifactWithoutReceipt({
+      stage: "image build",
+      message: "docker build failed: exec /bin/sh: exec format error",
+    });
+
+    await expect(publish(receiptPath)).rejects.toThrow(
+      "image build: docker build failed: exec /bin/sh: exec format error",
+    );
+
+    expect(process.exitCode).toBe(1);
+    expect(api.comments).toHaveLength(1);
+    const body = api.comments[0]?.body ?? "";
+    expect(body).toContain(
+      "`image build: docker build failed: exec /bin/sh: exec format error`",
+    );
+    expect(body).not.toContain("ENOENT");
+  });
+
+  it("keeps the ENOENT when neither a receipt nor a failure was written", async () => {
+    const api = github();
+    const receiptPath = await artifactWithoutReceipt();
+
+    await expect(publish(receiptPath)).rejects.toThrow("ENOENT");
+
+    expect(api.comments).toHaveLength(1);
+    expect(api.comments[0]?.body).toContain("ENOENT");
   });
 
   it("tells an unreadable status.json from one that was never written", async () => {

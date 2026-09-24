@@ -983,6 +983,35 @@ export async function lanePhases(artifactRoot: string): Promise<LanePhase[]> {
   return phases.sort((a, b) => a.runId.localeCompare(b.runId));
 }
 
+/**
+ * The failure the action wrote beside the receipt it never produced.
+ *
+ * A run that dies before `swarm.ts` runs leaves nothing to publish and an
+ * ENOENT that says only which file is missing; the stage and the message the
+ * action recorded say which step died and why.
+ */
+const runFailure = async (
+  artifactRoot: string,
+): Promise<{ stage: string; message: string } | null> => {
+  const raw = await readFile(join(artifactRoot, "failure.json"), "utf8").catch(
+    () => null,
+  );
+  if (raw === null) return null;
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(raw);
+  } catch {
+    return null;
+  }
+  if (typeof parsed !== "object" || parsed === null) return null;
+  const record = parsed as Record<string, unknown>;
+  const stage = record["stage"];
+  const message = record["message"];
+  return typeof stage === "string" && typeof message === "string"
+    ? { stage, message }
+    : null;
+};
+
 /** One lane as the comment names it. */
 export type RefusalLane = {
   lane: string;
@@ -1357,6 +1386,10 @@ export async function main(
     // Publishing is opt-in, and so is the report: a dry run leaves the pull
     // request as it found it. The job fails either way.
     process.exitCode = 1;
+    const failure = receipt === null ? await runFailure(artifactRoot) : null;
+    const reported = failure
+      ? new Error(`${failure.stage}: ${failure.message}`)
+      : error;
     if (options.publish) {
       await reportRefusal({
         run,
@@ -1365,10 +1398,10 @@ export async function main(
         token,
         receipt,
         artifactRoot,
-        error,
+        error: reported,
       });
     }
-    throw error;
+    throw reported;
   }
 }
 
