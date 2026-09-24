@@ -40,6 +40,25 @@ const listen = (server: Server) =>
 const close = (server: Server) =>
   new Promise<void>((resolve) => server.close(() => resolve()));
 
+/** What each request the broker takes ends in: null, or what its handler threw. */
+const handlerEnds = (server: Server) => {
+  const handle = server.listeners("request")[0] as (
+    request: IncomingMessage,
+    response: ServerResponse,
+  ) => Promise<void>;
+  const ends: Promise<unknown>[] = [];
+  server.removeAllListeners("request");
+  server.on("request", (request, response) => {
+    ends.push(
+      handle(request, response).then(
+        () => null,
+        (error: unknown) => error,
+      ),
+    );
+  });
+  return ends;
+};
+
 describe("model broker", () => {
   let upstream: Server;
   let broker: Server;
@@ -321,17 +340,7 @@ describe("model broker", () => {
       caps,
       ledgerPath: ledger,
     });
-    const [handle] = server.listeners("request") as ((
-      request: IncomingMessage,
-      response: ServerResponse,
-    ) => Promise<void>)[];
-    const failures: unknown[] = [];
-    server.removeAllListeners("request");
-    server.on("request", (request, response) => {
-      handle?.(request, response).catch((error: unknown) => {
-        failures.push(error);
-      });
-    });
+    const ends = handlerEnds(server);
     const port = await listen(server);
 
     const response = await fetch(`http://127.0.0.1:${port}/messages`, {
@@ -340,9 +349,7 @@ describe("model broker", () => {
       body: "{}",
     });
     const text = await response.text();
-    await vi.waitFor(() => {
-      expect(failures).toHaveLength(1);
-    });
+    const failures = await Promise.all(ends);
     await close(server);
     await close(provider);
     await rm(endScratch, { recursive: true, force: true });
