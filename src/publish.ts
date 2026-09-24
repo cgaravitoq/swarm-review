@@ -1007,6 +1007,7 @@ const REFUSAL_REASON_LIMIT = 400;
 export const refusalReason = (error: unknown) => {
   const text = (error instanceof Error ? error.message : String(error))
     .replaceAll("`", "'")
+    .replaceAll("<", "‹")
     .replace(/\s+/g, " ")
     .trim();
   return text.length <= REFUSAL_REASON_LIMIT
@@ -1015,11 +1016,13 @@ export const refusalReason = (error: unknown) => {
 };
 
 /**
- * A status.json field in a table cell. The lane's own file is target-writable
- * inside its container, so nothing from it reaches the comment verbatim.
+ * A lane-written field as a code span in a table cell. The lane's own file is
+ * target-writable inside its container, so nothing from it reaches the comment
+ * as markup or as another run's marker. The cut comes before the escape so it
+ * cannot split an escaped pipe.
  */
 const statusCell = (text: string) =>
-  cell(text.replaceAll("`", "'")).slice(0, 80);
+  `\`${cell(text.slice(0, 80).replaceAll("`", "'").replaceAll("<", "‹"))}\``;
 
 /**
  * What a run that published no review leaves behind: the refusal, the phase
@@ -1043,7 +1046,7 @@ export const refusalCommentBody = (input: {
           "| --- | --- | --- |",
           ...input.lanes.map(
             (lane) =>
-              `| \`${statusCell(lane.lane)}\` | ${statusCell(lane.status)} | ${lane.phase ? `\`${statusCell(lane.phase.phase)}\` ${statusCell(lane.phase.state)}` : "no status.json"} |`,
+              `| ${statusCell(lane.lane)} | ${statusCell(lane.status)} | ${lane.phase ? `${statusCell(lane.phase.phase)} ${statusCell(lane.phase.state)}` : "no status.json"} |`,
           ),
         ]),
     "",
@@ -1109,7 +1112,7 @@ export async function upsertRefusalComment(input: {
   const marker = refusalMarker(input.runId);
   const existing = (
     await fetchIssueComments(input.repo, input.pullRequest, input.token)
-  ).find((comment) => (comment.body ?? "").includes(marker));
+  ).find((comment) => (comment.body ?? "").startsWith(`${marker}\n`));
   if (existing) {
     await updateIssueComment(input.repo, existing.id, input.token, input.body);
     return "edited" as const;

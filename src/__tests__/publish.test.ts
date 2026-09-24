@@ -16,6 +16,7 @@ import {
   publicationDisposition,
   REVIEW_EVENT,
   REVIEW_SIDE,
+  refusalReason,
   revalidatePullRequest,
   reviewScore,
   type SwarmReceipt,
@@ -1161,7 +1162,7 @@ describe("a run that publishes no review", () => {
     expect(body).toContain(
       "publication requires a completed or partial review",
     );
-    expect(body).toContain("`install` failed");
+    expect(body).toContain("`install` `failed`");
     expect(body).toContain(runUrl);
     expect(
       api.fetchMock.mock.calls.filter(
@@ -1222,6 +1223,73 @@ describe("a run that publishes no review", () => {
     await expect(
       updateIssueComment("acme/demo", 99, "token", "body"),
     ).rejects.toThrow("GitHub comment update failed: 404");
+  });
+
+  it("keeps a marker a lane wrote from claiming another run's comment", async () => {
+    const api = github();
+    const receiptPath = await artifact(failed(), [
+      {
+        runId: "swarm-1-reviewer-1",
+        phase: `install ${marker}`,
+        state: `failed ${marker}`,
+      },
+    ]);
+    const lane = { ...env, GITHUB_RUN_ID: "777" };
+
+    await expect(publish(receiptPath, lane)).rejects.toThrow(
+      "publication requires a completed or partial review",
+    );
+    const planted = api.comments[0]?.body ?? "";
+    await expect(publish(receiptPath)).rejects.toThrow(
+      "publication requires a completed or partial review",
+    );
+
+    expect(planted).not.toContain(marker);
+    expect(api.comments.map((comment) => comment.body.split("\n")[0])).toEqual([
+      "<!-- swarm-review:run:777 -->",
+      marker,
+    ]);
+    expect(api.comments[0]?.body).toBe(planted);
+    expect(
+      issueRequests(api.fetchMock).filter(
+        ([, init]) => (init as RequestInit | undefined)?.method === "PATCH",
+      ),
+    ).toHaveLength(0);
+  });
+
+  it("renders every lane-written field as inert text", async () => {
+    const api = github();
+    const image = "![x](https://evil.example/t.png) [d](https://evil.example)";
+    const long = `${"a".repeat(79)}|tail`;
+    const swarm = failed();
+    swarm.lanes = [
+      ...(swarm.lanes ?? []),
+      {
+        laneId: "reviewer-2",
+        runId: "swarm-1-reviewer-2",
+        role: "reviewer",
+        model: "@cf/deepseek-ai/deepseek-v4-flash-0731",
+        status: "failed",
+      },
+    ];
+    const receiptPath = await artifact(swarm, [
+      { runId: "swarm-1-reviewer-1", phase: "install", state: image },
+      { runId: "swarm-1-reviewer-2", phase: "install", state: long },
+    ]);
+
+    await expect(publish(receiptPath)).rejects.toThrow(
+      "publication requires a completed or partial review",
+    );
+
+    const body = api.comments[0]?.body ?? "";
+    expect(body).toContain(`| \`install\` \`${image}\` |`);
+    expect(body).toContain(`| \`install\` \`${"a".repeat(79)}\\|\` |`);
+  });
+
+  it("keeps a refusal from carrying a comment marker", () => {
+    expect(refusalReason(new Error(`no receipt ${marker}`))).not.toContain(
+      "<!--",
+    );
   });
 
   it("leaves the pull request alone on a dry run", async () => {
