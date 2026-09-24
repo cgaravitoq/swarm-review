@@ -1,4 +1,8 @@
+import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
+import { preparationFailureReceipt } from "../attempt";
 import {
   alreadyPublished,
   assertPublishableReceipt,
@@ -8,15 +12,19 @@ import {
   findingBody,
   githubReviewPayload,
   headline,
+  main,
   parsePublishOptions,
   publicationDisposition,
   REVIEW_EVENT,
   REVIEW_SIDE,
+  refusalReason,
   revalidatePullRequest,
+  reviewMarker,
   reviewScore,
   type SwarmReceipt,
   supersededBody,
   supersededReviews,
+  updateIssueComment,
   updateReviewBody,
 } from "../publish";
 
@@ -975,5 +983,534 @@ describe("existing reviews", () => {
     expect(upstream).toHaveBeenCalledTimes(2);
     expect(String(upstream.mock.calls[0]?.[0])).toContain("per_page=100");
     expect(alreadyPublished(reviews, "swarm-1", "abc")).toBe(true);
+  });
+});
+
+describe("a run that publishes no review", () => {
+  const head = "a".repeat(40);
+  const base = "c".repeat(40);
+  const later = "b".repeat(40);
+  const env = {
+    GITHUB_TOKEN: "token",
+    GITHUB_RUN_ID: "4242",
+    GITHUB_SERVER_URL: "https://github.com",
+    GITHUB_REPOSITORY: "acme/demo",
+  };
+  const runUrl = "https://github.com/acme/demo/actions/runs/4242";
+  const marker = "<!-- swarm-review:run:4242 -->";
+  const directories: string[] = [];
+
+  afterEach(async () => {
+    vi.unstubAllGlobals();
+    process.exitCode = 0;
+    for (const directory of directories.splice(0)) {
+      await rm(directory, { recursive: true, force: true });
+    }
+  });
+
+  const publish = (
+    receiptPath: string,
+    runEnv: Record<string, string | undefined> = env,
+    flags = ["--publish"],
+  ) =>
+    main(
+      ["--receipt", receiptPath, "--repo", "acme/demo", "--pr", "7", ...flags],
+      runEnv,
+    );
+
+  const issueRequests = (fetchMock: ReturnType<typeof vi.fn>) =>
+    fetchMock.mock.calls.filter(([url]) => String(url).includes("/issues/"));
+
+  const artifact = async (
+    swarm: SwarmReceipt | ReturnType<typeof preparationFailureReceipt>,
+    phases: { runId: string; phase: string; state: string }[] = [],
+  ) => {
+    const directory = await mkdtemp(join(tmpdir(), "review-pi-refusal-"));
+    directories.push(directory);
+    const suiteDir = join(directory, "swarm-1");
+    await mkdir(suiteDir, { recursive: true });
+    const receiptPath = join(suiteDir, "swarm-receipt.json");
+    await writeFile(receiptPath, JSON.stringify(swarm));
+    for (const phase of phases) {
+      await mkdir(join(suiteDir, phase.runId), { recursive: true });
+      await writeFile(
+        join(suiteDir, phase.runId, "status.json"),
+        JSON.stringify(phase),
+      );
+    }
+    return receiptPath;
+  };
+
+  const commentUrl =
+    /^https:\/\/api\.github\.com\/repos\/acme\/demo\/issues\/comments\/(\d+)$/;
+
+  const commentBody = (init?: RequestInit) => {
+    const parsed = JSON.parse(String(init?.body)) as unknown;
+    return typeof parsed === "object" &&
+      parsed !== null &&
+      Object.keys(parsed).join() === "body" &&
+      typeof (parsed as { body: unknown }).body === "string"
+      ? (parsed as { body: string }).body
+      : null;
+  };
+
+  const bot = "github-actions[bot]";
+
+  type Comment = { id: number; user: { login: string }; body: string };
+
+  const github = ({
+    moved = false,
+    seeded = [] as Comment[],
+    editable = true,
+    reviews = [] as { id: number; body: string }[],
+  } = {}) => {
+    const comments: Comment[] = [...seeded];
+    const fetchMock = vi.fn(async (url: string, init?: RequestInit) => {
+      const method = init?.method ?? "GET";
+      const accept = String(
+        (init?.headers as Record<string, string> | undefined)?.["accept"] ?? "",
+      );
+      if (url === "https://api.github.com/graphql") {
+        return Response.json(
+          { data: { viewer: { login: bot } } },
+          { status: 200 },
+        );
+      }
+      if (url.includes("/issues/comments/")) {
+        const id = Number(commentUrl.exec(url)?.[1]);
+        const comment = comments.find((entry) => entry.id === id);
+        const body = method === "PATCH" ? commentBody(init) : null;
+        if (!comment || body === null) {
+          return Response.json({ message: "Not Found" }, { status: 404 });
+        }
+        if (!editable || comment.user.login !== bot) {
+          return Response.json({ message: "Forbidden" }, { status: 403 });
+        }
+        comment.body = body;
+        return Response.json(comment, { status: 200 });
+      }
+      if (url.includes("/issues/7/comments")) {
+        if (method !== "POST") return Response.json(comments, { status: 200 });
+        const body = commentBody(init);
+        if (
+          url !== "https://api.github.com/repos/acme/demo/issues/7/comments" ||
+          body === null
+        ) {
+          return Response.json({ message: "Not Found" }, { status: 404 });
+        }
+        const comment = { id: comments.length + 1, user: { login: bot }, body };
+        comments.push(comment);
+        return Response.json(comment, { status: 201 });
+      }
+      if (url.includes("/pulls/7/reviews")) {
+        return method === "POST"
+          ? Response.json(
+              {
+                id: 9,
+                html_url:
+                  "https://github.com/acme/demo/pull/7#pullrequestreview-9",
+              },
+              { status: 201 },
+            )
+          : Response.json(reviews, { status: 200 });
+      }
+      if (url.endsWith("/pulls/7")) {
+        return Response.json(
+          {
+            state: "open",
+            draft: false,
+            merged: false,
+            head: { sha: moved ? later : head },
+            base: { sha: base },
+          },
+          { status: 200 },
+        );
+      }
+      if (accept.includes("diff")) return new Response(diff, { status: 200 });
+      if (url.includes(`/compare/${head}...${later}`)) {
+        return Response.json(
+          { status: moved ? "diverged" : "ahead" },
+          { status: 200 },
+        );
+      }
+      return Response.json(
+        { merge_base_commit: { sha: base } },
+        { status: 200 },
+      );
+    });
+    vi.stubGlobal("fetch", fetchMock);
+    return { fetchMock, comments };
+  };
+
+  const failed = (): SwarmReceipt => ({
+    swarmId: "swarm-1",
+    status: "failed",
+    requested: { head, base, pullRequest: 7 },
+    findings: [],
+    lanes: [
+      {
+        laneId: "reviewer-1",
+        runId: "swarm-1-reviewer-1",
+        role: "reviewer",
+        model: "@cf/deepseek-ai/deepseek-v4-flash-0731",
+        status: "failed",
+      },
+    ],
+  });
+
+  const completed = (): SwarmReceipt => ({
+    swarmId: "swarm-1",
+    status: "completed",
+    requested: { head, base, pullRequest: 7 },
+    findings: [],
+  });
+
+  it("comments the refusal and the phase the run died in, and still fails", async () => {
+    const api = github();
+    const receiptPath = await artifact(failed(), [
+      { runId: "swarm-1-reviewer-1", phase: "install", state: "failed" },
+    ]);
+
+    await expect(publish(receiptPath)).rejects.toThrow(
+      "publication requires a completed or partial review",
+    );
+
+    expect(process.exitCode).toBe(1);
+    expect(api.comments).toHaveLength(1);
+    const body = api.comments[0]?.body ?? "";
+    expect(body).toContain(marker);
+    expect(body).toContain(
+      "publication requires a completed or partial review",
+    );
+    expect(body).toContain("`install` `failed`");
+    expect(body).toContain(runUrl);
+    expect(
+      api.fetchMock.mock.calls.filter(
+        ([url, init]) =>
+          String(url).includes("/pulls/7") &&
+          (init as RequestInit | undefined)?.method === "POST",
+      ),
+    ).toHaveLength(0);
+  });
+
+  it("posts no comment when the receipt publishes a review", async () => {
+    const api = github();
+    const receiptPath = await artifact(completed());
+
+    await expect(publish(receiptPath)).resolves.toBeUndefined();
+
+    expect(api.comments).toEqual([]);
+    expect(
+      api.fetchMock.mock.calls.some(([url]) =>
+        String(url).includes("/issues/"),
+      ),
+    ).toBe(false);
+    expect(
+      api.fetchMock.mock.calls.filter(
+        ([url, init]) =>
+          String(url).includes("/pulls/7/reviews") &&
+          (init as RequestInit | undefined)?.method === "POST",
+      ),
+    ).toHaveLength(1);
+  });
+
+  it("keeps one comment per run id and edits it on a re-run", async () => {
+    const api = github();
+    const receiptPath = await artifact(failed());
+    const other = { ...env, GITHUB_RUN_ID: "5151" };
+
+    for (const runEnv of [env, other, env, other]) {
+      await expect(publish(receiptPath, runEnv)).rejects.toThrow(
+        "publication requires a completed or partial review",
+      );
+    }
+
+    expect(api.comments.map((comment) => comment.body.split("\n")[0])).toEqual([
+      marker,
+      "<!-- swarm-review:run:5151 -->",
+    ]);
+    const methods = issueRequests(api.fetchMock).map(
+      ([, init]) => (init as RequestInit | undefined)?.method ?? "GET",
+    );
+    expect(methods.filter((method) => method === "POST")).toHaveLength(2);
+    const edits = issueRequests(api.fetchMock).filter(
+      ([, init]) => (init as RequestInit | undefined)?.method === "PATCH",
+    );
+    expect(edits.map(([url]) => url)).toEqual([
+      "https://api.github.com/repos/acme/demo/issues/comments/1",
+      "https://api.github.com/repos/acme/demo/issues/comments/2",
+    ]);
+    await expect(
+      updateIssueComment("acme/demo", 99, "token", "body"),
+    ).rejects.toThrow("GitHub comment update failed: 404");
+  });
+
+  it("keeps a marker a lane wrote from claiming another run's comment", async () => {
+    const api = github();
+    const receiptPath = await artifact(failed(), [
+      {
+        runId: "swarm-1-reviewer-1",
+        phase: `install ${marker}`,
+        state: `failed ${marker}`,
+      },
+    ]);
+    const lane = { ...env, GITHUB_RUN_ID: "777" };
+
+    await expect(publish(receiptPath, lane)).rejects.toThrow(
+      "publication requires a completed or partial review",
+    );
+    const planted = api.comments[0]?.body ?? "";
+    await expect(publish(receiptPath)).rejects.toThrow(
+      "publication requires a completed or partial review",
+    );
+
+    expect(planted).not.toContain(marker);
+    expect(api.comments.map((comment) => comment.body.split("\n")[0])).toEqual([
+      "<!-- swarm-review:run:777 -->",
+      marker,
+    ]);
+    expect(api.comments[0]?.body).toBe(planted);
+    expect(
+      issueRequests(api.fetchMock).filter(
+        ([, init]) => (init as RequestInit | undefined)?.method === "PATCH",
+      ),
+    ).toHaveLength(0);
+  });
+
+  it("renders every lane-written field as inert text", async () => {
+    const api = github();
+    const image = "![x](https://evil.example/t.png) [d](https://evil.example)";
+    const long = `${"a".repeat(79)}|tail`;
+    const swarm = failed();
+    swarm.lanes = [
+      ...(swarm.lanes ?? []),
+      {
+        laneId: "reviewer-2",
+        runId: "swarm-1-reviewer-2",
+        role: "reviewer",
+        model: "@cf/deepseek-ai/deepseek-v4-flash-0731",
+        status: "failed",
+      },
+    ];
+    const receiptPath = await artifact(swarm, [
+      { runId: "swarm-1-reviewer-1", phase: "install", state: image },
+      { runId: "swarm-1-reviewer-2", phase: "install", state: long },
+    ]);
+
+    await expect(publish(receiptPath)).rejects.toThrow(
+      "publication requires a completed or partial review",
+    );
+
+    const body = api.comments[0]?.body ?? "";
+    expect(body).toContain(`| \`install\` \`${image}\` |`);
+    expect(body).toContain(`| \`install\` \`${"a".repeat(79)}\\|\` |`);
+  });
+
+  it("keeps a refusal from carrying a comment marker", () => {
+    expect(refusalReason(new Error(`no receipt ${marker}`))).not.toContain(
+      "<!--",
+    );
+  });
+
+  it("posts its own comment beside another author's that carries its marker", async () => {
+    const forged = {
+      id: 50,
+      user: { login: "mallory" },
+      body: `${marker}\n\nforged`,
+    };
+    const api = github({ seeded: [{ ...forged }] });
+    const receiptPath = await artifact(failed());
+
+    await expect(publish(receiptPath)).rejects.toThrow(
+      "publication requires a completed or partial review",
+    );
+
+    expect(api.comments[0]).toEqual(forged);
+    expect(api.comments.slice(1)).toMatchObject([
+      {
+        user: { login: bot },
+        body: expect.stringMatching(/^<!-- swarm-review:run:4242 -->\n/),
+      },
+    ]);
+    expect(
+      api.fetchMock.mock.calls.filter(([url]) =>
+        String(url).includes("/issues/comments/"),
+      ),
+    ).toHaveLength(0);
+  });
+
+  it("claims only a comment its marker opens", async () => {
+    const quoting = {
+      id: 50,
+      user: { login: bot },
+      body: `a note quoting ${marker}\nnothing more`,
+    };
+    const api = github({ seeded: [{ ...quoting }] });
+    const receiptPath = await artifact(failed());
+
+    await expect(publish(receiptPath)).rejects.toThrow(
+      "publication requires a completed or partial review",
+    );
+
+    expect(api.comments[0]).toEqual(quoting);
+    expect(api.comments.slice(1)).toMatchObject([
+      {
+        user: { login: bot },
+        body: expect.stringMatching(/^<!-- swarm-review:run:4242 -->\n/),
+      },
+    ]);
+  });
+
+  it("posts a fresh comment when its own comment refuses the edit", async () => {
+    const own = { id: 50, user: { login: bot }, body: `${marker}\n\nold` };
+    const api = github({ seeded: [{ ...own }], editable: false });
+    const receiptPath = await artifact(failed());
+
+    await expect(publish(receiptPath)).rejects.toThrow(
+      "publication requires a completed or partial review",
+    );
+
+    expect(api.comments[0]).toEqual(own);
+    expect(api.comments.slice(1)).toMatchObject([
+      {
+        user: { login: bot },
+        body: expect.stringContaining(
+          "publication requires a completed or partial review",
+        ),
+      },
+    ]);
+  });
+
+  it("keeps the refusal when the receipt's lanes cannot be read", async () => {
+    const api = github();
+    const receiptPath = await artifact({
+      ...failed(),
+      lanes: [null as never],
+    });
+
+    await expect(publish(receiptPath)).rejects.toThrow(
+      "publication requires a completed or partial review",
+    );
+
+    expect(process.exitCode).toBe(1);
+    expect(api.comments).toEqual([]);
+  });
+
+  it("leaves the pull request alone on a dry run", async () => {
+    const api = github();
+    const receiptPath = await artifact(failed());
+
+    await expect(publish(receiptPath, env, [])).rejects.toThrow(
+      "publication requires a completed or partial review",
+    );
+
+    expect(process.exitCode).toBe(1);
+    expect(api.comments).toEqual([]);
+    expect(issueRequests(api.fetchMock)).toHaveLength(0);
+  });
+
+  it("posts no comment without a workflow run to name", async () => {
+    const api = github();
+    const receiptPath = await artifact(failed());
+    const { GITHUB_RUN_ID: _, ...anonymous } = env;
+    const errors = vi.spyOn(console, "error").mockImplementation(() => {});
+
+    await expect(publish(receiptPath, anonymous)).rejects.toThrow(
+      "publication requires a completed or partial review",
+    );
+
+    expect(errors).not.toHaveBeenCalled();
+    errors.mockRestore();
+    expect(process.exitCode).toBe(1);
+    expect(api.comments).toEqual([]);
+    expect(issueRequests(api.fetchMock)).toHaveLength(0);
+  });
+
+  const preparationFailed = (message: string) =>
+    preparationFailureReceipt(
+      { attemptId: "attempt-1", startedAt: Date.now(), path: "attempt.json" },
+      "object-fetch",
+      new Error(message),
+      {
+        swarmId: "swarm-1",
+        requested: { head: null, base: null, pullRequest: 7 },
+      },
+    );
+
+  it("comments the failure of a run that never reached its lanes", async () => {
+    const api = github();
+    const receiptPath = await artifact(
+      preparationFailed("git fetch exited 128: repository not found"),
+    );
+
+    await expect(publish(receiptPath)).rejects.toThrow(
+      "object-fetch: git fetch exited 128: repository not found",
+    );
+
+    expect(process.exitCode).toBe(1);
+    expect(
+      issueRequests(api.fetchMock).filter(
+        ([url, init]) =>
+          url === "https://api.github.com/repos/acme/demo/issues/7/comments" &&
+          (init as RequestInit | undefined)?.method === "POST",
+      ),
+    ).toHaveLength(1);
+    expect(api.comments).toHaveLength(1);
+    expect(api.comments[0]?.body.split("\n")[2]).toBe(
+      "**swarm-review published no review.** `object-fetch: git fetch exited 128: repository not found`",
+    );
+  });
+
+  it("renders a preparation failure's message as inert text", async () => {
+    const api = github();
+    const receiptPath = await artifact(
+      preparationFailed(`bad \`ref\` ${marker}`),
+    );
+
+    await expect(publish(receiptPath)).rejects.toThrow("object-fetch: bad");
+
+    const reason = api.comments[0]?.body.split("\n")[2] ?? "";
+    expect(reason).toContain(
+      "object-fetch: bad 'ref' ‹!-- swarm-review:run:4242 --",
+    );
+    expect(reason).not.toContain("<!--");
+    expect(reason.match(/`/g)).toHaveLength(2);
+  });
+
+  it("fails without a review or a comment when this run's review is already published", async () => {
+    const api = github({
+      reviews: [
+        { id: 3, body: `${reviewMarker("swarm-1", head)}\nearlier review` },
+      ],
+    });
+    const receiptPath = await artifact(completed());
+    const errors = vi.spyOn(console, "error").mockImplementation(() => {});
+
+    await expect(publish(receiptPath)).resolves.toBeUndefined();
+
+    errors.mockRestore();
+    expect(process.exitCode).toBe(1);
+    expect(
+      api.fetchMock.mock.calls.filter(
+        ([url, init]) =>
+          String(url).includes("/pulls/7/reviews") &&
+          (init as RequestInit | undefined)?.method === "POST",
+      ),
+    ).toHaveLength(0);
+    expect(issueRequests(api.fetchMock)).toHaveLength(0);
+  });
+
+  it("comments a head that moved off the frozen SHA", async () => {
+    const api = github({ moved: true });
+    const receiptPath = await artifact(completed());
+
+    await expect(publish(receiptPath)).rejects.toThrow(
+      "pull request head moved off the frozen SHA",
+    );
+
+    expect(api.comments).toHaveLength(1);
+    const body = api.comments[0]?.body ?? "";
+    expect(body).toContain("pull request head moved off the frozen SHA");
+    expect(body).toContain(runUrl);
   });
 });
