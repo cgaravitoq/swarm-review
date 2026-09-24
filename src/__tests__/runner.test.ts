@@ -1320,7 +1320,7 @@ process.stdin.on("data", (chunk) => {
             messages: [],
           }) + "\\n");
           process.stdout.write(JSON.stringify({ type: "agent_settled" }) + "\\n");
-          setTimeout(() => process.exit(1), 10);
+          setTimeout(() => process.exit(1), Number(process.env.PI_EXIT_DELAY_MS || 10));
         }, 30);
       } else if (cmd.message.includes("active descendant")) {
         const descendant = spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)"], {
@@ -2494,29 +2494,38 @@ process.stdin.on("data", (chunk) => {
       quota.runnerProc.kill();
     }
 
-    const modelError = await prepareSupervisedRun(
-      "model-error-exit",
-      "model error then exit",
-    );
-    try {
-      expect(await waitForExit(modelError.runnerProc)).toBe(1);
-      const status = JSON.parse(
-        await readFile(join(modelError.root, "status.json"), "utf8"),
+    // pi exits 10 ms after its error turn, or a second after it. The bridge
+    // exits 100 ms after it decides to, so the slow child is the order in
+    // which a bridge that did not wait for it left alive: true behind; the
+    // margin keeps that order under a loaded event loop.
+    for (const exitDelay of ["10", "1000"]) {
+      const modelError = await prepareSupervisedRun(
+        "model-error-exit",
+        "model error then exit",
+        "openai-codex",
+        {},
+        { PI_EXIT_DELAY_MS: exitDelay },
       );
-      expect(status).toMatchObject({
-        state: "failed",
-        terminalReason: "model_error",
-        process: { alive: false },
-      });
-      const evidence = JSON.parse(
-        await readFile(join(modelError.root, "review-error.json"), "utf8"),
-      );
-      expect(evidence).toMatchObject({
-        reason: "model_error",
-        errorMessage: "provider model error",
-      });
-    } finally {
-      modelError.runnerProc.kill();
+      try {
+        expect(await waitForExit(modelError.runnerProc)).toBe(1);
+        const status = JSON.parse(
+          await readFile(join(modelError.root, "status.json"), "utf8"),
+        );
+        expect(status, `pi exits after ${exitDelay} ms`).toMatchObject({
+          state: "failed",
+          terminalReason: "model_error",
+          process: { alive: false },
+        });
+        const evidence = JSON.parse(
+          await readFile(join(modelError.root, "review-error.json"), "utf8"),
+        );
+        expect(evidence).toMatchObject({
+          reason: "model_error",
+          errorMessage: "provider model error",
+        });
+      } finally {
+        modelError.runnerProc.kill();
+      }
     }
   });
 
