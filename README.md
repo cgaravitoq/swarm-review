@@ -55,7 +55,7 @@ The action pulls the image tagged from its container sources and the pull reques
 A run acknowledges itself in that pull request.
 The `comment-id` input defaults to `github.event.comment.id`, and the action's first step reacts with an eyes reaction to that comment, which the calling workflow grants with `issues: write`; a run with no comment to acknowledge, such as a scheduled one, skips it.
 Once the mode is chosen the action opens one status comment for the run and links the run's artifact page.
-Publishing is its own step and runs whatever the review step did, so the same comment ends naming the outcome: the submitted review when there is one, and the stage the run died in when there is not.
+Publishing is its own step and runs whatever the review step did: a submitted review deletes the run's comment, and a run with no review turns it into the stage the run died in.
 
 ## A Claude Code subscription lane
 

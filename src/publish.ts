@@ -7,8 +7,8 @@
  * out of the review as out-of-diff, and unverified and rejected candidates stay
  * in the receipt. Comments attach to the GitHub three-dot diff
  * (merge-base...head) on side RIGHT at the frozen head SHA. The GitHub
- * credential stays on the host. Publishing is opt-in, and a published or
- * refused run replaces the comment it opened with the outcome.
+ * credential stays on the host. Publishing is opt-in; a published run deletes
+ * the comment it opened and a refused one turns it into the refusal.
  */
 
 import { readdir, readFile } from "node:fs/promises";
@@ -792,7 +792,7 @@ export const fetchReviews = (
   pullRequest: number,
   token: string,
 ) =>
-  githubPages<{ id: number; html_url: string; body?: string | null }>(
+  githubPages<{ id: number; body?: string | null }>(
     `/repos/${repo}/pulls/${pullRequest}/reviews`,
     "reviews",
     token,
@@ -1157,25 +1157,6 @@ export const runningCommentBody = (input: {
     `[Run artifact](${input.url})`,
   ].join("\n");
 
-/**
- * What the run's comment says once its review is on the pull request.
- *
- * A run that ends with a review replaces the line that says it is still
- * working, so no comment is left claiming a run that already finished.
- */
-export const publishedCommentBody = (input: {
-  runId: string;
-  url: string;
-  reviewUrl: string;
-}) =>
-  [
-    runMarker(input.runId),
-    "",
-    `**swarm-review published a review.** [Read it](${input.reviewUrl})`,
-    "",
-    `[Run artifact](${input.url})`,
-  ].join("\n");
-
 export async function postIssueComment(
   repo: string,
   pullRequest: number,
@@ -1228,6 +1209,25 @@ export async function updateIssueComment(
  * The login the token acts as. REST's `/user` refuses an installation token,
  * while GraphQL's viewer answers for it and for a personal token alike.
  */
+export async function deleteIssueComment(
+  repo: string,
+  commentId: number,
+  token: string,
+) {
+  const response = await fetch(
+    `https://api.github.com/repos/${repo}/issues/comments/${commentId}`,
+    {
+      method: "DELETE",
+      headers: githubHeaders(token, "application/vnd.github+json"),
+    },
+  );
+  if (!response.ok) {
+    throw new Error(
+      `GitHub comment delete failed: ${response.status}: ${await response.text()}`,
+    );
+  }
+}
+
 export async function fetchViewerLogin(token: string) {
   const response = await fetch("https://api.github.com/graphql", {
     method: "POST",
@@ -1248,20 +1248,17 @@ export async function fetchViewerLogin(token: string) {
 }
 
 /**
- * Every comment this run opened, edited in place; one posted when none was.
+ * Every comment this run opened.
  *
- * Only a comment the token's identity wrote can be edited, so one carrying the
- * marker under another author is not this run's. A re-run of the same run id
- * keeps the attempt it replaced, so every comment the run opened is edited and
- * none is left claiming a run that already ended. An edit that still fails
- * leaves a fresh comment rather than none.
+ * Only a comment the token's identity wrote is the run's, so one carrying the
+ * marker under another author is left alone. A re-run of the same run id keeps
+ * the attempts it replaced, so there can be more than one.
  */
-export async function upsertRunComment(input: {
+async function runComments(input: {
   repo: string;
   pullRequest: number;
   token: string;
   runId: string;
-  body: string;
 }) {
   const marker = runMarker(input.runId);
   const viewer = await fetchViewerLogin(input.token).catch((error: unknown) => {
@@ -1270,7 +1267,7 @@ export async function upsertRunComment(input: {
     );
     return null;
   });
-  const existing = (
+  return (
     await fetchIssueComments(input.repo, input.pullRequest, input.token)
   ).filter(
     (comment) =>
@@ -1278,18 +1275,54 @@ export async function upsertRunComment(input: {
       comment.user?.login === viewer &&
       (comment.body ?? "").startsWith(`${marker}\n`),
   );
-  let edited = false;
-  for (const comment of existing) {
-    try {
-      await updateIssueComment(input.repo, comment.id, input.token, input.body);
-      edited = true;
-    } catch (error: unknown) {
-      console.error(
-        `run comment ${comment.id} not edited: ${error instanceof Error ? error.message : String(error)}`,
-      );
-    }
+}
+
+async function deleteRunComment(
+  repo: string,
+  commentId: number,
+  token: string,
+) {
+  try {
+    await deleteIssueComment(repo, commentId, token);
+  } catch (error: unknown) {
+    console.error(
+      `run comment ${commentId} not deleted: ${error instanceof Error ? error.message : String(error)}`,
+    );
   }
-  if (edited) return "edited" as const;
+}
+
+/**
+ * Leaves the run exactly one comment: the first of its own that takes the
+ * edit, every other one deleted, and one posted when none took it.
+ */
+export async function upsertRunComment(input: {
+  repo: string;
+  pullRequest: number;
+  token: string;
+  runId: string;
+  body: string;
+}) {
+  let kept = false;
+  for (const comment of await runComments(input)) {
+    if (!kept) {
+      try {
+        await updateIssueComment(
+          input.repo,
+          comment.id,
+          input.token,
+          input.body,
+        );
+        kept = true;
+        continue;
+      } catch (error: unknown) {
+        console.error(
+          `run comment ${comment.id} not edited: ${error instanceof Error ? error.message : String(error)}`,
+        );
+      }
+    }
+    await deleteRunComment(input.repo, comment.id, input.token);
+  }
+  if (kept) return "edited" as const;
   await postIssueComment(
     input.repo,
     input.pullRequest,
@@ -1342,37 +1375,29 @@ async function reportRefusal(input: {
 }
 
 /**
- * Names the published review on the comment the run opened, best effort.
- *
- * The review is already on the pull request by now, so a comment that cannot
- * be written is logged and never disturbs it.
+ * Deletes every comment the run opened once its review is on the pull
+ * request, best effort: the review is the answer, and a comment that cannot
+ * be deleted is logged and never disturbs it.
  */
-async function reportPublished(input: {
+async function clearRunComments(input: {
   run: RunIdentity | null;
   repo: string;
-  pullRequest: number | null;
-  token: string | null;
-  reviewUrl: string;
+  pullRequest: number;
+  token: string;
 }) {
-  if (!input.run || input.pullRequest === null || input.token === null) return;
+  if (!input.run) return;
   try {
-    const outcome = await upsertRunComment({
+    for (const comment of await runComments({
       repo: input.repo,
       pullRequest: input.pullRequest,
       token: input.token,
       runId: input.run.runId,
-      body: publishedCommentBody({
-        runId: input.run.runId,
-        url: input.run.url,
-        reviewUrl: input.reviewUrl,
-      }),
-    });
-    console.log(
-      `review comment ${outcome} on ${input.repo}#${input.pullRequest}`,
-    );
+    })) {
+      await deleteRunComment(input.repo, comment.id, input.token);
+    }
   } catch (error: unknown) {
     console.error(
-      `published review not reported: ${error instanceof Error ? error.message : String(error)}`,
+      `run comments not cleared: ${error instanceof Error ? error.message : String(error)}`,
     );
   }
 }
@@ -1429,22 +1454,17 @@ export async function main(
     );
     if (alreadyPublished(validated.reviews, receipt.swarmId, expected.head)) {
       // This run's review is on the pull request, so there is no refusal to
-      // report; the job fails as it did before, and the comment this run
-      // opened says where the review is rather than that it is still coming.
+      // report; the job fails as it did before, and the comments this run
+      // opened go as they would after its own publish.
       console.error(
         "a review for this run and SHA is already on the pull request",
       );
-      const marker = reviewMarker(receipt.swarmId, expected.head);
-      const earlier = validated.reviews.find((review) =>
-        (review.body ?? "").includes(marker),
-      );
-      if (earlier && options.publish) {
-        await reportPublished({
+      if (options.publish) {
+        await clearRunComments({
           run,
           repo: options.repo,
           pullRequest,
           token,
-          reviewUrl: earlier.html_url,
         });
       }
       process.exitCode = 1;
@@ -1489,13 +1509,7 @@ export async function main(
     }
     const posted = await postReview(options.repo, pullRequest, token, payload);
     console.log(posted.html_url);
-    await reportPublished({
-      run,
-      repo: options.repo,
-      pullRequest,
-      token,
-      reviewUrl: posted.html_url,
-    });
+    await clearRunComments({ run, repo: options.repo, pullRequest, token });
     for (const review of superseded) {
       try {
         await updateReviewBody(
