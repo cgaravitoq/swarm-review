@@ -9,7 +9,7 @@ import {
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { main } from "../action";
 import { imageReference, imageTagFromFiles } from "../image-tag";
 
@@ -17,6 +17,7 @@ const packageRoot = join(dirname(fileURLToPath(import.meta.url)), "../..");
 const roots: string[] = [];
 
 afterEach(async () => {
+  vi.restoreAllMocks();
   for (const root of roots.splice(0)) {
     await rm(root, { recursive: true, force: true });
   }
@@ -40,7 +41,7 @@ async function arrange(headRepo: string, pullSucceeds: boolean) {
   );
   await writeFile(
     join(bin, "bun"),
-    '#!/bin/sh\nprintf "bun %s\\n" "$*" >> "$ACTION_LOG"\nif [ "$1" = "$ACTION_ROOT/src/swarm.ts" ]; then printf "%s\\0" "$@" > "$ACTION_ARGS"; [ "$ACTION_FAIL" = swarm ] && exit 1; fi\nif [ "$2" = "$ACTION_ROOT/scripts/deploy.ts" ] && [ "$ACTION_FAIL" = deploy ]; then exit 1; fi\nexit 0\n',
+    '#!/bin/sh\nprintf "bun %s\\n" "$*" >> "$ACTION_LOG"\nif [ "$1" = "$ACTION_ROOT/src/swarm.ts" ]; then printf "%s\\0" "$@" > "$ACTION_ARGS"; [ "$ACTION_FAIL" = swarm ] && exit 1; fi\nif [ "$2" = "$ACTION_ROOT/scripts/deploy.ts" ] && [ "$ACTION_FAIL" = deploy ]; then printf "exec /bin/sh: exec format error\\ndocker build exited with code 1\\n" >&2; exit 1; fi\nexit 0\n',
   );
   for (const name of ["gh", "docker", "bun"]) {
     await chmod(join(bin, name), 0o755);
@@ -68,6 +69,13 @@ async function arrange(headRepo: string, pullSucceeds: boolean) {
       (await readFile(env.ACTION_LOG, "utf8")).trim().split("\n"),
     swarmArgs: async () =>
       (await readFile(env.ACTION_ARGS, "utf8")).split("\0").slice(0, -1),
+    failure: async () =>
+      JSON.parse(
+        await readFile(
+          join(env.RUNNER_TEMP, "swarm-review", "pr-42-123-1", "failure.json"),
+          "utf8",
+        ),
+      ) as { stage: string; message: string },
   };
 }
 
@@ -207,6 +215,10 @@ describe("composite action driver", () => {
     expect(log.at(-1)).toBe(
       `bun ${packageRoot}/src/publish.ts --receipt ${fixture.env.RUNNER_TEMP}/swarm-review/pr-42-123-1/swarm-receipt.json --repo acme/demo --pr 42 --publish --allow-moved-head`,
     );
+    expect(await fixture.failure()).toEqual({
+      stage: "registry login",
+      message: "docker login exited with code 2",
+    });
   });
 
   it("publishes when the missing image fails to build", async () => {
@@ -221,6 +233,31 @@ describe("composite action driver", () => {
     expect(log.some((line) => line.startsWith("docker push "))).toBe(false);
     expect(log.some((line) => line.includes("src/swarm.ts"))).toBe(false);
     expect(log.at(-1)).toBe(
+      `bun ${packageRoot}/src/publish.ts --receipt ${fixture.env.RUNNER_TEMP}/swarm-review/pr-42-123-1/swarm-receipt.json --repo acme/demo --pr 42 --publish --allow-moved-head`,
+    );
+    expect(await fixture.failure()).toEqual({
+      stage: "image build",
+      message: "docker build exited with code 1",
+    });
+  });
+
+  it("publishes when the failure file cannot be written", async () => {
+    const fixture = await arrange("acme/demo", false);
+    const failurePath = join(
+      fixture.env.RUNNER_TEMP,
+      "swarm-review",
+      "pr-42-123-1",
+      "failure.json",
+    );
+    await mkdir(failurePath, { recursive: true });
+    const logged = vi.spyOn(console, "error").mockImplementation(() => {});
+    await expect(
+      main({ ...fixture.env, INPUT_MODE: "sandbox", ACTION_FAIL: "deploy" }),
+    ).resolves.toBeUndefined();
+    expect(logged).toHaveBeenCalledWith(
+      expect.objectContaining({ code: "EISDIR", path: failurePath }),
+    );
+    expect((await fixture.log()).at(-1)).toBe(
       `bun ${packageRoot}/src/publish.ts --receipt ${fixture.env.RUNNER_TEMP}/swarm-review/pr-42-123-1/swarm-receipt.json --repo acme/demo --pr 42 --publish --allow-moved-head`,
     );
   });
