@@ -36,6 +36,7 @@ import {
   parseOptions,
   planBroker,
   prepareTransport,
+  RUN_DEADLINE_GRACE_SECONDS,
   readLaneReceipt,
   readLocalReceipt,
   redactArgs,
@@ -186,11 +187,15 @@ const revision = (format: string) => {
 };
 
 // A stalled run has to end through its own receipt, which names the phase that
-// hung, before vitest gives up on the test: the run budget, then the teardown's
-// own budget, then a margin for the receipt write.
+// hung, before vitest gives up on the test: the run's deadline, then the
+// teardown's own budget, then a margin for the receipt write.
 const RUN_BUDGET_SECONDS = 20;
 const LIFECYCLE_TEST_TIMEOUT_MS =
-  (RUN_BUDGET_SECONDS + TEARDOWN_BUDGET_SECONDS + 10) * 1000;
+  (RUN_BUDGET_SECONDS +
+    RUN_DEADLINE_GRACE_SECONDS +
+    TEARDOWN_BUDGET_SECONDS +
+    10) *
+  1000;
 
 const localArguments = (out: string, runId: string) => [
   localScript,
@@ -1926,6 +1931,51 @@ describe("public local CLI lifecycle", {
       outcome: "failed",
       error: "run failed at finished: model_error",
     });
+  });
+
+  it("ends a lane whose status file says done forever at the run's deadline", async () => {
+    // The 402 hang: the bridge was gone, the runner's last word was done, and
+    // the driver never believes a done it did not hear from the bridge.
+    const root = await mkdtemp(join(tmpdir(), "review-pi-cli-"));
+    temporaryDirectories.push(root);
+    const arranged = await arrangeFakeDocker(root);
+    const runId = "done-forever";
+    const out = join(root, "out");
+    const totalSeconds = 8;
+    const startedAt = Date.now();
+
+    const result = await runLocalCli(
+      [...localArguments(out, runId).slice(0, -1), String(totalSeconds)],
+      {
+        ...fakeEnvironment(arranged, runId, "success"),
+        FAKE_BRIDGE: "unavailable",
+        FAKE_PREPARATION_STATUS: JSON.stringify({
+          runId,
+          phase: "finished",
+          state: "done",
+          detail: "",
+          terminalReason: "completed",
+          process: { alive: false, pid: 50 },
+        }),
+      },
+    );
+
+    const elapsedSeconds = (Date.now() - startedAt) / 1000;
+    const deadlineSeconds = totalSeconds + RUN_DEADLINE_GRACE_SECONDS;
+    expect(result.code, result.output).toBe(1);
+    expect(elapsedSeconds).toBeGreaterThanOrEqual(deadlineSeconds);
+    expect(elapsedSeconds).toBeLessThan(deadlineSeconds + 15);
+    await expect(readLocalReceipt(join(out, runId))).resolves.toMatchObject({
+      outcome: "failed",
+      error: `run deadline exceeded after ${deadlineSeconds} s`,
+    });
+    const dockerLog = await readFile(
+      join(arranged.state, "docker.log"),
+      "utf8",
+    );
+    expect(dockerLog).toContain(
+      `rm --force --volumes review-pi-local-${runId}`,
+    );
   });
 
   it("refuses an image whose broker copy differs before the review ever starts", async () => {
