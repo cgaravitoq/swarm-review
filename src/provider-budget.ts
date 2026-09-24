@@ -263,10 +263,18 @@ export type LedgerEntry = {
 
 /** Actual provider activity as the broker recorded it, never as Pi reported it. */
 export function readLedgerUsage(ledger: string) {
-  const entries = ledger
-    .split("\n")
-    .filter(Boolean)
-    .map((line) => JSON.parse(line) as LedgerEntry);
+  const lines = ledger.split("\n").filter(Boolean);
+  const entries = lines.flatMap((line) => {
+    try {
+      return [JSON.parse(line) as LedgerEntry];
+    } catch {
+      // A broker killed mid-append leaves one torn line, as the swarm's seal
+      // reader knows: the lines before it still stand, and what it recorded
+      // is lost, not zero.
+      return [];
+    }
+  });
+  const torn = entries.length < lines.length;
   const last = [...entries]
     .reverse()
     .find((entry) => entry.totals !== undefined);
@@ -275,13 +283,21 @@ export function readLedgerUsage(ledger: string) {
     retries: last?.totals?.retries ?? 0,
     inputTokens: last?.totals?.input ?? 0,
     outputTokens: last?.totals?.output ?? 0,
-    denials: entries.filter((entry) => entry.event === "denied").length,
+    denials: torn
+      ? null
+      : entries.filter((entry) => entry.event === "denied").length,
     // A request the broker admitted and never saw end: its slot is counted and
     // its usage was never observed, so the count is the only field that can
     // say the row's totals are missing one request's worth of tokens. Every
     // admission writes totals, so a ledger without them admitted nothing, and
-    // totals from a broker that predates the count never observed it.
-    unended: last === undefined ? 0 : (last.totals?.unended ?? null),
+    // totals from a broker that predates the count never observed it. A torn
+    // line may have been an admission no whole line counted, so a ledger that
+    // lost one cannot say how many requests never ended.
+    unended: torn
+      ? null
+      : last === undefined
+        ? 0
+        : (last.totals?.unended ?? null),
     // The ended requests whose response never reported that side: the token
     // sums above are short by these, read the same way as `unended`.
     inputUnobserved:

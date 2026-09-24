@@ -2054,6 +2054,71 @@ describe("public local CLI lifecycle", {
     expect(receipt.modelRequests).toBe(1);
   });
 
+  it("reads a ledger a killed broker tore mid-append, leaving what it lost unobserved", async () => {
+    const root = await mkdtemp(join(tmpdir(), "review-pi-cli-"));
+    temporaryDirectories.push(root);
+    const arranged = await arrangeFakeDocker(root);
+    const totals = (overrides: Record<string, number>) => ({
+      requests: 1,
+      retries: 0,
+      input: 0,
+      output: 0,
+      unended: 1,
+      inputUnobserved: 0,
+      outputUnobserved: 0,
+      ...overrides,
+    });
+    // The second admission was cut mid-append: it may have admitted a request
+    // the whole lines never counted, or been a denial nobody counted either.
+    const torn = JSON.stringify({
+      event: "provider_admitted",
+      attemptId: 2,
+      attempt: 0,
+      totals: totals({ requests: 2, input: 111, output: 222 }),
+    }).slice(0, 48);
+    await writeFile(
+      join(arranged.container, "provider-usage.jsonl"),
+      [
+        JSON.stringify({ event: "broker_start" }),
+        JSON.stringify({
+          event: "provider_admitted",
+          attemptId: 1,
+          attempt: 0,
+          totals: totals({}),
+        }),
+        JSON.stringify({
+          event: "provider_request",
+          attemptId: 1,
+          status: 200,
+          usage: { input: 111, output: 222 },
+          totals: totals({ input: 111, output: 222, unended: 0 }),
+        }),
+        torn,
+      ].join("\n"),
+    );
+    const runId = "torn-ledger-lane";
+    const out = join(root, "out");
+
+    const result = await runLocalCli(
+      localArguments(out, runId),
+      fakeEnvironment(arranged, runId, "success"),
+    );
+    const receipt = await readLocalReceipt(join(out, runId));
+
+    expect(result.code, result.output).toBe(0);
+    expect(receipt.usage).toEqual({
+      requests: 1,
+      retries: 0,
+      inputTokens: 111,
+      outputTokens: 222,
+      denials: null,
+      unended: null,
+      inputUnobserved: 0,
+      outputUnobserved: 0,
+    });
+    expect(receipt.modelRequests).toBe(1);
+  });
+
   it("removes staged OAuth after a review-start failure", async () => {
     const root = await mkdtemp(join(tmpdir(), "review-pi-cli-"));
     temporaryDirectories.push(root);
