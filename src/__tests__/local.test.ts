@@ -444,6 +444,13 @@ if [[ "$1" == "exec" && "\${@: -2:1}" == "cat" ]]; then
     printf '%s\\n' "\${FAKE_PREPARATION_STATUS}"
     exit 0
   fi
+  if [[ -n "\${FAKE_STATUS_SEQUENCE:-}" && "\${@: -1}" == *"/status.json" ]]; then
+    reads=0
+    [[ -f "$state/status-reads" ]] && reads=$(cat "$state/status-reads")
+    echo $(( reads + 1 )) > "$state/status-reads"
+    jq -c --argjson i "$reads" '.[[$i, length - 1] | min]' <<< "\${FAKE_STATUS_SEQUENCE}"
+    exit 0
+  fi
   target=$(printf '%s' "\${@: -1}" | /usr/bin/sed "s#/workspace/runs/\${FAKE_RUN_ID:?}#$root#g")
   /bin/cat "$target" 2>/dev/null
   exit $?
@@ -1850,6 +1857,75 @@ describe("public local CLI lifecycle", {
     );
     expect(receipt).not.toContain('"outcome": "cancelled"');
     expect(receipt).not.toContain("interrupted");
+  });
+
+  it("ends a lane blocked when its bridge is gone and the runner says blocked", async () => {
+    const root = await mkdtemp(join(tmpdir(), "review-pi-cli-"));
+    temporaryDirectories.push(root);
+    const arranged = await arrangeFakeDocker(root);
+    const runId = "quota-blocked";
+    const out = join(root, "out");
+    const startedAt = Date.now();
+
+    const result = await runLocalCli(localArguments(out, runId), {
+      ...fakeEnvironment(arranged, runId, "success"),
+      FAKE_BRIDGE: "unavailable",
+      FAKE_PREPARATION_STATUS: JSON.stringify({
+        runId,
+        phase: "finished",
+        state: "blocked",
+        detail: "",
+        terminalReason: "quota_blocked",
+        process: { alive: false, pid: 50 },
+      }),
+    });
+
+    expect(result.code, result.output).toBe(1);
+    expect(Date.now() - startedAt).toBeLessThan(30_000);
+    await expect(readLocalReceipt(join(out, runId))).resolves.toMatchObject({
+      outcome: "blocked",
+      error: "run blocked at finished: quota_blocked",
+    });
+  });
+
+  it("ends a failed review on the runner's last word once the bridge is gone", async () => {
+    // The 402 lane: the bridge wrote the review failed and exited, and the
+    // runner went on to write the evidence of that failure before its own
+    // last word. Ending on the bridge's word would tear the container down
+    // under the partial report.
+    const root = await mkdtemp(join(tmpdir(), "review-pi-cli-"));
+    temporaryDirectories.push(root);
+    const arranged = await arrangeFakeDocker(root);
+    const runId = "model-error";
+    const out = join(root, "out");
+    const failed = (phase: string) => ({
+      runId,
+      phase,
+      state: "failed",
+      detail: "",
+      terminalReason: "model_error",
+      process: { alive: false, pid: 50 },
+    });
+
+    const result = await runLocalCli(localArguments(out, runId), {
+      ...fakeEnvironment(arranged, runId, "success"),
+      FAKE_BRIDGE: "unavailable",
+      FAKE_STATUS_SEQUENCE: JSON.stringify([
+        failed("review"),
+        failed("review"),
+        failed("finished"),
+      ]),
+    });
+
+    expect(result.code, result.output).toBe(1);
+    expect(result.output).toContain("review/failed");
+    expect(
+      Number(await readFile(join(arranged.state, "status-reads"), "utf8")),
+    ).toBeGreaterThanOrEqual(3);
+    await expect(readLocalReceipt(join(out, runId))).resolves.toMatchObject({
+      outcome: "failed",
+      error: "run failed at finished: model_error",
+    });
   });
 
   it("refuses an image whose broker copy differs before the review ever starts", async () => {
