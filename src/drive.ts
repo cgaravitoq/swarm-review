@@ -24,6 +24,8 @@ import {
   parseCandidateIds,
   parseSingleVerdict,
   planBroker,
+  RUN_DEADLINE_GRACE_SECONDS,
+  readImageSources,
   resolveRunCredentials,
   targetProviderEnv,
 } from "./local";
@@ -513,6 +515,13 @@ export async function driveUntilComplete(input: {
   while (input.now() < input.deadline) {
     state = await input.poll();
     const completion = controlPlaneCompletion(state, input.requested);
+    // A failed review writes its partial report on the way out too, so a
+    // runner gone with a report behind it is only a completion when the review
+    // itself did not fail.
+    const failure = accepted ? undefined : promptFailure(state);
+    if (failure && completion.processesObserved && !completion.reviewAlive) {
+      throw new Error(failure);
+    }
     if (completion.reportOk && !completion.reviewAlive) return state;
     if (!briefed && input.brief) {
       const brief = await input.brief();
@@ -612,15 +621,16 @@ export async function driveUntilComplete(input: {
         }
       }
     }
-    const blocked = promptFailure(state);
-    if (blocked && !accepted) {
+    if (failure && !accepted) {
       // A refusal from the provider is terminal, but the container still holds
       // the work the lane reached and writes it down once it is told to stop.
       // Destroying the sandbox on the first observation is how a lane cut by
       // its request cap ends with no report at all.
       if (!cancelled) {
-        cancelled = { reason: blocked, at: input.now() };
-        await input.send({ type: "cancel" });
+        cancelled = { reason: failure, at: input.now() };
+        // A review that failed closes its own bridge, so the cancel can find
+        // nothing listening, and that is not what ended the lane.
+        await input.send({ type: "cancel" }).catch(() => undefined);
       } else if (input.now() - cancelled.at >= REPORT_GRACE_MS) {
         throw new Error(cancelled.reason);
       }
@@ -702,7 +712,7 @@ export const brokerCaps = (
   ),
 });
 
-async function main() {
+export async function main() {
   const token = githubToken();
   const secret = process.env.REVIEW_PI_CONTROL_SECRET ?? required("secret");
   const runId = assertRunId(argument("run-id") ?? mintRunId("run"));
@@ -807,6 +817,7 @@ async function main() {
   const job: ReviewJob = {
     runId,
     expectedRunnerSha: createHash("sha256").update(runner).digest("hex"),
+    expectedSources: await readImageSources(join(packageRoot, "container")),
     head,
     base,
     ...(Object.keys(targetEnv).length > 0 ? { targetEnv } : {}),
@@ -902,7 +913,9 @@ async function main() {
       );
       if (canary) return started;
 
-      const deadline = startedAt + job.totalTimeoutSeconds * 1000 + 60_000;
+      const deadline =
+        startedAt +
+        (job.totalTimeoutSeconds + RUN_DEADLINE_GRACE_SECONDS) * 1000;
       state = await driveUntilComplete({
         requested: { head: head.sha, base: base.sha },
         role,

@@ -9,12 +9,14 @@
 # the Worker and the control server baked into this image speak a versioned
 # protocol and a mismatch fails at runtime, not at build time.
 #
+# Every version here is a literal, never a build argument. A lane compares this
+# file's own bytes with the host's copy before its first model request, and a
+# `--build-arg` would change what the image installs without changing them.
+#
 # The base (Ubuntu 22.04) already ships git, curl, jq, unzip, procps and the
 # control server on port 3000; its ENTRYPOINT/CMD/EXPOSE are left alone because
 # overriding them detaches the container from the SDK.
-ARG SANDBOX_VERSION=0.12.9
-
-FROM docker.io/cloudflare/sandbox:${SANDBOX_VERSION} AS bun
+FROM docker.io/cloudflare/sandbox:0.12.9 AS bun
 
 # The base boots warm code-interpreter pools for an API no route here calls.
 # Six Node processes racing a monorepo install for the container's CPU is pure
@@ -25,14 +27,12 @@ ENV JAVASCRIPT_POOL_MIN_SIZE=0 \
 
 # Pinned to the repository's own packageManager version: a review that installs
 # with a different Bun is not a review of what CI builds.
-ARG BUN_VERSION=1.4.0
-
 ENV BUN_INSTALL=/usr/local/bun
 ENV PATH=/usr/local/bun/bin:$PATH \
     BUN_INSTALL_CACHE_DIR=/opt/review/bun-cache
 
-RUN curl -fsSL https://bun.sh/install | bash -s "bun-v${BUN_VERSION}" \
-  && bun --version | grep -qx "${BUN_VERSION}"
+RUN curl -fsSL https://bun.sh/install | bash -s "bun-v1.4.0" \
+  && bun --version | grep -qx "1.4.0"
 
 # The build context also carries the runner, the broker and the models, so a
 # `COPY .` would key the bake on their content. Copying only the generated
@@ -46,12 +46,10 @@ RUN cd /opt/review/lockfile \
 
 FROM bun
 
-ARG PI_VERSION=0.85.1
-
 ENV PI_CODING_AGENT_DIR=/opt/review/pi-config
 
-RUN npm install -g "@earendil-works/pi-coding-agent@${PI_VERSION}" \
-  && pi --version | grep -qx "${PI_VERSION}"
+RUN npm install -g "@earendil-works/pi-coding-agent@0.85.1" \
+  && pi --version | grep -qx "0.85.1"
 
 # The review prompt asks for `rg`; the base image has no ripgrep, so every
 # search silently degraded to repeated grep/find sweeps of the whole monorepo.
@@ -72,12 +70,10 @@ RUN apt-get update \
 #
 # The build asserts the module the provider file imports is still published: a
 # version that moves it must fail here, not mid-review.
-ARG CLAUDE_CODE_AUTH_VERSION=2.5.2
-
 RUN mkdir -p /opt/review/extensions \
   && cd /opt/review/extensions \
   && npm install --no-audit --no-fund --ignore-scripts --legacy-peer-deps \
-    "@cgaravitoq/pi-claude-code-auth@${CLAUDE_CODE_AUTH_VERSION}" \
+    "@cgaravitoq/pi-claude-code-auth@2.5.2" \
   && test -f node_modules/@cgaravitoq/pi-claude-code-auth/src/anthropic-stream.ts
 
 # The provider seam: registered with the extension's stream and with neither a
@@ -118,6 +114,11 @@ COPY response-seal.ts /opt/review/response-seal.ts
 COPY response-usage.ts /opt/review/response-usage.ts
 RUN chmod 0755 /opt/review/model-broker.ts
 
-# Last, so a runner or broker edit reuses every layer above it. The install runs
-# as `review-target`, and Bun writes into its cache while linking.
+# Last but for the recipe itself, so a runner or broker edit reuses every layer
+# above it. The install runs as `review-target`, and Bun writes into its cache
+# while linking.
 COPY --from=bun-cache --chown=1102:1102 /opt/review/bun-cache /opt/review/bun-cache
+
+# The recipe itself, so a lane can tell an image built from another one - an
+# older pi, a missing tool, another uid - by comparing it with the host's.
+COPY Dockerfile /opt/review/Dockerfile

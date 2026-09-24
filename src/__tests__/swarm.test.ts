@@ -24,6 +24,7 @@ import { FINALIZE_REQUEST_RESERVE } from "../drive";
 import { CANARY_PROMPT } from "../fast-review";
 import { TEARDOWN_BUDGET_SECONDS } from "../local";
 import { wholeChangeFits } from "../pack-context";
+import { IMAGE_SOURCES } from "../protocol";
 import { SESSION_CAPS } from "../provider-budget";
 import {
   applyVerdicts,
@@ -96,9 +97,16 @@ await cp(
   join(packageRoot, "package.json"),
   join(workspaceRoot, "agents/review-pi/package.json"),
 );
-const runnerSha = createHash("sha256")
-  .update(readFileSync(join(packageRoot, "container/review-run.sh")))
-  .digest("hex");
+const imageSources = JSON.stringify(
+  Object.fromEntries(
+    Object.entries(IMAGE_SOURCES).map(([path, name]) => [
+      path,
+      createHash("sha256")
+        .update(readFileSync(join(packageRoot, "container", name)))
+        .digest("hex"),
+    ]),
+  ),
+);
 
 const commit = (repo: string, message: string) =>
   execFileSync("git", [
@@ -2302,9 +2310,9 @@ if [[ "$joined" == *"cat /opt/review/pi-config/models.json"* ]]; then
   printf '{"providers":{"cloudflare-workers-ai":{"modelOverrides":{"@cf/deepseek-ai/deepseek-v4-flash-0731":{"contextWindow":1048576}}}}}\\n'
   exit 0
 fi
+if [[ "$joined" == *" sha256sum "* ]]; then jq -r 'to_entries[] | "\\(.value)  \\(.key)"' <<< "\${FAKE_IMAGE_SOURCES:?}"; exit 0; fi
 if [[ "$1" == "cp" || "$joined" == *" /opt/review/pi-config/models.json "* || "$joined" == *" mkdir -p "* || "$joined" == *" chmod "* || "$joined" == *" chown "* ]]; then exit 0; fi
 if [[ "$joined" == *" id -u; id -g "* ]]; then printf '1000\\n1000\\n'; exit 0; fi
-if [[ "$joined" == *" sha256sum "* ]]; then echo "\${FAKE_RUNNER_SHA:?}"; exit 0; fi
 if [[ "$joined" == *" --detach "* ]]; then
   rundir=$(printf '%s' "$joined" | grep -o '/workspace/runs/[A-Za-z0-9._-]*' | head -1)
   runid="\${rundir##*/}"
@@ -2538,7 +2546,7 @@ exec /usr/bin/git "$@"
         FAKE_REPORTS: reports,
         FAKE_FORGED: forged,
         FAKE_MODE: mode,
-        FAKE_RUNNER_SHA: runnerSha,
+        FAKE_IMAGE_SOURCES: imageSources,
         PI_CODING_AGENT_DIR: piAuthDir,
         GROK_AUTH_DIR: grokAuthDir,
         WORKERS_AI_API_KEY: "swarm-test-secret",

@@ -40,7 +40,16 @@ import {
   publicModelUsage,
   reserveAttempt,
 } from "./src/model-proxy";
-import { MAX_ARTIFACT_BYTES, REVIEW_RUNNER, runDir } from "./src/protocol";
+import {
+  firstSourceMismatch,
+  MAX_ARTIFACT_BYTES,
+  parseExpectedSources,
+  parseSourceFingerprint,
+  REVIEW_RUNNER,
+  runDir,
+  sourceFingerprintCommand,
+  sourceMismatchDetail,
+} from "./src/protocol";
 
 const MODEL_SESSION_KEY = "modelSession";
 const MODEL_SEALS_KEY = "modelSeals";
@@ -316,41 +325,53 @@ export default {
         );
       }
       let parsed: ReturnType<typeof parseCloudRunRequest>;
+      let expectedSources: Record<string, string>;
       try {
-        parsed = parseCloudRunRequest(await request.json());
+        const body: unknown = await request.json();
+        parsed = parseCloudRunRequest(body);
+        expectedSources = parseExpectedSources(
+          (body as { job?: { expectedSources?: unknown } }).job
+            ?.expectedSources,
+        );
       } catch (error) {
         return json({ error: "invalid_run", detail: messageOf(error) }, 400);
       }
       const job = {
         ...parsed.job,
+        expectedSources,
         gitRemote: `${url.origin}/git/${await gitCapability(parsed.job.runId, env.CONTROL_SECRET)}`,
       };
       const sandbox = getSandbox(env.REVIEW_SANDBOX, job.runId);
       const directory = runDir(job.runId);
       try {
         const fingerprint = await bounded(
-          "runner fingerprint",
+          "source fingerprint",
           sandbox.exec(
-            `sha256sum ${REVIEW_RUNNER} | cut -d" " -f1; pi --version; bun --version; git --version`,
+            `${sourceFingerprintCommand()}; pi --version; bun --version; git --version`,
           ),
         );
-        const [
-          runnerSha = "",
-          piVersion = "",
-          bunVersion = "",
-          gitVersion = "",
-        ] = fingerprint.stdout.trim().split("\n");
-        if (runnerSha !== job.expectedRunnerSha) {
+        const { sources: observedSources, versions } = parseSourceFingerprint(
+          fingerprint.stdout,
+        );
+        const [piVersion = "", bunVersion = "", gitVersion = ""] = versions;
+        const mismatch = firstSourceMismatch(
+          job.expectedSources,
+          observedSources,
+        );
+        if (mismatch) {
           return json(
             {
-              error: "runner_mismatch",
-              expected: job.expectedRunnerSha,
-              containerRunnerSha: runnerSha,
+              error: "source_mismatch",
+              file: mismatch.file,
+              expected: mismatch.expected,
+              observed: mismatch.observed,
+              detail: sourceMismatchDetail(mismatch),
               shutdown: { destroy: await destroySandbox(sandbox) },
             },
             409,
           );
         }
+        const runnerSha = observedSources[REVIEW_RUNNER] ?? "";
         await bounded(
           "model session",
           sandbox.putModelSession({

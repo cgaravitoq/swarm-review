@@ -25,6 +25,7 @@ import {
 } from "node:fs/promises";
 import { homedir, tmpdir } from "node:os";
 import { basename, dirname, join } from "node:path";
+import { StringDecoder } from "node:string_decoder";
 import { setTimeout as sleep } from "node:timers/promises";
 import { fileURLToPath } from "node:url";
 import { forceRefreshClaudeCodeCreds } from "@cgaravitoq/claude-code-core";
@@ -42,7 +43,16 @@ import {
   RUN_ID_PATTERN,
   TARGET_UID,
 } from "./isolation";
-import { MAX_ARTIFACT_BYTES, REVIEW_RUNNER, type ReviewJob } from "./protocol";
+import {
+  firstSourceMismatch,
+  IMAGE_SOURCES,
+  MAX_ARTIFACT_BYTES,
+  parseSourceFingerprint,
+  REVIEW_RUNNER,
+  type ReviewJob,
+  sourceFingerprintCommand,
+  sourceMismatchDetail,
+} from "./protocol";
 import {
   PROVIDER_UPSTREAM,
   readLedgerUsage,
@@ -83,11 +93,19 @@ export const CLOUD_MODEL = "workers-ai/@cf/deepseek-ai/deepseek-v4-flash-0731";
 export const TEARDOWN_BUDGET_SECONDS = 90;
 
 /**
- * Bound for a single control request against a live run. The supervised review
- * itself has no wall deadline: the container owns Pi and its tools, so a slow
- * or failed observation is uncertainty about the run, never the end of it.
+ * Bound for a single control request against a live run. The container owns Pi
+ * and its tools, so a slow or failed observation is uncertainty about the run,
+ * never the end of it: only the run's deadline ends a lane nobody can see.
  */
 export const CONTROL_REQUEST_BUDGET_SECONDS = 60;
+
+/**
+ * How far past `--total-timeout` a driver holds a lane, on either transport.
+ * The lane's window is measured from the runner's start, which the driver's
+ * own preparation delays, and a swarm cuts its lanes at their window plus
+ * LANE_CUT_GRACE_SECONDS, so a driver's own deadline comes after both.
+ */
+export const RUN_DEADLINE_GRACE_SECONDS = 60;
 
 /** Off-contract finals are corrected in the same session, never indefinitely. */
 export const MAX_FORMAT_CORRECTIONS = 2;
@@ -265,6 +283,9 @@ export type RunMetadata = {
   revisions: { head: { sha: string }; base: { sha: string } };
   runnerSha: string;
   containerRunnerSha?: string | null;
+  /** What the driver expected of the image's sources and what the container held at start. */
+  expectedSources: Record<string, string>;
+  observedSources: Record<string, string>;
   provider: string;
   credentialIsolation: {
     mode: "brokered";
@@ -329,6 +350,28 @@ export type BridgeResponse = {
   error?: string;
   data?: unknown;
 };
+
+/**
+ * The sha256 of the host's copy of every file in `container/` the image is
+ * built from, the Dockerfile among them, keyed by the path the image holds it
+ * at.
+ */
+export async function readImageSources(
+  containerDir: string,
+): Promise<Record<string, string>> {
+  const entries = await Promise.all(
+    Object.entries(IMAGE_SOURCES).map(
+      async ([path, name]) =>
+        [
+          path,
+          createHash("sha256")
+            .update(await readFile(join(containerDir, name)))
+            .digest("hex"),
+        ] as const,
+    ),
+  );
+  return Object.fromEntries(entries);
+}
 
 export async function sendBridgeCommand(
   containerName: string,
@@ -977,7 +1020,7 @@ const messageOf = (error: unknown) =>
     redactions,
   );
 
-const execute = (
+export const execute = (
   file: string,
   args: string[],
   timeoutMs: number,
@@ -995,8 +1038,12 @@ const execute = (
       stdio: ["ignore", "pipe", "pipe"],
       ...(cwd ? { cwd } : {}),
     });
-    child.stdout.setEncoding("utf8");
-    child.stderr.setEncoding("utf8");
+    // Decoded here rather than with `setEncoding`: Bun 1.4.2's own utf8
+    // decoder at times never ends a stream whose chunk ends mid-character, and
+    // a stream that never ends never emits `close`, so the driver would wait
+    // forever for a child that already exited.
+    const stdoutDecoder = new StringDecoder("utf8");
+    const stderrDecoder = new StringDecoder("utf8");
     const killGroup = (signalName: NodeJS.Signals) => {
       if (!child.pid) return;
       try {
@@ -1037,20 +1084,24 @@ const execute = (
       if (error) reject(error);
       else resolvePromise(stdout);
     };
-    child.stdout.on("data", (chunk) => {
-      stdout += chunk;
+    child.stdout.on("data", (chunk: Buffer) => {
+      stdout += stdoutDecoder.write(chunk);
       if (stdout.length + stderr.length > 32 * 1024 * 1024) {
         terminate(new Error("command output exceeded 32 MiB"));
       }
     });
-    child.stderr.on("data", (chunk) => {
-      stderr += chunk;
+    child.stderr.on("data", (chunk: Buffer) => {
+      stderr += stderrDecoder.write(chunk);
       if (stdout.length + stderr.length > 32 * 1024 * 1024) {
         terminate(new Error("command output exceeded 32 MiB"));
       }
     });
     child.once("error", (error) => finish(stopError ?? error));
     child.once("close", (code, signalName) => {
+      // A stream that ends mid-character still contributes its replacement
+      // character, so a clipped tail is never silently dropped.
+      stdout += stdoutDecoder.end();
+      stderr += stderrDecoder.end();
       if (stopError) finish(stopError);
       else if (code === 0) finish();
       else
@@ -1825,8 +1876,12 @@ export async function readContainerStatus(
   }
 }
 
-/** States the runner never leaves. */
-export const TERMINAL_RUNNER_STATES = ["failed", "cancelled", "done"] as const;
+/** Runner states that end a lane whose bridge is gone. */
+const LANE_ENDING_STATES: readonly string[] = [
+  "failed",
+  "blocked",
+  "cancelled",
+];
 
 /** Live events worth a line; the rest of the raw stream is per-token noise. */
 const ACTIVITY_TYPES = [
@@ -1943,11 +1998,11 @@ async function main() {
     options.resume ||
     Boolean(options.steer);
   /**
-   * Preparation and one-shot control actions are bounded; the supervised review
-   * is not. `--total-timeout` names that preparation bound.
+   * Preparation and one-shot control actions draw from `--total-timeout`; the
+   * review ends at the run's deadline.
    */
   const budget = createBudget(startedAt, options.totalTimeoutSeconds);
-  /** A fresh bound per control request; the review itself is never deadlined. */
+  /** A fresh bound per control request inside the run's deadline. */
   const controlBudget = () =>
     createBudget(Date.now(), CONTROL_REQUEST_BUDGET_SECONDS);
   // A run names both halves of its target: the GitHub identity its revisions
@@ -1980,6 +2035,19 @@ async function main() {
   // A closed Orca tab reaches the driver as SIGHUP, and an unhandled SIGHUP
   // would end it before teardown - leaving the container it owns running.
   process.once("SIGHUP", onSignal);
+  // A runner that never ends, a container that stops answering and a status
+  // file that says done forever all end here, with the usual teardown.
+  const deadlineSeconds =
+    options.totalTimeoutSeconds + RUN_DEADLINE_GRACE_SECONDS;
+  let deadlineReached = false;
+  const deadlineTimer = setTimeout(
+    () => {
+      deadlineReached = true;
+      controller.abort(new Error("run deadline exceeded"));
+    },
+    startedAt + deadlineSeconds * 1000 - Date.now(),
+  );
+  deadlineTimer.unref();
 
   let revisions: { head: { sha: string }; base: { sha: string } } | undefined;
   let stage: string | undefined;
@@ -1989,13 +2057,18 @@ async function main() {
   let reviewStarted = false;
   let finalAccepted = false;
   // Where the runner itself stopped, when the driver saw it stop. A container
-  // whose end was observed is disposed of like an accepted one; a container
-  // the driver lost sight of is kept with its evidence, and an auth-blocked
-  // one is kept because it is the one kind of end a resume can pick up.
+  // whose end was observed, or whose deadline passed, is disposed of like an
+  // accepted one; a container the driver lost sight of is kept with its
+  // evidence, and an auth-blocked one is kept because it is the one kind of
+  // end a resume can pick up.
   let runnerTerminalReason: string | null = null;
+  // The state the runner said the lane ended in, whichever poll heard it: the
+  // receipt's outcome is read from this, never from the error's wording.
+  let runnerEnding: string | null = null;
   const containerDisposable = () =>
     options.cancel ||
     finalAccepted ||
+    deadlineReached ||
     !reviewStarted ||
     (runnerTerminalReason !== null && runnerTerminalReason !== "auth_blocked");
   let imageId: string | null = null;
@@ -2257,30 +2330,37 @@ async function main() {
         );
       }
 
-      const containerRunnerShaActual = (
-        await docker(
-          [
-            "exec",
-            metadata.containerName,
-            "sh",
-            "-c",
-            `sha256sum ${REVIEW_RUNNER} | cut -d' ' -f1`,
-          ],
-          budget,
-          "runner hash check",
-          controller.signal,
-        )
-      ).trim();
-      const expectedRunnerSha =
-        metadata.containerRunnerSha ?? metadata.runnerSha;
-      if (
-        expectedRunnerSha &&
-        containerRunnerShaActual &&
-        containerRunnerShaActual !== expectedRunnerSha
-      ) {
+      // A resume restarts the broker and pi with this checkout's staging, so
+      // it holds the image to the host's copies as a fresh start does. Every
+      // other action only reattaches to the lane its metadata recorded, and a
+      // checkout that moved since must not keep an operator from inspecting
+      // or cancelling it.
+      const attachSources = options.resume
+        ? await readImageSources(dirname(runnerPath))
+        : metadata.observedSources;
+      if (!attachSources) {
         throw new Error(
-          `container runner mismatch: ${containerRunnerShaActual} !== ${expectedRunnerSha}`,
+          `lane metadata for ${metadata.containerName} carries no source fingerprints and cannot be verified`,
         );
+      }
+      const attachFingerprint = await docker(
+        [
+          "exec",
+          metadata.containerName,
+          "sh",
+          "-c",
+          sourceFingerprintCommand(),
+        ],
+        budget,
+        "source fingerprint check",
+        controller.signal,
+      );
+      const attachMismatch = firstSourceMismatch(
+        attachSources,
+        parseSourceFingerprint(attachFingerprint).sources,
+      );
+      if (attachMismatch) {
+        throw new Error(sourceMismatchDetail(attachMismatch));
       }
 
       const containerJobJson = await docker(
@@ -2305,10 +2385,13 @@ async function main() {
       if (
         parsedJob.head.sha !== metadata.revisions.head.sha ||
         parsedJob.base.sha !== metadata.revisions.base.sha ||
-        parsedJob.expectedRunnerSha !== metadata.runnerSha
+        firstSourceMismatch(
+          metadata.expectedSources,
+          parsedJob.expectedSources ?? {},
+        ) !== null
       ) {
         throw new Error(
-          `job revision or runner mismatch in container ${metadata.containerName}`,
+          `job revision or source mismatch in container ${metadata.containerName}`,
         );
       }
 
@@ -2611,10 +2694,8 @@ async function main() {
         options.pullRequest,
         controller.signal,
       );
-      const runner = await readFile(runnerPath, "utf8");
-      const currentRunnerSha = createHash("sha256")
-        .update(runner)
-        .digest("hex");
+      const expectedSources = await readImageSources(dirname(runnerPath));
+      const currentRunnerSha = expectedSources[REVIEW_RUNNER] ?? "";
       runnerSha = currentRunnerSha;
       const prompt = options.briefPath
         ? ""
@@ -2642,6 +2723,7 @@ async function main() {
       } = {
         runId: options.runId,
         expectedRunnerSha: currentRunnerSha,
+        expectedSources,
         head: resolvedRevisions.head,
         base: resolvedRevisions.base,
         gitRemote: `file://${containerRunDir}/origin.git`,
@@ -2790,6 +2872,23 @@ async function main() {
         "job upload",
         controller.signal,
       );
+      // The image's own runner is judged before the driver's copy of the
+      // host's replaces it: an upload would otherwise erase the one source
+      // whose staleness this gate exists to catch.
+      const fingerprint = await docker(
+        ["exec", containerName, "sh", "-c", sourceFingerprintCommand()],
+        budget,
+        "source fingerprint",
+        controller.signal,
+      );
+      const observedSources = parseSourceFingerprint(fingerprint).sources;
+      const mismatch = firstSourceMismatch(expectedSources, observedSources);
+      if (mismatch) {
+        throw new Error(sourceMismatchDetail(mismatch));
+      }
+      // The gate just proved the image's runner hash and the host's are the
+      // same value, so the upload below replaces it with identical bytes.
+      containerRunnerSha = observedSources[REVIEW_RUNNER] ?? null;
       await docker(
         ["cp", runnerPath, `${containerName}:${REVIEW_RUNNER}`],
         budget,
@@ -2826,26 +2925,6 @@ async function main() {
         controller.signal,
       );
 
-      containerRunnerSha = (
-        await docker(
-          [
-            "exec",
-            containerName,
-            "sh",
-            "-c",
-            `sha256sum ${REVIEW_RUNNER} | cut -d' ' -f1`,
-          ],
-          budget,
-          "runner fingerprint",
-          controller.signal,
-        )
-      ).trim();
-      if (containerRunnerSha !== job.expectedRunnerSha) {
-        throw new Error(
-          `runner mismatch: container ${containerRunnerSha}, expected ${runnerSha}`,
-        );
-      }
-
       const metadata: RunMetadata = {
         runId: options.runId,
         attemptId: options.attemptId,
@@ -2858,6 +2937,8 @@ async function main() {
         revisions: resolvedRevisions,
         runnerSha: currentRunnerSha,
         containerRunnerSha,
+        expectedSources,
+        observedSources,
         provider: options.provider,
         credentialIsolation: {
           mode: "brokered",
@@ -2932,6 +3013,11 @@ async function main() {
         // No bridge yet, or no bridge any more. The runner's status file is the
         // only witness for a run that died before Pi came up, and a lane that
         // has already failed must not be waited on for the rest of the run.
+        // Its done is never believed: the target's uid can write this file,
+        // and only the bridge may say that a review ended well. A failure it
+        // claims only ends the target's own lane. One the bridge wrote at the
+        // review is followed by the runner's own last word once its evidence
+        // is written, and the lane ends on that.
         const runnerStatus = await readContainerStatus(
           containerName,
           containerRunDir,
@@ -2939,10 +3025,8 @@ async function main() {
         );
         if (
           runnerStatus &&
-          (TERMINAL_RUNNER_STATES as readonly string[]).includes(
-            runnerStatus.state,
-          ) &&
-          runnerStatus.state !== "done"
+          LANE_ENDING_STATES.includes(runnerStatus.state) &&
+          runnerStatus.phase !== "review"
         ) {
           status = {
             runId: options.runId,
@@ -2953,7 +3037,26 @@ async function main() {
           runError = `run ${runnerStatus.state} at ${runnerStatus.phase}: ${runnerStatus.terminalReason ?? (runnerStatus.detail || "no reason recorded")}`;
           runnerTerminalReason =
             runnerStatus.terminalReason ?? runnerStatus.state;
+          runnerEnding = runnerStatus.state;
           break;
+        }
+        // The socket exists only once Pi is up. While the runner is still
+        // cloning, installing or checking, or writing a failed review's
+        // evidence, its own status file is a truthful observation of the
+        // lane, not a lost one.
+        if (runnerStatus && runnerStatus.state !== "done") {
+          status = {
+            runId: options.runId,
+            phase: runnerStatus.phase,
+            state: runnerStatus.state,
+            detail: runnerStatus.detail,
+          };
+          const observed = `${runnerStatus.phase}/${runnerStatus.state}`;
+          if (observed !== reported) {
+            reported = observed;
+            console.log(`${new Date().toISOString()} ${reported}`);
+          }
+          continue;
         }
         console.warn(`status observation uncertain: ${messageOf(err)}`);
         continue;
@@ -2989,8 +3092,10 @@ async function main() {
       }
 
       if (curState === "cancelled") {
-        runError = "cancelled";
-        runnerTerminalReason = String(data["terminalReason"] ?? "cancelled");
+        const reason = String(data["terminalReason"] ?? "cancelled");
+        runError = `run cancelled at ${phase}: ${reason}`;
+        runnerTerminalReason = reason;
+        runnerEnding = curState;
         break;
       }
       // The brief lands once Pi is up and idle; before that the container is
@@ -3041,12 +3146,14 @@ async function main() {
         );
         runError = `run failed at ${phase}: ${reason}`;
         runnerTerminalReason = reason;
+        runnerEnding = curState;
         break;
       }
       if (curState === "blocked") {
         const reason = String(data["terminalReason"] ?? "blocked");
         runError = `run blocked at ${phase}: ${reason}`;
         runnerTerminalReason = reason;
+        runnerEnding = curState;
         break;
       }
       if (curState === "done") {
@@ -3152,6 +3259,10 @@ async function main() {
     }
   } catch (error) {
     runError = interrupted ? "interrupted" : messageOf(error);
+  }
+  clearTimeout(deadlineTimer);
+  if (deadlineReached && !interrupted) {
+    runError = `run deadline exceeded after ${deadlineSeconds} s`;
   }
 
   const teardownBeganAt = Date.now();
@@ -3268,11 +3379,9 @@ async function main() {
     outcome: runError
       ? interrupted
         ? "interrupted"
-        : runError === "cancelled"
-          ? "cancelled"
-          : runError.startsWith("run blocked")
-            ? "blocked"
-            : "failed"
+        : runnerEnding === "cancelled" || runnerEnding === "blocked"
+          ? runnerEnding
+          : "failed"
       : "completed",
     error: runError,
     teardownBudgetSeconds: TEARDOWN_BUDGET_SECONDS,
