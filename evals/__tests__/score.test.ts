@@ -79,6 +79,24 @@ describe("scoreT1a", () => {
     expect(scored.usage).toEqual({ inputTokens: 300, outputTokens: 30 });
   });
 
+  it("leaves a usage total unobserved when one trial left its count unobserved", () => {
+    const partial = scoreT1a(
+      [
+        {
+          ...t1aTrial("u1", "completed", []),
+          usage: { inputTokens: 100, unended: null },
+        },
+        {
+          ...t1aTrial("u2", "completed", []),
+          usage: { inputTokens: 200, unended: 0 },
+        },
+      ],
+      KEYS,
+    );
+
+    expect(partial.usage).toEqual({ inputTokens: 300, unended: null });
+  });
+
   it("treats a duplicate verdict as no decision at all", () => {
     const duplicated = scoreT1a(
       [

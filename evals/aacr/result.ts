@@ -53,7 +53,7 @@ export type ReceiptLane = {
   role: string;
   status: string;
   model: string | null;
-  usage: Record<string, number> | null;
+  usage: Record<string, number | null> | null;
   installSkipped: boolean | null;
   installSkippedReason: string | null;
 };
@@ -115,13 +115,14 @@ const optionalBoolean = (value: unknown, where: string) => {
   return value;
 };
 
+/** Numeric fields, keeping the null a lane recorded for a count nobody observed. */
 const numberRecord = (value: unknown, where: string) => {
   if (value === undefined || value === null) return null;
   const source = record(value, where);
-  const totals: Record<string, number> = {};
+  const totals: Record<string, number | null> = {};
   for (const [key, entry] of Object.entries(source)) {
-    if (typeof entry !== "number") {
-      throw new Error(`${where}.${key}: expected a number`);
+    if (typeof entry !== "number" && entry !== null) {
+      throw new Error(`${where}.${key}: expected a number or null`);
     }
     totals[key] = entry;
   }
@@ -274,14 +275,18 @@ export const publishedFindings = (
       severityAtLeast(finding.severity, minSeverity),
   );
 
-/** Sums every lane's usage, the verifier's included: it is a lane too. */
+/**
+ * Sums every lane's usage, the verifier's included: it is a lane too. A count
+ * one lane recorded as unobserved leaves that total unobserved.
+ */
 export const sumUsage = (lanes: readonly ReceiptLane[]) => {
-  const totals: Record<string, number> = {};
+  const totals: Record<string, number | null> = {};
   let observed = false;
   for (const lane of lanes) {
     if (!lane.usage) continue;
     for (const [key, value] of Object.entries(lane.usage)) {
-      totals[key] = (totals[key] ?? 0) + value;
+      const sum = totals[key];
+      totals[key] = sum === null || value === null ? null : (sum ?? 0) + value;
       observed = true;
     }
   }
@@ -347,11 +352,18 @@ export const commentFrom = (entry: {
   end_line: entry.line,
 });
 
+/**
+ * A token total, or nothing when the usage never observed it: a sum its
+ * unobserved count says is short is left out rather than published as whole.
+ */
 const tokenTotal = (
-  usage: Readonly<Record<string, number>> | null,
+  usage: Readonly<Record<string, number | null>> | null,
   keys: readonly string[],
+  unobserved: string,
 ) => {
   if (!usage) return undefined;
+  const short = usage[unobserved];
+  if (short !== undefined && short !== 0) return undefined;
   for (const key of keys) {
     const value = usage[key];
     if (typeof value === "number") return value;
@@ -359,10 +371,20 @@ const tokenTotal = (
   return undefined;
 };
 
-const usageSummary = (usage: Readonly<Record<string, number>> | null) => {
+const usageSummary = (
+  usage: Readonly<Record<string, number | null>> | null,
+) => {
   const summary: Record<string, number> = {};
-  const input = tokenTotal(usage, ["input_tokens", "inputTokens", "input"]);
-  const output = tokenTotal(usage, ["output_tokens", "outputTokens", "output"]);
+  const input = tokenTotal(
+    usage,
+    ["input_tokens", "inputTokens", "input"],
+    "inputUnobserved",
+  );
+  const output = tokenTotal(
+    usage,
+    ["output_tokens", "outputTokens", "output"],
+    "outputUnobserved",
+  );
   if (input !== undefined) summary["input_tokens"] = input;
   if (output !== undefined) summary["output_tokens"] = output;
   return summary;
@@ -372,7 +394,7 @@ export const buildResultFile = (input: {
   entry: AacrCase;
   startedAt: string;
   wallSeconds: number | null;
-  usage: Readonly<Record<string, number>> | null;
+  usage: Readonly<Record<string, number | null>> | null;
   comments: AacrResultComment[];
 }): AacrResultFile => ({
   instance_id: input.entry.instanceId,
@@ -403,7 +425,7 @@ export type AacrCaseSidecar = {
   reason: string | null;
   outcome: string | null;
   wallSeconds: number | null;
-  usage: Record<string, number> | null;
+  usage: Record<string, number | null> | null;
   installSkipped: boolean | null;
   installSkipReason: string | null;
   candidates: number;

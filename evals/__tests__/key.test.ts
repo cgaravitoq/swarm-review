@@ -530,6 +530,52 @@ describe("buildTrials", () => {
     expect(trials[0]?.usage).toEqual({ inputTokens: 140, outputTokens: 15 });
   });
 
+  it("leaves a trial's token sum unobserved when a lane left its count unobserved", () => {
+    const sheet = buildSheet(KEY, "W2", [
+      {
+        receiptPath: "r1.json",
+        receipt: swarmReceipt({
+          candidates: [],
+          findings: [],
+          lanes: [
+            {
+              laneId: "reviewer-1",
+              role: "reviewer",
+              model: "m",
+              status: "completed",
+              finishReason: "stop",
+              usage: { inputTokens: null, outputTokens: 5, unended: 1 },
+            },
+            {
+              laneId: "verifier",
+              role: "verifier",
+              model: "m",
+              status: "completed",
+              finishReason: "stop",
+              usage: {
+                inputTokens: 100,
+                outputTokens: 10,
+                inputUnobserved: 0,
+                outputUnobserved: 1,
+              },
+            },
+          ],
+        }),
+      },
+    ]);
+
+    // One lane never observed its input and the other's output sum is a
+    // request short, so neither side of the trial is a number to quote.
+    expect(sheet.receipts[0]?.lanes.map((lane) => lane.usage)).toEqual([
+      { inputTokens: null, outputTokens: 5 },
+      { inputTokens: 100, outputTokens: null },
+    ]);
+    expect(buildTrials(KEY, sheet)[0]?.usage).toEqual({
+      inputTokens: null,
+      outputTokens: null,
+    });
+  });
+
   it("deduplicates a defect two rows name", () => {
     const trials = buildTrials(
       KEY,

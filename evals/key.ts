@@ -60,7 +60,7 @@ export type SheetLane = {
   model: string | null;
   status: string;
   finishReason: string | null;
-  usage: { inputTokens: number; outputTokens: number } | null;
+  usage: { inputTokens: number | null; outputTokens: number | null } | null;
 };
 
 export type SheetReceipt = {
@@ -114,7 +114,7 @@ export type ScoringSheet = {
     lanes: readonly {
       role: string;
       status: string;
-      usage: { inputTokens: number; outputTokens: number } | null;
+      usage: { inputTokens: number | null; outputTokens: number | null } | null;
     }[];
   }[];
   rows: readonly {
@@ -166,6 +166,10 @@ const optionalNumber = (value: unknown) =>
  * `outputTokens`, or the Pi receipt's `input`, `output`, `turns`, `cacheRead`,
  * `totalTokens` and `costUsd`. A shape neither reader understands is unknown
  * spend, not a broken run, so it reads as absent instead of failing the sheet.
+ *
+ * A side the control side recorded as unobserved reads null, and so does a
+ * sum its `inputUnobserved` or `outputUnobserved` count says is short: either
+ * one read as a number would be quoted as the lane's whole spend.
  */
 const optionalUsage = (value: unknown) => {
   if (typeof value !== "object" || value === null || Array.isArray(value)) {
@@ -174,10 +178,21 @@ const optionalUsage = (value: unknown) => {
   const usage = value as Readonly<Record<string, unknown>>;
   const input = usage["inputTokens"] ?? usage["input"];
   const output = usage["outputTokens"] ?? usage["output"];
-  if (typeof input !== "number" || typeof output !== "number") return null;
-  if (!Number.isInteger(input) || !Number.isInteger(output)) return null;
-  return { inputTokens: input, outputTokens: output };
+  if (input === undefined && output === undefined) return null;
+  const side = (tokens: unknown, unobserved: unknown) =>
+    typeof tokens === "number" &&
+    Number.isInteger(tokens) &&
+    (unobserved === undefined || unobserved === 0)
+      ? tokens
+      : null;
+  return {
+    inputTokens: side(input, usage["inputUnobserved"]),
+    outputTokens: side(output, usage["outputUnobserved"]),
+  };
 };
+
+const sumObserved = (total: number | null, lane: number | null) =>
+  total === null || lane === null ? null : total + lane;
 
 const readLocations = (value: unknown, where: string): KeyLocation[] =>
   array(value, where).map((entry, index) => {
@@ -511,11 +526,25 @@ export function buildTrials(
         });
       }
     }
-    const usage = receipt.lanes.reduce(
-      (total, lane) => ({
-        inputTokens: total.inputTokens + (lane.usage?.inputTokens ?? 0),
-        outputTokens: total.outputTokens + (lane.usage?.outputTokens ?? 0),
-      }),
+    // A lane with no usage record adds nothing, as it always has; a side one
+    // lane left unobserved leaves that side of the trial unobserved.
+    const usage = receipt.lanes.reduce<{
+      inputTokens: number | null;
+      outputTokens: number | null;
+    }>(
+      (total, lane) =>
+        lane.usage
+          ? {
+              inputTokens: sumObserved(
+                total.inputTokens,
+                lane.usage.inputTokens,
+              ),
+              outputTokens: sumObserved(
+                total.outputTokens,
+                lane.usage.outputTokens,
+              ),
+            }
+          : total,
       { inputTokens: 0, outputTokens: 0 },
     );
     return {
