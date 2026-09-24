@@ -19,6 +19,7 @@ import {
   REVIEW_SIDE,
   refusalReason,
   revalidatePullRequest,
+  reviewMarker,
   reviewScore,
   type SwarmReceipt,
   supersededBody,
@@ -1061,6 +1062,7 @@ describe("a run that publishes no review", () => {
     moved = false,
     seeded = [] as Comment[],
     editable = true,
+    reviews = [] as { id: number; body: string }[],
   } = {}) => {
     const comments: Comment[] = [...seeded];
     const fetchMock = vi.fn(async (url: string, init?: RequestInit) => {
@@ -1110,7 +1112,7 @@ describe("a run that publishes no review", () => {
               },
               { status: 201 },
             )
-          : Response.json([], { status: 200 });
+          : Response.json(reviews, { status: 200 });
       }
       if (url.endsWith("/pulls/7")) {
         return Response.json(
@@ -1473,6 +1475,29 @@ describe("a run that publishes no review", () => {
     );
     expect(reason).not.toContain("<!--");
     expect(reason.match(/`/g)).toHaveLength(2);
+  });
+
+  it("fails without a review or a comment when this run's review is already published", async () => {
+    const api = github({
+      reviews: [
+        { id: 3, body: `${reviewMarker("swarm-1", head)}\nearlier review` },
+      ],
+    });
+    const receiptPath = await artifact(completed());
+    const errors = vi.spyOn(console, "error").mockImplementation(() => {});
+
+    await expect(publish(receiptPath)).resolves.toBeUndefined();
+
+    errors.mockRestore();
+    expect(process.exitCode).toBe(1);
+    expect(
+      api.fetchMock.mock.calls.filter(
+        ([url, init]) =>
+          String(url).includes("/pulls/7/reviews") &&
+          (init as RequestInit | undefined)?.method === "POST",
+      ),
+    ).toHaveLength(0);
+    expect(issueRequests(api.fetchMock)).toHaveLength(0);
   });
 
   it("comments a head that moved off the frozen SHA", async () => {
