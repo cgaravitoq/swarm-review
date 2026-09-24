@@ -376,6 +376,10 @@ if [[ "$1" == "exec" && "$joined" == *" --send "* ]]; then
     echo "no such file or directory: rpc.sock" >&2
     exit 1
   fi
+  if [[ "\${FAKE_CANCEL:-}" == "closes" && -f "$state/cancel-request" ]]; then
+    echo "no such file or directory: rpc.sock" >&2
+    exit 1
+  fi
   if [[ -n "\${FAKE_BRIDGE_FLAKY:-}" ]]; then
     flaky=0
     [[ -f "$state/bridge-flaky" ]] && flaky=$(cat "$state/bridge-flaky")
@@ -395,6 +399,11 @@ if [[ "$1" == "exec" && "$joined" == *" --send "* ]]; then
       [[ $index -gt $last ]] && index=$last
       current="\${states[$index]}"
       echo $(( step + 1 )) > "$state/bridge-step"
+      terminal="\${FAKE_TERMINAL_REASON:-}"
+      if [[ -f "$state/cancel-request" ]]; then
+        current=cancelled
+        terminal=$(jq -r '.reason // "cancelled"' "$state/cancel-request")
+      fi
       candidate=""
       idle=false
       if [[ "$current" == "idle" ]]; then
@@ -405,7 +414,7 @@ if [[ "$1" == "exec" && "$joined" == *" --send "* ]]; then
         fi
       fi
       printf '{"type":"response","command":"inspect","success":true,"data":{"runId":"%s","phase":"review","state":"%s","detail":"","childIdle":%s,"isStreaming":false,"inFlightTool":null,"terminalReason":"%s","lastCandidateResult":%s,"process":{"alive":true,"pid":4242},"session":{"sessionId":"fake-session","sessionFile":"/dev/null"}}}\\n' \\
-        "\${FAKE_RUN_ID:?}" "$current" "$idle" "\${FAKE_TERMINAL_REASON:-}" "$(printf '%s' "$candidate" | /usr/bin/python3 -c 'import json,sys; print(json.dumps(sys.stdin.read() or None))')"
+        "\${FAKE_RUN_ID:?}" "$current" "$idle" "$terminal" "$(printf '%s' "$candidate" | /usr/bin/python3 -c 'import json,sys; print(json.dumps(sys.stdin.read() or None))')"
       exit 0
       ;;
     prompt)
@@ -430,6 +439,7 @@ if [[ "$1" == "exec" && "$joined" == *" --send "* ]]; then
         echo "bridge is gone" >&2
         exit 1
       fi
+      printf '%s' "$payload" > "$state/cancel-request"
       printf '{"type":"response","command":"cancel","success":true,"data":{}}\\n'
       exit 0
       ;;
@@ -1891,6 +1901,108 @@ describe("public local CLI lifecycle", {
       outcome: "blocked",
       error: "run blocked at finished: quota_blocked",
     });
+  });
+
+  it("ends a lane cancelled when its bridge is gone and the runner says cancelled", async () => {
+    const root = await mkdtemp(join(tmpdir(), "review-pi-cli-"));
+    temporaryDirectories.push(root);
+    const arranged = await arrangeFakeDocker(root);
+    const runId = "runner-cancelled";
+    const out = join(root, "out");
+    const startedAt = Date.now();
+
+    const result = await runLocalCli(localArguments(out, runId), {
+      ...fakeEnvironment(arranged, runId, "success"),
+      FAKE_BRIDGE: "unavailable",
+      FAKE_PREPARATION_STATUS: JSON.stringify({
+        runId,
+        phase: "finished",
+        state: "cancelled",
+        detail: "",
+        terminalReason: "no_candidates",
+        process: { alive: false, pid: 50 },
+      }),
+    });
+
+    expect(result.code, result.output).toBe(1);
+    expect(Date.now() - startedAt).toBeLessThan(30_000);
+    await expect(readLocalReceipt(join(out, runId))).resolves.toMatchObject({
+      outcome: "cancelled",
+      error: "run cancelled at finished: no_candidates",
+    });
+  });
+
+  it("ends a lane on an empty brief cancelled whichever poll sees the cancel", async () => {
+    // The bridge answers the cancel and then closes its socket, so the next
+    // poll either still reaches it or finds only the runner's status file. The
+    // two lanes below differ in nothing else.
+    const cancelled = (phase: string) => ({
+      phase,
+      state: "cancelled",
+      detail: "",
+      terminalReason: "no_candidates",
+      process: { alive: false, pid: 50 },
+    });
+    const endOnEmptyBrief = async (runId: string, bridgeCloses: boolean) => {
+      const root = await mkdtemp(join(tmpdir(), "review-pi-cli-"));
+      temporaryDirectories.push(root);
+      const arranged = await arrangeFakeDocker(root);
+      const brief = join(root, "brief.json");
+      await writeFile(
+        brief,
+        JSON.stringify({ prompt: null, candidateIds: [] }),
+      );
+      const out = join(root, "out");
+
+      const result = await runLocalCli(
+        [...localArguments(out, runId), "--brief", brief],
+        {
+          ...fakeEnvironment(arranged, runId, "success"),
+          FAKE_BRIDGE_STATES: "idle",
+          FAKE_STATUS_SEQUENCE: JSON.stringify([
+            cancelled("review"),
+            { ...cancelled("trace"), state: "running", terminalReason: null },
+            cancelled("finished"),
+          ]),
+          ...(bridgeCloses ? { FAKE_CANCEL: "closes" } : {}),
+        },
+      );
+
+      expect(result.code, result.output).toBe(1);
+      expect(
+        JSON.parse(
+          await readFile(join(arranged.state, "cancel-request"), "utf8"),
+        ),
+      ).toEqual({ type: "cancel", reason: "no_candidates" });
+      const statusReads = await readFile(
+        join(arranged.state, "status-reads"),
+        "utf8",
+      ).catch(() => "0");
+      return {
+        receipt: await readLocalReceipt(join(out, runId)),
+        statusReads: Number(statusReads),
+      };
+    };
+
+    const bridgeAlive = await endOnEmptyBrief("empty-brief-bridge", false);
+    const bridgeGone = await endOnEmptyBrief("empty-brief-status", true);
+
+    expect([bridgeAlive, bridgeGone]).toMatchObject([
+      {
+        statusReads: 0,
+        receipt: {
+          outcome: "cancelled",
+          error: "run cancelled at review: no_candidates",
+        },
+      },
+      {
+        receipt: {
+          outcome: "cancelled",
+          error: "run cancelled at finished: no_candidates",
+        },
+      },
+    ]);
+    expect(bridgeGone.statusReads).toBeGreaterThanOrEqual(3);
   });
 
   it("ends a failed review on the runner's last word once the bridge is gone", async () => {
