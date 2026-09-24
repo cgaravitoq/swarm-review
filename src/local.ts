@@ -2098,6 +2098,7 @@ async function main() {
   let activeRole = options.role;
   let activeCandidateIds = options.candidateIds ?? [];
   let activeLaneId = options.laneId;
+  let laneInputCap = caps.maxCumulativeInputTokens;
   const interventions: Array<{ at: string; type: string; reason: string }> = [];
   let corrections = 0;
 
@@ -2420,6 +2421,7 @@ async function main() {
       containerRunnerSha = metadata.containerRunnerSha ?? null;
       promptSha = metadata.promptSha;
       imageId = metadata.image.id;
+      laneInputCap = metadata.credentialIsolation.caps.maxCumulativeInputTokens;
       activeRole = metadata.role ?? options.role;
       activeCandidateIds = metadata.candidateIds ?? options.candidateIds ?? [];
       activeLaneId = metadata.laneId ?? options.laneId ?? "lane-1";
@@ -3386,8 +3388,8 @@ async function main() {
     // work, not a lane that never reached the model and can be relaunched.
     modelRequests: providerUsage?.requests ?? null,
     // The input ceiling this lane ran under, from the trial's table or the
-    // caller's own --lane-input-cap.
-    laneInputCap: caps.maxCumulativeInputTokens,
+    // caller's own --lane-input-cap, as the run recorded it for itself.
+    laneInputCap,
     fixture: options.fixturePath ?? null,
     checkCommand: options.checkCommand,
     failStep: options.failStep ?? null,

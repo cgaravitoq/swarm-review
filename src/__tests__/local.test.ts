@@ -2399,6 +2399,52 @@ describe("public local CLI lifecycle", {
     expect(existsSync(join(arranged.state, "cancelled"))).toBe(true);
   });
 
+  it("resumes a lane under the input ceiling it started with, not the trial's", async () => {
+    const root = await mkdtemp(join(tmpdir(), "review-pi-cli-"));
+    temporaryDirectories.push(root);
+    const arranged = await arrangeFakeDocker(root);
+    const runId = "resumed-lane-cap";
+    const out = join(root, "out");
+    const cap = 4_000_000;
+    const started = await runLocalCli(
+      [...localArguments(out, runId), "--lane-input-cap", String(cap)],
+      {
+        ...fakeEnvironment(arranged, runId, "success"),
+        FAKE_BRIDGE_STATES: "running,blocked",
+        FAKE_TERMINAL_REASON: "auth_blocked",
+      },
+    );
+    expect(started.code, started.output).toBe(1);
+    await rm(join(arranged.container, "copied-broker.json"));
+    await rm(join(out, runId, "local-receipt.json"));
+    await writeFile(join(arranged.state, "bridge-step"), "0");
+
+    const resumed = await runLocalCli(
+      [...controlAction(out, runId, "--resume"), "--reconnect"],
+      {
+        ...fakeEnvironment(arranged, runId, "success"),
+        FAKE_BRIDGE_STATES: "blocked,done",
+        FAKE_TERMINAL_REASON: "auth_blocked",
+      },
+    );
+
+    expect(resumed.code, resumed.output).toBe(0);
+    const metadata = JSON.parse(
+      await readFile(join(out, runId, "metadata.json"), "utf8"),
+    ) as { credentialIsolation: { caps: Record<string, unknown> } };
+    const recorded =
+      metadata.credentialIsolation.caps["maxCumulativeInputTokens"];
+    expect(recorded).toBe(cap);
+    // The resumed broker is the one that cuts the lane from here on, so it
+    // must hold the run's ceiling and not the one this invocation defaults to.
+    const broker = JSON.parse(
+      await readFile(join(arranged.container, "copied-broker.json"), "utf8"),
+    ) as { caps: Record<string, unknown> };
+    expect(broker.caps["maxCumulativeInputTokens"]).toBe(recorded);
+    const receipt = await readLocalReceipt(join(out, runId));
+    expect(receipt.laneInputCap).toBe(recorded);
+  });
+
   it("refuses to reattach to a container that no longer holds what its lane started with", async () => {
     const root = await mkdtemp(join(tmpdir(), "review-pi-cli-"));
     temporaryDirectories.push(root);
