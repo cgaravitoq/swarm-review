@@ -205,11 +205,14 @@ export async function main(env: Env = process.env): Promise<void> {
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
     console.error(message);
-    await mkdir(swarmDir, { recursive: true });
-    await writeFile(
-      join(swarmDir, "failure.json"),
-      JSON.stringify({ stage, message }),
-    );
+    await mkdir(swarmDir, { recursive: true })
+      .then(() =>
+        writeFile(
+          join(swarmDir, "failure.json"),
+          JSON.stringify({ stage, message }),
+        ),
+      )
+      .catch((writeError: unknown) => console.error(writeError));
   }
   await run(
     "bun",

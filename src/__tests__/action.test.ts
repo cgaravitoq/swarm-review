@@ -240,6 +240,25 @@ describe("composite action driver", () => {
     });
   });
 
+  it("publishes when the failure file cannot be written", async () => {
+    const fixture = await arrange("acme/demo", false);
+    await mkdir(
+      join(
+        fixture.env.RUNNER_TEMP,
+        "swarm-review",
+        "pr-42-123-1",
+        "failure.json",
+      ),
+      { recursive: true },
+    );
+    await expect(
+      main({ ...fixture.env, INPUT_MODE: "sandbox", ACTION_FAIL: "deploy" }),
+    ).resolves.toBeUndefined();
+    expect((await fixture.log()).at(-1)).toBe(
+      `bun ${packageRoot}/src/publish.ts --receipt ${fixture.env.RUNNER_TEMP}/swarm-review/pr-42-123-1/swarm-receipt.json --repo acme/demo --pr 42 --publish --allow-moved-head`,
+    );
+  });
+
   it("runs a fork forced to sandbox without the packed fork note", async () => {
     const fixture = await arrange("contributor/demo", true);
     await main({ ...fixture.env, INPUT_MODE: "sandbox" });
