@@ -1,5 +1,5 @@
 import { execFile, spawn } from "node:child_process";
-import { appendFile, mkdir, writeFile } from "node:fs/promises";
+import { access, appendFile, mkdir, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { promisify } from "node:util";
 import { imageReference, imageTagFromFiles } from "./image-tag";
@@ -259,9 +259,14 @@ export async function main(env: Env = process.env): Promise<void> {
         ),
       )
       .catch((writeError: unknown) => console.error(writeError));
-    // The review did not run, so the step fails; the publish step runs anyway
-    // and names the stage on the run's comment.
-    throw error;
+    // A receipt of any status is a review that ran, and publish decides the
+    // job from it; without one the step fails, and publish names the stage on
+    // the run's comment.
+    const reviewed = await access(receiptPath).then(
+      () => true,
+      () => false,
+    );
+    if (!reviewed) throw error;
   }
 }
 

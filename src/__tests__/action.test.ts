@@ -44,7 +44,7 @@ async function arrange(headRepo: string, pullSucceeds: boolean) {
   );
   await writeFile(
     join(bin, "bun"),
-    '#!/bin/sh\nprintf "bun %s\\n" "$*" >> "$ACTION_LOG"\nif [ "$1" = "$ACTION_ROOT/src/swarm.ts" ]; then printf "%s\\0" "$@" > "$ACTION_ARGS"; out=; id=; previous=; for arg; do case "$previous" in --out) out=$arg;; --swarm-id) id=$arg;; esac; previous=$arg; done; mkdir -p "$out" && mkdir "$out/$id" || exit 1; [ "$ACTION_FAIL" = swarm ] && exit 1; fi\nif [ "$2" = "$ACTION_ROOT/scripts/deploy.ts" ] && [ "$ACTION_FAIL" = deploy ]; then printf "exec /bin/sh: exec format error\\ndocker build exited with code 1\\n" >&2; exit 1; fi\nexit 0\n',
+    '#!/bin/sh\nprintf "bun %s\\n" "$*" >> "$ACTION_LOG"\nif [ "$1" = "$ACTION_ROOT/src/swarm.ts" ]; then printf "%s\\0" "$@" > "$ACTION_ARGS"; out=; id=; previous=; for arg; do case "$previous" in --out) out=$arg;; --swarm-id) id=$arg;; esac; previous=$arg; done; mkdir -p "$out" && mkdir "$out/$id" || exit 1; [ "$ACTION_FAIL" = partial ] && printf "{}" > "$out/$id/swarm-receipt.json" && exit 1; [ "$ACTION_FAIL" = swarm ] && exit 1; fi\nif [ "$2" = "$ACTION_ROOT/scripts/deploy.ts" ] && [ "$ACTION_FAIL" = deploy ]; then printf "exec /bin/sh: exec format error\\ndocker build exited with code 1\\n" >&2; exit 1; fi\nexit 0\n',
   );
   for (const name of ["gh", "docker", "bun"]) {
     await chmod(join(bin, name), 0o755);
@@ -293,6 +293,24 @@ describe("composite action driver", () => {
     ).rejects.toThrow(`bun ${packageRoot}/src/swarm.ts exited with code 1`);
     const log = await fixture.log();
     expect(log.some((line) => line.includes("src/publish.ts"))).toBe(false);
+    expect(await fixture.failure()).toEqual({
+      stage: "review",
+      message: `bun ${packageRoot}/src/swarm.ts exited with code 1`,
+    });
+  });
+
+  it("passes the step when the swarm exits non-zero after writing its receipt", async () => {
+    const fixture = await arrange("acme/demo", true);
+    vi.spyOn(console, "error").mockImplementation(() => {});
+    await main({
+      ...fixture.env,
+      INPUT_MODE: "packed",
+      ACTION_FAIL: "partial",
+    });
+    expect(
+      await readFile(join(fixture.swarmDir, "swarm-receipt.json"), "utf8"),
+    ).toBe("{}");
+    expect(await fixture.notes()).toEqual({ fork: false });
     expect(await fixture.failure()).toEqual({
       stage: "review",
       message: `bun ${packageRoot}/src/swarm.ts exited with code 1`,
