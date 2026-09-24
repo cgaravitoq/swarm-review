@@ -931,17 +931,24 @@ export const refusalMarker = (runId: string) =>
   `${REFUSAL_MARKER_PREFIX}${runId} -->`;
 
 /** The step a lane was in when it stopped, as its own status.json records it. */
-export type LanePhase = { runId: string; phase: string; state: string };
+export type LanePhase = {
+  runId: string;
+  /** null when the lane wrote a status.json nothing can parse. */
+  phase: string | null;
+  state: string | null;
+};
 
-const parseLanePhase = (raw: string): LanePhase | undefined => {
+const parseLanePhase = (raw: string, runDir: string): LanePhase => {
   let parsed: unknown;
   try {
     parsed = JSON.parse(raw);
   } catch {
-    return undefined;
+    parsed = undefined;
   }
-  if (typeof parsed !== "object" || parsed === null) return undefined;
-  const record = parsed as Record<string, unknown>;
+  const record =
+    typeof parsed === "object" && parsed !== null
+      ? (parsed as Record<string, unknown>)
+      : {};
   const runId = record["runId"];
   const phase = record["phase"];
   const state = record["state"];
@@ -949,7 +956,7 @@ const parseLanePhase = (raw: string): LanePhase | undefined => {
     typeof phase === "string" &&
     typeof state === "string"
     ? { runId, phase, state }
-    : undefined;
+    : { runId: runDir, phase: null, state: null };
 };
 
 /**
@@ -971,8 +978,7 @@ export async function lanePhases(artifactRoot: string): Promise<LanePhase[]> {
       join(artifactRoot, entry.name, "status.json"),
       "utf8",
     ).catch(() => null);
-    const phase = raw === null ? undefined : parseLanePhase(raw);
-    if (phase) phases.push(phase);
+    if (raw !== null) phases.push(parseLanePhase(raw, entry.name));
   }
   return phases.sort((a, b) => a.runId.localeCompare(b.runId));
 }
@@ -1033,6 +1039,14 @@ export const refusalReason = (error: unknown) => {
 const statusCell = (text: string) =>
   `\`${cell(text.slice(0, 80).replaceAll("`", "'").replaceAll("<", "‹"))}\``;
 
+/** A lane's step, or the reason there is none to name. */
+const phaseCell = (phase: LanePhase | null) =>
+  phase === null
+    ? "no status.json"
+    : phase.phase === null || phase.state === null
+      ? "unreadable status.json"
+      : `${statusCell(phase.phase)} ${statusCell(phase.state)}`;
+
 /**
  * What a run that published no review leaves behind: the refusal, the phase
  * each lane reached, and the run whose artifact holds the rest.
@@ -1055,7 +1069,7 @@ export const refusalCommentBody = (input: {
           "| --- | --- | --- |",
           ...input.lanes.map(
             (lane) =>
-              `| ${statusCell(lane.lane)} | ${statusCell(lane.status)} | ${lane.phase ? `${statusCell(lane.phase.phase)} ${statusCell(lane.phase.state)}` : "no status.json"} |`,
+              `| ${statusCell(lane.lane)} | ${statusCell(lane.status)} | ${phaseCell(lane.phase)} |`,
           ),
         ]),
     "",

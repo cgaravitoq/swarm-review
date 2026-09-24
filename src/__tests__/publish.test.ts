@@ -1,6 +1,6 @@
 import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { preparationFailureReceipt } from "../attempt";
 import {
@@ -1036,14 +1036,19 @@ describe("a run that publishes no review", () => {
   const issueRequests = (fetchMock: ReturnType<typeof vi.fn>) =>
     fetchMock.mock.calls.filter(([url]) => String(url).includes("/issues/"));
 
-  const artifact = async (
-    swarm: SwarmReceipt | ReturnType<typeof preparationFailureReceipt>,
-    phases: { runId: string; phase: string; state: string }[] = [],
-  ) => {
+  const artifactDirectory = async () => {
     const directory = await mkdtemp(join(tmpdir(), "review-pi-refusal-"));
     directories.push(directory);
     const suiteDir = join(directory, "swarm-1");
     await mkdir(suiteDir, { recursive: true });
+    return suiteDir;
+  };
+
+  const artifact = async (
+    swarm: SwarmReceipt | ReturnType<typeof preparationFailureReceipt>,
+    phases: { runId: string; phase: string; state: string }[] = [],
+  ) => {
+    const suiteDir = await artifactDirectory();
     const receiptPath = join(suiteDir, "swarm-receipt.json");
     await writeFile(receiptPath, JSON.stringify(swarm));
     for (const phase of phases) {
@@ -1227,6 +1232,35 @@ describe("a run that publishes no review", () => {
           (init as RequestInit | undefined)?.method === "POST",
       ),
     ).toHaveLength(1);
+  });
+
+  it("tells an unreadable status.json from one that was never written", async () => {
+    const api = github();
+    const swarm = failed();
+    swarm.lanes = [
+      ...(swarm.lanes ?? []),
+      {
+        laneId: "reviewer-2",
+        runId: "swarm-1-reviewer-2",
+        role: "reviewer",
+        model: "@cf/deepseek-ai/deepseek-v4-flash-0731",
+        status: "failed",
+      },
+    ];
+    const receiptPath = await artifact(swarm);
+    const runDir = join(dirname(receiptPath), "swarm-1-reviewer-1");
+    await mkdir(runDir, { recursive: true });
+    await writeFile(join(runDir, "status.json"), '{"phase":');
+
+    await expect(publish(receiptPath)).rejects.toThrow(
+      "publication requires a completed or partial review",
+    );
+
+    const body = api.comments[0]?.body ?? "";
+    expect(body).toContain(
+      "| `reviewer-1` | `failed` | unreadable status.json |",
+    );
+    expect(body).toContain("| `reviewer-2` | `failed` | no status.json |");
   });
 
   it("publishes the packed fork note in the review body", async () => {
