@@ -558,6 +558,20 @@ describe("reviewer context", () => {
       /--lane-input-cap must be a positive whole number of tokens/,
     );
   });
+
+  it("refuses a lane input ceiling on a run that already started", () => {
+    expect(() =>
+      parseOptions([
+        "--out",
+        "/tmp/out",
+        "--run-id",
+        "started",
+        "--resume",
+        "--lane-input-cap",
+        "8000000",
+      ]),
+    ).toThrow(/the ceiling in force is the one its metadata.json recorded/);
+  });
 });
 
 describe("credential boundary", () => {

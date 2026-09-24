@@ -229,6 +229,11 @@ export function parseOptions(argv: string[]) {
   // Refused at parse time, before a container exists: the number this lane is
   // cut at is the caller's, or the run never starts.
   const rawLaneInputCap = flag(argv, "lane-input-cap");
+  if (isControlAction && rawLaneInputCap !== undefined) {
+    throw new Error(
+      "--lane-input-cap cannot change a run that already started: the ceiling in force is the one its metadata.json recorded",
+    );
+  }
   const laneInputCap = laneCaps(
     trialKind,
     rawLaneInputCap,
