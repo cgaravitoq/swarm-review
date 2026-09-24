@@ -12,7 +12,7 @@ inputs:
     description: The pull request to review.
     default: ${{ github.event.issue.number || github.event.pull_request.number }}
   mode:
-    description: Use sandbox lanes, packed lanes, or choose sandbox except for forks.
+    description: Use sandbox lanes, packed lanes, or choose sandbox except for forks and runners that cannot run the sandbox image.
     default: auto
 
 runs:
