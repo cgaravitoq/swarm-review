@@ -17,6 +17,7 @@ import { tmpdir } from "node:os";
 import { basename, dirname, join } from "node:path";
 import { fileURLToPath, pathToFileURL, URL } from "node:url";
 import { afterAll, afterEach, describe, expect, it, vi } from "vitest";
+import { imageReference, imageTagFromFiles } from "../image-tag";
 import {
   adaptModelsConfig,
   assertRunId,
@@ -1545,6 +1546,40 @@ describe("public local CLI lifecycle", {
     expect(await readFile(join(arranged.state, "docker.log"), "utf8")).toMatch(
       /^image inspect --format \{\{\.Id\}\} review-pi-b5-local$/m,
     );
+  });
+
+  it("runs the image derived from the container sources and lockfile unless --image names one", async () => {
+    const root = await mkdtemp(join(tmpdir(), "review-pi-cli-"));
+    temporaryDirectories.push(root);
+    const staged = await stageDriver(root, '{"lockfileVersion":1}\n');
+    const expected = imageReference(
+      "acme/demo",
+      await imageTagFromFiles(
+        staged.container,
+        join(staged.container, "context/bun.lock"),
+      ),
+    );
+    for (const [runId, extra, image] of [
+      ["derived-image", [], expected],
+      ["explicit-image", ["--image", "x"], "x"],
+    ] as const) {
+      await mkdir(join(root, runId));
+      const arranged = await arrangeFakeDocker(join(root, runId));
+      const out = join(root, runId, "out");
+      const result = await runLocalCli(
+        [...withoutImage(staged.script, localArguments(out, runId)), ...extra],
+        fakeEnvironment(arranged, runId, "success"),
+      );
+
+      expect(result.code, result.output).toBe(0);
+      expect(
+        [
+          ...(
+            await readFile(join(arranged.state, "docker.log"), "utf8")
+          ).matchAll(/^image inspect --format \{\{\.Id\}\} (\S+)$/gm),
+        ].map((match) => match[1]),
+      ).toEqual([image]);
+    }
   });
 
   it("names the missing lockfile before creating anything when no --image is given", async () => {

@@ -22,6 +22,7 @@ import { createBrokerServer } from "../../container/model-broker";
 import { PARTIAL_SUFFIX } from "../attempt";
 import { FINALIZE_REQUEST_RESERVE } from "../drive";
 import { CANARY_PROMPT } from "../fast-review";
+import { imageReference, imageTagFromFiles } from "../image-tag";
 import { TEARDOWN_BUDGET_SECONDS } from "../local";
 import { wholeChangeFits } from "../pack-context";
 import { IMAGE_SOURCES } from "../protocol";
@@ -2974,6 +2975,33 @@ exec /usr/bin/git "$@"
     expect(await inspectedImages(arranged)).toEqual(
       new Set(["review-pi-b5-swarm"]),
     );
+  }, 120_000);
+
+  it("runs every lane on the image derived from the container sources and lockfile", async () => {
+    const arranged = await arrange("success");
+    const expected = imageReference(
+      TARGET_REPO,
+      await imageTagFromFiles(
+        arranged.laneContainer,
+        join(arranged.laneContainer, "context/bun.lock"),
+      ),
+    );
+
+    const result = await runQuietSwarm(arranged, "swarm-derived-image");
+
+    expect(result.code, result.output).toBe(0);
+    expect(await inspectedImages(arranged)).toEqual(new Set([expected]));
+  }, 120_000);
+
+  it("runs every lane on an explicit --image", async () => {
+    const arranged = await arrange("success");
+    const result = await runQuietSwarm(arranged, "swarm-explicit-image", [
+      "--image",
+      "x",
+    ]);
+
+    expect(result.code, result.output).toBe(0);
+    expect(await inspectedImages(arranged)).toEqual(new Set(["x"]));
   }, 120_000);
 
   it("names the missing lockfile before creating anything when no --image is given", async () => {
