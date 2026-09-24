@@ -49,8 +49,10 @@ runs:
           --source "$GITHUB_WORKSPACE/swarm-review-source" --pr "$PULL_REQUEST" \
           --provider cloudflare-workers-ai --model @cf/deepseek-ai/deepseek-v4-flash-0731 \
           --reviewers 3 --swarm-id "$swarm_id" --out "$out" || true
+        # A pull request that merges while its review runs still gets the
+        # review, posted at the commit the lanes read.
         bun "$GITHUB_ACTION_PATH/src/publish.ts" --receipt "$out/$swarm_id/swarm-receipt.json" \
-          --repo "$GITHUB_REPOSITORY" --pr "$PULL_REQUEST" --publish
+          --repo "$GITHUB_REPOSITORY" --pr "$PULL_REQUEST" --publish --allow-moved-head
 
     - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
       if: always()
