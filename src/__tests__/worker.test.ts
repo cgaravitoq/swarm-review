@@ -776,10 +776,10 @@ describe("deployed container image", () => {
         "/opt/review/extensions/claude-code-provider.js",
       ],
       ["models.json", "/opt/review/pi-config/models.json"],
-      ["review-run.sh", REVIEW_RUNNER],
       ["model-broker.ts", MODEL_BROKER],
       ["response-seal.ts", "/opt/review/response-seal.ts"],
       ["response-usage.ts", "/opt/review/response-usage.ts"],
+      ["review-run.sh", REVIEW_RUNNER],
       ["Dockerfile", "/opt/review/Dockerfile"],
     ]);
   });

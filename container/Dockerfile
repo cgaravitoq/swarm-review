@@ -38,7 +38,7 @@ RUN curl -fsSL https://bun.sh/install | bash -s "bun-v1.4.0" \
 # `COPY .` would key the bake on their content. Copying only the generated
 # manifest tree keeps it keyed on the lockfile, and a runner or broker edit
 # reuses it.
-FROM bun AS bun-cache
+FROM bun AS bun-template
 
 COPY context /opt/review/lockfile
 RUN cd /opt/review/lockfile \
@@ -84,13 +84,12 @@ RUN mkdir -p /opt/review/extensions \
 COPY claude-code-provider.js /opt/review/extensions/claude-code-provider.js
 
 COPY models.json /opt/review/pi-config/models.json
-COPY review-run.sh /opt/review/review-run.sh
-RUN chmod 0755 /opt/review/review-run.sh
 
 # Reader cases build and test Rust crates in this repository, so a review that
 # cannot run `cargo` silently degrades to reading the diff. Admission refuses a
 # run whose image lacks it rather than letting that degradation pass as a review.
-RUN apt-get update \
+RUN sed -i 's|http://archive.ubuntu.com/|https://archive.ubuntu.com/|g; s|http://security.ubuntu.com/|https://security.ubuntu.com/|g' /etc/apt/sources.list \
+  && apt-get update \
   && apt-get install --no-install-recommends -y cargo util-linux \
   && rm -rf /var/lib/apt/lists/* \
   && cargo --version \
@@ -114,10 +113,13 @@ COPY response-seal.ts /opt/review/response-seal.ts
 COPY response-usage.ts /opt/review/response-usage.ts
 RUN chmod 0755 /opt/review/model-broker.ts
 
-# Last but for the recipe itself, so a runner or broker edit reuses every layer
-# above it. The install runs as `review-target`, and Bun writes into its cache
-# while linking.
-COPY --from=bun-cache --chown=1102:1102 /opt/review/bun-cache /opt/review/bun-cache
+# The target receives the installed tree only when its lockfile matches this
+# template. Bun still runs its scripts and frozen install in the lane.
+COPY --from=bun-template --chown=1102:1102 /opt/review/lockfile/node_modules /opt/review/node_modules-template
+COPY --from=bun-template /opt/review/lockfile/bun.lock /opt/review/template-bun.lock
+COPY --from=bun-template --chown=1102:1102 /opt/review/bun-cache /opt/review/bun-cache
+COPY review-run.sh /opt/review/review-run.sh
+RUN chmod 0755 /opt/review/review-run.sh
 
 # The recipe itself, so a lane can tell an image built from another one - an
 # older pi, a missing tool, another uid - by comparing it with the host's.

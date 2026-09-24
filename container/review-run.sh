@@ -43,7 +43,8 @@ write_status() {
   if ! is_supervised; then
     jq -n --arg runId "$RUN_ID" --arg phase "$phase" --arg state "$state" --arg at "$(now)" \
       --arg detail "$detail" --argjson elapsedSeconds "$(elapsed)" \
-      '{runId:$runId, phase:$phase, state:$state, at:$at, elapsedSeconds:$elapsedSeconds, detail:$detail}' \
+      --argjson install "$(install_evidence)" \
+      '{runId:$runId, phase:$phase, state:$state, at:$at, elapsedSeconds:$elapsedSeconds, detail:$detail, install:$install}' \
       > "$STATUS.tmp"
     mv "$STATUS.tmp" "$STATUS"
     return
@@ -52,9 +53,10 @@ write_status() {
   jq -n --arg runId "$RUN_ID" --arg phase "$phase" --arg state "$state" --arg at "$(now)" \
     --arg detail "$detail" --arg inFlightTool "$in_flight" --arg lastEvent "$last_event" \
     --arg terminalReason "$term_reason" --argjson elapsedSeconds "$(elapsed)" \
-    --argjson pid "$proc_pid" \
+    --argjson pid "$proc_pid" --argjson install "$(install_evidence)" \
     '{runId:$runId, phase:$phase, state:$state, at:$at, elapsedSeconds:$elapsedSeconds,
-      detail:$detail, inFlightTool:(if $inFlightTool == "" then null else $inFlightTool end),
+      detail:$detail, install:$install,
+      inFlightTool:(if $inFlightTool == "" then null else $inFlightTool end),
       lastEvent:(if $lastEvent == "" then null else $lastEvent end),
       terminalReason:(if $terminalReason == "" then null else $terminalReason end),
       process:{alive:(if $state == "done" or $state == "cancelled" or $state == "failed" or $state == "blocked" then false else true end), pid:$pid}}' \
@@ -198,7 +200,7 @@ install_evidence() {
   if [ -s "$RUN_DIR/install.json" ]; then
     jq -c . "$RUN_DIR/install.json" 2>/dev/null && return 0
   fi
-  printf '{"status":"unknown","manifest":null,"reason":null}'
+  printf '{"status":"unknown","manifest":null,"reason":null,"seconds":null,"nothingToDo":null}'
 }
 
 do_install() {
@@ -207,20 +209,32 @@ do_install() {
   manifest=$(install_manifest)
   if [ -z "$manifest" ]; then
     jq -cn --arg reason "$(install_skip_reason)" \
-      '{status:"skipped", manifest:null, reason:$reason}' > "$RUN_DIR/install.json"
+      '{status:"skipped", manifest:null, reason:$reason, seconds:null, nothingToDo:null}' > "$RUN_DIR/install.json"
     return 0
   fi
-  local code
+  local code began seconds nothing_to_do
+  began=$(date +%s)
+  if [ "$manifest" = "bun.lock" ] && cmp -s "$REPO/bun.lock" /opt/review/template-bun.lock && [ -d /opt/review/node_modules-template ]; then
+    cp -a --reflink=auto /opt/review/node_modules-template "$REPO/node_modules" || return 1
+  fi
   if is_supervised; then
-    bun install --frozen-lockfile
+    bun install --frozen-lockfile > "$RUN_DIR/install.log" 2>&1
     code=$?
   else
-    timeout -k 15 "$(job .installTimeoutSeconds)" bun install --frozen-lockfile
+    timeout -k 15 "$(job .installTimeoutSeconds)" bun install --frozen-lockfile > "$RUN_DIR/install.log" 2>&1
     code=$?
   fi
+  seconds=$(($(date +%s) - began))
+  nothing_to_do=false
+  if grep -qiE '\(no changes\)|nothing to install' "$RUN_DIR/install.log"; then
+    nothing_to_do=true
+  fi
+  jq -cn --arg manifest "$manifest" --argjson seconds "$seconds" \
+    --argjson nothingToDo "$nothing_to_do" --argjson exit "$code" \
+    '{status:(if $exit == 0 then "installed" else "failed" end), manifest:$manifest,
+      reason:(if $exit == 0 then null else "exit \($exit)" end), seconds:$seconds,
+      nothingToDo:$nothingToDo}' > "$RUN_DIR/install.json"
   [ "$code" -eq 0 ] || return "$code"
-  jq -cn --arg manifest "$manifest" \
-    '{status:"installed", manifest:$manifest, reason:null}' > "$RUN_DIR/install.json"
 }
 
 do_check() {

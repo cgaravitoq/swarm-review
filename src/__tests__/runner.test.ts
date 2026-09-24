@@ -798,6 +798,9 @@ if [ ! -f package.json ]; then
   printf 'error: Bun could not find a package.json file to install from\\n' >&2
   exit 1
 fi
+if [ "\${FAKE_BUN_NO_CHANGES:-}" = "1" ]; then
+  printf 'Checked 10 installs across 20 packages (no changes)\\n' >&2
+fi
 exit "\${FAKE_BUN_INSTALL_EXIT:-0}"
 `,
     );
@@ -899,6 +902,8 @@ child.on("exit", (code, signal) => {
       status: "skipped",
       manifest: null,
       reason: "the checkout root has no package.json",
+      seconds: null,
+      nothingToDo: null,
     });
     // Reaching the review step is only half of it: the reviewer has to have
     // been handed a prompt, and the install must never have been attempted.
@@ -939,6 +944,17 @@ child.on("exit", (code, signal) => {
       status: "installed",
       manifest: "bun.lock",
       reason: null,
+      seconds: expect.any(Number),
+      nothingToDo: false,
+    });
+    expect(
+      JSON.parse(await readFile(join(prepared.run, "status.json"), "utf8")),
+    ).toMatchObject({
+      install: {
+        status: "installed",
+        seconds: expect.any(Number),
+        nothingToDo: false,
+      },
     });
     expect(steps.find((step) => step["step"] === "review")?.["exit"]).toBe(0);
     expect(await readFile(prepared.piArgv, "utf8")).toContain(
@@ -965,6 +981,26 @@ child.on("exit", (code, signal) => {
       exit: 3,
     });
     expect(steps.some((step) => step["step"] === "review")).toBe(false);
+  });
+
+  it("records Bun's no-changes result in status.json", async () => {
+    const prepared = await prepareRun("bun-no-changes", {
+      "package.json": '{"name":"demo"}\n',
+      "bun.lock": '{"lockfileVersion":1}\n',
+    });
+    const result = spawnSync("bash", [runnerScript, prepared.run], {
+      encoding: "utf8",
+      env: { ...prepared.env, FAKE_BUN_NO_CHANGES: "1" },
+    });
+    const status = JSON.parse(
+      await readFile(join(prepared.run, "status.json"), "utf8"),
+    );
+    expect(result.status).toBe(0);
+    expect(status.install).toMatchObject({
+      status: "installed",
+      nothingToDo: true,
+      seconds: expect.any(Number),
+    });
   });
 
   it("installs with bun when the checkout root carries the binary lockfile", async () => {
@@ -995,6 +1031,8 @@ child.on("exit", (code, signal) => {
       status: "installed",
       manifest: "bun.lockb",
       reason: null,
+      seconds: expect.any(Number),
+      nothingToDo: false,
     });
     expect(steps.find((step) => step["step"] === "review")?.["exit"]).toBe(0);
     expect(await readFile(prepared.piArgv, "utf8")).toContain(
@@ -1024,6 +1062,8 @@ child.on("exit", (code, signal) => {
       manifest: null,
       reason:
         "the checkout root has a package.json and no bun lockfile (found package-lock.json)",
+      seconds: null,
+      nothingToDo: null,
     });
     expect(await readFile(prepared.bunArgv, "utf8")).not.toContain(
       "install --frozen-lockfile",

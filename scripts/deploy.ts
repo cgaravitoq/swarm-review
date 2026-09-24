@@ -15,6 +15,7 @@ const targetManifests = [
   "bun.lock",
   "bunfig.toml",
   "patches/*",
+  "scripts/package.json",
   "apps/*/package.json",
   "agents/*/package.json",
   "packages/*/package.json",
