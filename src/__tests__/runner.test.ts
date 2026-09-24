@@ -798,10 +798,60 @@ if [ ! -f package.json ]; then
   printf 'error: Bun could not find a package.json file to install from\\n' >&2
   exit 1
 fi
-exit 0
+exit "\${FAKE_BUN_INSTALL_EXIT:-0}"
 `,
     );
     await chmod(join(bin, "bun"), 0o755);
+    // The runner bounds the install, the check and Pi with the image's
+    // coreutils `timeout`, which macOS does not carry. Without it every one of
+    // those steps exits 127 on this host, so the double stands in for that one
+    // host tool: it takes the option shape the runner uses, cuts the child's
+    // own process group at the limit, and reports the statuses coreutils
+    // reports: the child's own, 128 plus the signal that killed it, 124 for a
+    // cut child, and 137 for one the -k KILL had to end.
+    await writeFile(
+      join(bin, "timeout"),
+      `#!/usr/bin/env node
+const { spawn } = require("node:child_process");
+const { signals } = require("node:os").constants;
+
+const argv = process.argv.slice(2);
+let killAfter = null;
+if (argv[0] === "-k") {
+  killAfter = Number(argv[1]);
+  argv.splice(0, 2);
+}
+const limit = Number(argv[0]);
+if (!Number.isFinite(limit) || !argv[1]) {
+  process.stderr.write("timeout: expected a duration and a command\\n");
+  process.exit(125);
+}
+const child = spawn(argv[1], argv.slice(2), {
+  stdio: "inherit",
+  detached: true,
+});
+let expired = false;
+const limitTimer = setTimeout(() => {
+  expired = true;
+  try {
+    process.kill(-child.pid, "SIGTERM");
+  } catch {}
+  if (killAfter !== null) {
+    setTimeout(() => {
+      try {
+        process.kill(-child.pid, "SIGKILL");
+      } catch {}
+    }, killAfter * 1000);
+  }
+}, limit * 1000);
+child.on("exit", (code, signal) => {
+  clearTimeout(limitTimer);
+  if (expired) process.exit(signal === "SIGKILL" ? 128 + signals.SIGKILL : 124);
+  process.exit(signal ? 128 + signals[signal] : code);
+});
+`,
+    );
+    await chmod(join(bin, "timeout"), 0o755);
     return {
       root,
       run,
@@ -853,6 +903,9 @@ exit 0
     // Reaching the review step is only half of it: the reviewer has to have
     // been handed a prompt, and the install must never have been attempted.
     expect(await readFile(prepared.piArgv, "utf8")).toContain("--mode json");
+    expect(await readFile(prepared.piArgv, "utf8")).toContain(
+      "-- review this change",
+    );
     expect(await readFile(prepared.bunArgv, "utf8")).not.toContain(
       "install --frozen-lockfile",
     );
@@ -887,6 +940,31 @@ exit 0
       manifest: "bun.lock",
       reason: null,
     });
+    expect(steps.find((step) => step["step"] === "review")?.["exit"]).toBe(0);
+    expect(await readFile(prepared.piArgv, "utf8")).toContain(
+      "-- review this change",
+    );
+  });
+
+  it("ends the lane with the install's own exit when bun refuses the lockfile", async () => {
+    const prepared = await prepareRun("bun-install-refused", {
+      "package.json": '{"name":"demo"}\n',
+      "bun.lock": '{"lockfileVersion":1}\n',
+    });
+
+    // An exit no wrapper would invent, so the lane can only end with it if
+    // every hop between bun and the runner's status passed it through.
+    const result = spawnSync("bash", [runnerScript, prepared.run], {
+      encoding: "utf8",
+      env: { ...prepared.env, FAKE_BUN_INSTALL_EXIT: "3" },
+    });
+    const steps = await readSteps(prepared.run);
+
+    expect(result.status).toBe(3);
+    expect(steps.find((step) => step["step"] === "install")).toMatchObject({
+      exit: 3,
+    });
+    expect(steps.some((step) => step["step"] === "review")).toBe(false);
   });
 
   it("installs with bun when the checkout root carries the binary lockfile", async () => {
@@ -918,6 +996,10 @@ exit 0
       manifest: "bun.lockb",
       reason: null,
     });
+    expect(steps.find((step) => step["step"] === "review")?.["exit"]).toBe(0);
+    expect(await readFile(prepared.piArgv, "utf8")).toContain(
+      "-- review this change",
+    );
   });
 
   it("names the resolver it could not follow instead of installing a foreign tree", async () => {
@@ -931,6 +1013,7 @@ exit 0
       encoding: "utf8",
       env: prepared.env,
     });
+    const steps = await readSteps(prepared.run);
     const report = JSON.parse(
       await readFile(join(prepared.run, "report.json"), "utf8"),
     );
@@ -944,6 +1027,10 @@ exit 0
     });
     expect(await readFile(prepared.bunArgv, "utf8")).not.toContain(
       "install --frozen-lockfile",
+    );
+    expect(steps.find((step) => step["step"] === "review")?.["exit"]).toBe(0);
+    expect(await readFile(prepared.piArgv, "utf8")).toContain(
+      "-- review this change",
     );
   });
 });
@@ -979,6 +1066,7 @@ describe("supervised native Pi RPC lifecycle", { timeout: 120_000 }, () => {
     jobExtra: Record<string, unknown> = {},
     piEnv: Record<string, string> = {},
     entry: "bridge" | "main" = "bridge",
+    startedSecondsEarly = 0,
   ) => {
     const root = await mkdtemp(join(tmpdir(), "review-pi-supervised-"));
     temporaryDirectories.push(root);
@@ -1067,6 +1155,7 @@ if (!/^[A-Za-z0-9](?:[A-Za-z0-9._-]*[A-Za-z0-9])?$/.test(sessionId)) {
   process.exit(2);
 }
 let stateAnswers = 0;
+let steeredToolOpen = false;
 if (process.env.PI_ARGS_LOG) {
   fs.appendFileSync(process.env.PI_ARGS_LOG, JSON.stringify(args) + "\\n");
 }
@@ -1121,11 +1210,16 @@ process.stdin.on("data", (chunk) => {
     }
 
     const cmdId = cmd.id;
+    if (process.env.PI_CLOCK_LOG) {
+      fs.appendFileSync(process.env.PI_CLOCK_LOG, JSON.stringify({ type: cmd.type, at: Date.now() }) + "\\n");
+    }
 
     if (cmd.type === "get_state") {
-      const delay = stateAnswers === 0 ? Number(process.env.PI_STATE_DELAY_MS || 0) : 0;
+      const first = stateAnswers === 0;
+      const delay = first ? Number(process.env.PI_STATE_DELAY_MS || 0) : 0;
+      const gate = first ? process.env.PI_STATE_GATE : undefined;
       stateAnswers += 1;
-      setTimeout(() => process.stdout.write(JSON.stringify({
+      const answer = () => process.stdout.write(JSON.stringify({
         id: cmdId,
         type: "response",
         command: "get_state",
@@ -1136,7 +1230,10 @@ process.stdin.on("data", (chunk) => {
           isStreaming: false,
           messageCount: 0,
         },
-      }) + "\\n"), delay);
+      }) + "\\n");
+      const answerOnceOpen = () =>
+        !gate || fs.existsSync(gate) ? answer() : setTimeout(answerOnceOpen, 20);
+      setTimeout(answerOnceOpen, delay);
     } else if (cmd.type === "steer") {
       if (process.env.PI_STEER_LOG) {
         fs.appendFileSync(process.env.PI_STEER_LOG, cmd.message + "\\n");
@@ -1147,6 +1244,18 @@ process.stdin.on("data", (chunk) => {
         command: "steer",
         success: true,
       }) + "\\n");
+      if (steeredToolOpen) {
+        steeredToolOpen = false;
+        process.stdout.write(JSON.stringify({
+          type: "turn_end",
+          message: { stopReason: "stop", usage: { input: 10, output: 10, totalTokens: 20 } },
+        }) + "\\n");
+        process.stdout.write(JSON.stringify({
+          type: "agent_end",
+          messages: [{ role: "assistant", content: [{ type: "text", text: "Steered review finished" }] }],
+        }) + "\\n");
+        process.stdout.write(JSON.stringify({ type: "agent_settled" }) + "\\n");
+      }
     } else if (cmd.type === "abort") {
       process.stdout.write(JSON.stringify({
         id: cmdId,
@@ -1215,7 +1324,26 @@ process.stdin.on("data", (chunk) => {
         continue;
       }
 
-      if (cmd.message.includes("silent tool")) {
+      if (cmd.message.includes("steered tool")) {
+        // A real turn stays open between a tool's result and the request
+        // that follows it; this one stays open until the runner steers it.
+        process.stdout.write(JSON.stringify({
+          type: "tool_execution_start",
+          toolCallId: "call_steered_1",
+          toolName: "bash",
+          args: { command: "check.sh" },
+        }) + "\\n");
+        setTimeout(() => {
+          process.stdout.write(JSON.stringify({
+            type: "tool_execution_end",
+            toolCallId: "call_steered_1",
+            toolName: "bash",
+            isError: false,
+            result: { content: [{ type: "text", text: "tool completed" }] },
+          }) + "\\n");
+          steeredToolOpen = true;
+        }, 80);
+      } else if (cmd.message.includes("silent tool")) {
         process.stdout.write(JSON.stringify({
           type: "tool_execution_start",
           toolCallId: "call_tool_1",
@@ -1472,6 +1600,31 @@ process.stdin.on("data", (chunk) => {
       new URL("../../container/review-run.sh", import.meta.url),
     );
 
+    // A lane's window counts down from the whole second the runner's
+    // `date +%s` read, which no test can observe, so the test names that
+    // second itself: the one it starts the runner in, or an earlier one for a
+    // lane whose clock started before its bridge, as it does after a clone.
+    // That lane starts at the top of a second, so the seconds its clock has
+    // already run are whole too. Only that first read is the test's: every
+    // later one is the runner timing its own steps.
+    if (startedSecondsEarly > 0) {
+      await new Promise((resolve) =>
+        setTimeout(resolve, 1000 - (Date.now() % 1000)),
+      );
+    }
+    const startedAt =
+      (Math.floor(Date.now() / 1000) - startedSecondsEarly) * 1000;
+    await writeFile(
+      join(binDir, "date"),
+      `#!/bin/sh
+if [ "$1" = "+%s" ] && mkdir "${join(binDir, "date-started")}" 2>/dev/null; then
+  echo ${startedAt / 1000}
+  exit 0
+fi
+exec /bin/date "$@"
+`,
+    );
+    await chmod(join(binDir, "date"), 0o755);
     const argv = entry === "main" ? [runner, root] : [runner, root, "--bridge"];
     const runnerProc = spawn("bash", argv, {
       env: {
@@ -1481,6 +1634,7 @@ process.stdin.on("data", (chunk) => {
         PI_ARGS_LOG: join(root, "pi-args.jsonl"),
         PI_STEER_LOG: join(root, "pi-steer.log"),
         PI_PROMPT_LOG: join(root, "pi-prompt.log"),
+        PI_CLOCK_LOG: join(root, "pi-clock.jsonl"),
         PI_DESCENDANT_PID: join(root, "descendant.pid"),
         ...piEnv,
       },
@@ -1507,7 +1661,7 @@ process.stdin.on("data", (chunk) => {
     // its first turn closes it again before a poll could see it.
     if (entry === "bridge") await waitForSocket(sockPath);
 
-    return { root, sockPath, runnerProc };
+    return { root, sockPath, runnerProc, startedAt };
   };
 
   /** The arguments of the first Pi this run spawned, as it logged them. */
@@ -1648,6 +1802,72 @@ process.stdin.on("data", (chunk) => {
       await new Promise((r) => setTimeout(r, 20));
     }
     throw new Error(`Predicate on ${tracePath} not met after ${timeoutMs}ms`);
+  };
+
+  /** A log the fake Pi appends to, once it holds what the test waits for. */
+  const waitForLog = async (
+    path: string,
+    predicate: (log: string) => boolean,
+    timeoutMs = SUPERVISED_WAIT_MS,
+  ) => {
+    const start = Date.now();
+    while (Date.now() - start < timeoutMs) {
+      try {
+        const log = await readFile(path, "utf8");
+        if (predicate(log)) return log;
+      } catch {}
+      await new Promise((r) => setTimeout(r, 20));
+    }
+    throw new Error(`Predicate on ${path} not met after ${timeoutMs}ms`);
+  };
+
+  /** When Pi read the bridge's nth command of a type, by Pi's own clock. */
+  const piReadAt = async (root: string, type: string, nth = 0) => {
+    const read = (await readFile(join(root, "pi-clock.jsonl"), "utf8"))
+      .trim()
+      .split("\n")
+      .map((line) => JSON.parse(line) as { type: string; at: number })
+      .filter((line) => line.type === type)[nth];
+    if (!read) throw new Error(`Pi read no ${type} #${nth}`);
+    return read.at;
+  };
+
+  /**
+   * The windows the bridge can have printed at a briefing.
+   *
+   * It prints `total` less the whole seconds since the start the test pinned,
+   * reading its own clock once, after `earliest` and before `latest`. Both are
+   * instants this test saw, so the two ends meet on one value unless that span
+   * crosses a whole second, and a loaded host moves them with it.
+   */
+  const windowBetween = (
+    total: number,
+    startedAt: number,
+    earliest: number,
+    latest: number,
+  ) => ({
+    most: Math.max(0, total - Math.floor((earliest - startedAt) / 1000)),
+    least: Math.max(0, total - Math.floor((latest - startedAt) / 1000)),
+  });
+
+  /** The window the runner appended to the first prompt it sent. */
+  const promptWindow = (prompt: string) => {
+    const match =
+      /Budget for this lane: (\d+) model requests and (\d+) seconds\./.exec(
+        prompt,
+      );
+    if (!match) throw new Error(`no budget note in the prompt: ${prompt}`);
+    return { requests: Number(match[1]), seconds: Number(match[2]) };
+  };
+
+  /** The seconds notice the runner sent at a tool boundary, as the model read it. */
+  const secondsNotice = (steers: string) => {
+    const match =
+      /Budget notice from the runner: (\d+) of (\d+) seconds spent\./.exec(
+        steers,
+      );
+    if (!match) throw new Error(`no seconds notice in the steers: ${steers}`);
+    return { spent: Number(match[1]), cap: Number(match[2]) };
   };
 
   const waitForExit = (
@@ -1902,30 +2122,42 @@ process.stdin.on("data", (chunk) => {
     // A lane that reaches a cap is cut without an answer. The notice is what
     // turns "budget spent" into "answer with what you have", so it must reach
     // Pi as a steer at a tool boundary before the request that would cross it.
-    const { root, sockPath, runnerProc } = await prepareSupervisedRun(
-      "budget-requests",
-      "standby",
-      "openai-codex",
-      {
+    const { root, sockPath, runnerProc, startedAt } =
+      await prepareSupervisedRun("budget-requests", "standby", "openai-codex", {
         budget: { requests: 4, inputTokens: 1_000_000 },
         totalTimeoutSeconds: 100_000,
-      },
-    );
+      });
     try {
       const statusPath = join(root, "status.json");
       await waitForStandbySettled(statusPath);
       const firstPrompt = await readFile(join(root, "pi-prompt.log"), "utf8");
-      expect(firstPrompt).toMatch(
-        /Budget for this lane: 4 model requests and (100000|99999) seconds\./,
+      const window = promptWindow(firstPrompt);
+      expect(window.requests).toBe(4);
+      // The bridge briefs the lane once Pi has answered its first state, so
+      // the window it is told is what was left between Pi reading that state
+      // request and Pi reading the prompt: never a list of the numbers a
+      // loaded host can print.
+      const briefed = windowBetween(
+        100_000,
+        startedAt,
+        await piReadAt(root, "get_state"),
+        await piReadAt(root, "prompt"),
       );
+      expect(window.seconds).toBeLessThanOrEqual(briefed.most);
+      expect(window.seconds).toBeGreaterThanOrEqual(briefed.least);
 
       // The standby turn was request 1. Two tool turns more: the notice fires
-      // at the end of the third turn's tool, when 3 of 4 have been spent.
-      for (const id of ["tool-1", "tool-2"]) {
+      // at the end of the third turn's tool, when 3 of 4 have been spent, and
+      // that turn only ends once the notice has reached Pi, so a notice sent
+      // anywhere after the tool boundary never arrives.
+      for (const [id, tool] of [
+        ["tool-1", "silent tool"],
+        ["tool-2", "steered tool"],
+      ]) {
         await sendCommand(sockPath, {
           id,
           type: "prompt",
-          message: `run silent tool ${id}`,
+          message: `run ${tool} ${id}`,
         });
         await waitForStatus(
           statusPath,
@@ -1962,23 +2194,45 @@ process.stdin.on("data", (chunk) => {
   });
 
   it("tells the model to finish when three quarters of its window are gone", async () => {
-    // The runner's own start is a whole second and its own startup is not
-    // free, so the model is told the three seconds or what that left of them.
-    const { root, sockPath, runnerProc } = await prepareSupervisedRun(
-      "budget-seconds",
-      "standby",
-      "openai-codex",
-      {
-        budget: { requests: 1_000, inputTokens: 1_000_000 },
-        totalTimeoutSeconds: 3,
-      },
-    );
+    // The runner's clock started a second before its bridge, so the lane is
+    // told nineteen of its twenty seconds, or less on a slower startup, and the
+    // notice is measured against the window it was told rather than the one it
+    // started with. A loaded host's startup has spent five seconds before
+    // the briefing, so the window leaves it room to brief the lane in time.
+    const { root, sockPath, runnerProc, startedAt } =
+      await prepareSupervisedRun(
+        "budget-seconds",
+        "standby",
+        "openai-codex",
+        {
+          budget: { requests: 1_000, inputTokens: 1_000_000 },
+          totalTimeoutSeconds: 20,
+        },
+        {},
+        "bridge",
+        1,
+      );
     try {
       const statusPath = join(root, "status.json");
       await waitForStandbySettled(statusPath);
-      // Past the whole window before the tool turn, so the boundary the
-      // notice is measured at is on the far side of it.
-      await new Promise((resolve) => setTimeout(resolve, 3_100));
+      const window = promptWindow(
+        await readFile(join(root, "pi-prompt.log"), "utf8"),
+      );
+      const briefedAfter = await piReadAt(root, "get_state");
+      const briefedBefore = await piReadAt(root, "prompt");
+      const briefed = windowBetween(20, startedAt, briefedAfter, briefedBefore);
+      expect(window.seconds).toBeLessThanOrEqual(briefed.most);
+      expect(window.seconds).toBeGreaterThanOrEqual(briefed.least);
+      // A startup that spent the whole window leaves no notice to send.
+      expect(window.seconds).toBeGreaterThan(0);
+      // The tool turn starts once three quarters of that window are gone by
+      // Pi's clock, which is late enough for the notice and, for a window of
+      // four seconds or more, too early for one that waited for all of it.
+      const threeQuarters =
+        briefedBefore + Math.ceil(window.seconds * 0.75) * 1000 + 100;
+      await new Promise((resolve) =>
+        setTimeout(resolve, Math.max(0, threeQuarters - Date.now())),
+      );
       await sendCommand(sockPath, {
         id: "tool-1",
         type: "prompt",
@@ -1989,9 +2243,22 @@ process.stdin.on("data", (chunk) => {
         (line) =>
           line["type"] === "budget_notice" && line["name"] === "seconds",
       );
-      const steers = await readFile(join(root, "pi-steer.log"), "utf8");
-      expect(steers).toMatch(
-        /Budget notice from the runner: \d+ of [123] seconds spent\./,
+      // The bridge traces the notice before it sends it, and Pi logs its
+      // clock read before the steer, so the steer's own line orders both.
+      const steers = await waitForLog(join(root, "pi-steer.log"), (log) =>
+        log.includes("seconds spent."),
+      );
+      const notice = secondsNotice(steers);
+      expect(notice.cap).toBe(window.seconds);
+      // What the notice says was spent is the time from the briefing to the
+      // tool boundary it fired at, bracketed by what Pi read on either side.
+      const toolPromptedAt = await piReadAt(root, "prompt", 1);
+      const steeredAt = await piReadAt(root, "steer");
+      expect(notice.spent).toBeGreaterThanOrEqual(
+        Math.floor((toolPromptedAt - briefedBefore) / 1000),
+      );
+      expect(notice.spent).toBeLessThanOrEqual(
+        Math.floor((steeredAt - briefedAfter) / 1000),
       );
 
       await waitForStatus(
@@ -2010,26 +2277,38 @@ process.stdin.on("data", (chunk) => {
     // prompt has nothing else to move it: the 2026-09-15 sandbox verifier
     // stayed "running" with an idle child for the whole run and was never
     // briefed. The answer settles the state whenever it arrives.
+    const gateDir = await mkdtemp(join(tmpdir(), "review-pi-state-gate-"));
+    temporaryDirectories.push(gateDir);
+    const gate = join(gateDir, "open");
     const { root, sockPath, runnerProc } = await prepareSupervisedRun(
       "late-first-state",
       null,
       "openai-codex",
       {},
-      { PI_STATE_DELAY_MS: "6000" },
+      { PI_STATE_DELAY_MS: "6000", PI_STATE_GATE: gate },
     );
     try {
       const statusPath = join(root, "status.json");
+      // Pi holds its first answer until the gate opens, so the state read
+      // before it is the one the lane has with no answer at all, however late
+      // a loaded host lets this test read it.
       const early = await waitForStatus(
         statusPath,
         (s) => objectValue(s["process"])["alive"] === true,
       );
       expect(early["state"]).toBe("running");
+      await writeFile(gate, "");
       const settled = await waitForStatus(
         statusPath,
         (s) => s["childIdle"] === true,
         10_000,
       );
       expect(settled["state"]).toBe("idle");
+      // The bridge had stopped waiting: an answer inside the init wait would
+      // have resolved that wait instead of arriving unmatched.
+      expect(await readFile(join(root, "pi.stderr"), "utf8")).toContain(
+        "unmatched response from pi",
+      );
 
       await sendCommand(sockPath, {
         id: "brief",
@@ -2049,19 +2328,16 @@ process.stdin.on("data", (chunk) => {
     // prompt, and a briefed lane idles for most of the run before it has one.
     // The 2026-09-15 sandbox lanes were told 355 s of a 508 s window after a
     // 308 s install, so the notice keyed to it never came.
-    const { root, sockPath, runnerProc } = await prepareSupervisedRun(
-      "budget-window-left",
-      null,
-      "openai-codex",
-      {
+    const { root, sockPath, runnerProc, startedAt } =
+      await prepareSupervisedRun("budget-window-left", null, "openai-codex", {
         budget: { requests: 1_000, inputTokens: 1_000_000 },
         totalTimeoutSeconds: 5,
-      },
-    );
+      });
     try {
       const statusPath = join(root, "status.json");
       await waitForStatus(statusPath, (s) => s["childIdle"] === true);
       await new Promise((resolve) => setTimeout(resolve, 2_100));
+      const briefedAfter = Date.now();
       await sendCommand(sockPath, {
         id: "brief",
         type: "prompt",
@@ -2069,9 +2345,20 @@ process.stdin.on("data", (chunk) => {
       });
       await waitForStandbySettled(statusPath);
       const prompt = await readFile(join(root, "pi-prompt.log"), "utf8");
-      expect(prompt).toMatch(
-        /Budget for this lane: 1000 model requests and [123] seconds\./,
+      const window = promptWindow(prompt);
+      expect(window.requests).toBe(1_000);
+      // The lane idled past half of its 5 s window before it was briefed, and
+      // the bridge read its clock between this test sending the brief and Pi
+      // reading it, so the window it is told is what was left then: at most
+      // three seconds, never the five it started with.
+      const briefed = windowBetween(
+        5,
+        startedAt,
+        briefedAfter,
+        await piReadAt(root, "prompt"),
       );
+      expect(window.seconds).toBeLessThanOrEqual(briefed.most);
+      expect(window.seconds).toBeGreaterThanOrEqual(briefed.least);
 
       await sendCommand(sockPath, { type: "accept" });
       await waitForExit(runnerProc);
