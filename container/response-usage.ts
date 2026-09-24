@@ -21,12 +21,14 @@ const objectRecord = (value: unknown): Record<string, unknown> | null =>
  * Reads the usage a provider reported in one response as it streams through a
  * model hop, from every frame, wherever in the response it arrives.
  *
+ * A Responses answer reports both sides on a closing event that repeats the
+ * whole answer, so a reading kept to the tail of a long answer loses both.
  * Anthropic reports the input on the frame it opens with and the output on the
- * one it closes with, and a Responses answer reports both on a closing event
- * that repeats the whole answer, so a reading kept to the tail of a long answer
- * loses the first side of the one and both of the other. Each field keeps the
- * last value any frame gave it, as pi's own reader does: a closing frame
- * repeats its counts cumulatively and may leave out the ones it does not know.
+ * one it closes with; the one stream captured on 2026-09-24 repeated the input
+ * and both cache fields on its closing frame as well, but the reader does not
+ * depend on that repeat. Each field keeps the last value any frame gave it, as
+ * pi's own reader does, so a closing frame that leaves a field out or sends it
+ * as null keeps the value an earlier frame gave it.
  *
  * Anthropic also reports the cached halves of a prompt apart from
  * `input_tokens`, and a review that caches its context spends most of its input
