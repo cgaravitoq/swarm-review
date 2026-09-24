@@ -88,6 +88,21 @@ describe("commentable lines", () => {
 });
 
 describe("review payload", () => {
+  it("marks a packed fork in Coverage", () => {
+    const body = buildReview(
+      receipt([]),
+      new Map(),
+      "acme/demo",
+      "P2",
+      true,
+    ).body;
+    expect(body).toContain("<summary>Coverage</summary>\n");
+    expect(body).toContain("- fork reviewed with packed lanes");
+    expect(buildReview(receipt([]), new Map(), "acme/demo").body).not.toContain(
+      "fork reviewed",
+    );
+  });
+
   it("anchors a finding on a diff line and never requests changes", () => {
     const review = buildReview(
       receipt([finding()]),
@@ -1212,6 +1227,26 @@ describe("a run that publishes no review", () => {
           (init as RequestInit | undefined)?.method === "POST",
       ),
     ).toHaveLength(1);
+  });
+
+  it("publishes the packed fork note in the review body", async () => {
+    const api = github();
+    const receiptPath = await artifact(completed());
+
+    await publish(receiptPath, env, ["--publish", "--fork"]);
+
+    const request = api.fetchMock.mock.calls.find(
+      ([url, init]) =>
+        String(url).includes("/pulls/7/reviews") &&
+        (init as RequestInit | undefined)?.method === "POST",
+    );
+    const payload = JSON.parse(
+      String((request?.[1] as RequestInit | undefined)?.body),
+    ) as {
+      body: string;
+    };
+    expect(payload.body).toContain("<summary>Coverage</summary>");
+    expect(payload.body).toContain("- fork reviewed with packed lanes");
   });
 
   it("keeps one comment per run id and edits it on a re-run", async () => {

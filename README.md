@@ -44,6 +44,14 @@ bun run src/swarm.ts \
   --out /tmp/swarm-1234
 ```
 
+### GitHub Action
+
+The composite action reviews a pull request on the job's Docker host and publishes confirmed findings.
+It needs a Workers AI API key, a GitHub token with pull request review access, and package write access when it must build and push a missing sandbox image.
+The `mode` input defaults to `auto`: pull requests from this repository use three sandbox reviewer lanes, while forks use packed lanes and carry that limit in the review's Coverage section.
+Set `mode: packed` or `mode: sandbox` to choose explicitly.
+The action pulls the image tagged from its container sources and the pull request head's lockfile, or builds and pushes it when absent.
+
 ## A Claude Code subscription lane
 
 A lane can review on a Claude Code subscription instead of a provider API key, which is the only route to the Opus models here.
