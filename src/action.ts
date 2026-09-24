@@ -10,6 +10,7 @@ type Env = Record<string, string | undefined>;
 /** Which step a run died in, as `failure.json` reports it. */
 type Stage =
   | "pull request lookup"
+  | "runner check"
   | "account lookup"
   | "registry login"
   | "image pull"
@@ -93,6 +94,7 @@ export async function main(env: Env = process.env): Promise<void> {
   const swarmDir = join(out, swarmId);
   let stage: Stage = "pull request lookup";
   let packedFork = false;
+  let packedRunner: string | undefined;
   let runEnv = env;
   try {
     const { stdout } = await exec(
@@ -106,8 +108,23 @@ export async function main(env: Env = process.env): Promise<void> {
     const headRepository = pull.head?.repo?.full_name;
     if (!headRepository) throw new Error("pull request has no head repository");
     const fork = headRepository.toLowerCase() !== repository.toLowerCase();
-    const selected = mode === "auto" ? (fork ? "packed" : "sandbox") : mode;
+    const runnerArch = env["RUNNER_ARCH"] || "unknown";
+    const runsSandboxImage = runnerArch === "X64";
+    const selected =
+      mode === "auto"
+        ? fork || !runsSandboxImage
+          ? "packed"
+          : "sandbox"
+        : mode;
+    if (selected === "sandbox" && !runsSandboxImage) {
+      stage = "runner check";
+      throw new Error(
+        `sandbox mode needs an X64 runner: RUNNER_ARCH is ${runnerArch}`,
+      );
+    }
     packedFork = fork && selected === "packed";
+    packedRunner =
+      selected === "packed" && !runsSandboxImage ? runnerArch : undefined;
     stage = "account lookup";
     runEnv = { ...env, CLOUDFLARE_ACCOUNT_ID: await accountId(env) };
     const args = [
@@ -227,6 +244,7 @@ export async function main(env: Env = process.env): Promise<void> {
       "--publish",
       "--allow-moved-head",
       ...(packedFork ? ["--fork"] : []),
+      ...(packedRunner ? ["--packed-runner", packedRunner] : []),
     ],
     runEnv,
   );
