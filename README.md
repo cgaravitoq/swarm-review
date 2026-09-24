@@ -48,8 +48,8 @@ bun run src/swarm.ts \
 
 The composite action reviews a pull request on the job's Docker host and publishes confirmed findings.
 It needs a Workers AI API key, a GitHub token with pull request review access, and package write access when it must build and push a missing sandbox image.
-The `mode` input defaults to `auto`: pull requests from this repository use three sandbox reviewer lanes, while forks use packed lanes and carry that limit in the review's Coverage section.
-Set `mode: packed` or `mode: sandbox` to choose explicitly.
+The `mode` input defaults to `auto`: pull requests from this repository use three sandbox reviewer lanes, while forks, and runners whose `RUNNER_ARCH` cannot run the `linux/amd64` sandbox image, use packed lanes and carry that limit in the review's Coverage section.
+Set `mode: packed` or `mode: sandbox` to choose explicitly; `mode: sandbox` needs an `X64` runner and refuses any other before the registry login.
 The action pulls the image tagged from its container sources and the pull request head's lockfile, or builds and pushes it when absent.
 
 ## A Claude Code subscription lane

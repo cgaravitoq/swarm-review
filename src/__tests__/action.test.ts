@@ -60,6 +60,7 @@ async function arrange(headRepo: string, pullSucceeds: boolean) {
     GITHUB_TOKEN: "test-token",
     RUNNER_TEMP: root,
     PULL_REQUEST: "42",
+    RUNNER_ARCH: "X64",
     CLOUDFLARE_ACCOUNT_ID: "account",
     WORKERS_AI_API_KEY: "test-key",
   };
@@ -104,6 +105,62 @@ describe("composite action driver", () => {
     );
     expect(log.find((line) => line.includes("src/publish.ts"))).not.toContain(
       "--fork",
+    );
+  });
+
+  it("reviews through packed lanes when the runner cannot run the sandbox image", async () => {
+    const fixture = await arrange("acme/demo", true);
+    await main({ ...fixture.env, RUNNER_ARCH: "ARM64", INPUT_MODE: "auto" });
+    const log = await fixture.log();
+    expect(log.some((line) => line.startsWith("docker "))).toBe(false);
+    expect(log.find((line) => line.includes("src/swarm.ts"))).toBe(
+      `bun ${packageRoot}/src/swarm.ts --repo acme/demo --source ${fixture.env.GITHUB_WORKSPACE}/swarm-review-source --pr 42 --provider cloudflare-workers-ai --model @cf/deepseek-ai/deepseek-v4-flash-0731 --reviewers 3 --swarm-id pr-42-123-1 --out ${fixture.env.RUNNER_TEMP}/swarm-review`,
+    );
+    expect(await fixture.swarmArgs()).not.toContain("--sandbox");
+    expect(log.find((line) => line.includes("src/publish.ts"))).toContain(
+      "--packed-runner ARM64",
+    );
+    expect(log.at(-1)).toBe(
+      `bun ${packageRoot}/src/publish.ts --receipt ${fixture.env.RUNNER_TEMP}/swarm-review/pr-42-123-1/swarm-receipt.json --repo acme/demo --pr 42 --publish --allow-moved-head --packed-runner ARM64`,
+    );
+  });
+
+  it("reviews through packed lanes when the runner reports no architecture", async () => {
+    const fixture = await arrange("acme/demo", true);
+    const { RUNNER_ARCH: _arch, ...withoutArch } = fixture.env;
+    await main({ ...withoutArch, INPUT_MODE: "auto" });
+    const log = await fixture.log();
+    expect(log.some((line) => line.startsWith("docker "))).toBe(false);
+    expect(log.find((line) => line.includes("src/swarm.ts"))).not.toContain(
+      "--sandbox",
+    );
+    expect(log.at(-1)).toBe(
+      `bun ${packageRoot}/src/publish.ts --receipt ${fixture.env.RUNNER_TEMP}/swarm-review/pr-42-123-1/swarm-receipt.json --repo acme/demo --pr 42 --publish --allow-moved-head --packed-runner unknown`,
+    );
+  });
+
+  it("refuses sandbox mode on a runner that cannot run the sandbox image", async () => {
+    const fixture = await arrange("acme/demo", true);
+    await main({ ...fixture.env, RUNNER_ARCH: "ARM64", INPUT_MODE: "sandbox" });
+    const log = await fixture.log();
+    expect(log.some((line) => line.startsWith("docker "))).toBe(false);
+    expect(log.some((line) => line.includes("src/swarm.ts"))).toBe(false);
+    expect(await fixture.failure()).toEqual({
+      stage: "runner check",
+      message: "sandbox mode needs an X64 runner: RUNNER_ARCH is ARM64",
+    });
+  });
+
+  it("carries both packed lane limits for a fork on a runner that cannot run the image", async () => {
+    const fixture = await arrange("contributor/demo", true);
+    await main({ ...fixture.env, RUNNER_ARCH: "ARM64", INPUT_MODE: "auto" });
+    const log = await fixture.log();
+    expect(log.some((line) => line.startsWith("docker "))).toBe(false);
+    expect(log.find((line) => line.includes("src/swarm.ts"))).not.toContain(
+      "--sandbox",
+    );
+    expect(log.at(-1)).toBe(
+      `bun ${packageRoot}/src/publish.ts --receipt ${fixture.env.RUNNER_TEMP}/swarm-review/pr-42-123-1/swarm-receipt.json --repo acme/demo --pr 42 --publish --allow-moved-head --fork --packed-runner ARM64`,
     );
   });
 

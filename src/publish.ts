@@ -147,6 +147,7 @@ export function parsePublishOptions(argv: string[]) {
   const pullRequest = flag(argv, "pr");
   const expectedHead = flag(argv, "expected-head");
   const expectedMergeBase = flag(argv, "expected-merge-base");
+  const packedRunner = flag(argv, "packed-runner");
   return {
     receiptPath,
     repo,
@@ -156,6 +157,7 @@ export function parsePublishOptions(argv: string[]) {
     publish: argv.includes("--publish"),
     allowMovedHead: argv.includes("--allow-moved-head"),
     fork: argv.includes("--fork"),
+    ...(packedRunner ? { packedRunner } : {}),
     minSeverity: flag(argv, "min-severity") ?? "P2",
   };
 }
@@ -476,6 +478,7 @@ export function buildReview(
   repo: string,
   minSeverity = "P2",
   fork = false,
+  packedRunner?: string,
 ) {
   const head = receipt.requested.head;
   const comments: {
@@ -613,6 +616,11 @@ export function buildReview(
     }),
   );
   if (fork) summary.push("- fork reviewed with packed lanes");
+  if (packedRunner) {
+    summary.push(
+      `- runner ${packedRunner} cannot run the sandbox image: reviewed with packed lanes`,
+    );
+  }
   if (receipt.coverage && receipt.coverage.uncoveredFiles.length > 0) {
     summary.push(
       `- not reviewed: ${receipt.coverage.uncoveredFiles.map((file) => `\`${file}\``).join(", ")}`,
@@ -1330,6 +1338,7 @@ export async function main(
       options.repo,
       options.minSeverity,
       options.fork,
+      options.packedRunner,
     );
     const payload = githubReviewPayload(built);
     const superseded = supersededReviews(validated.reviews);
