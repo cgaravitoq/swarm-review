@@ -550,6 +550,24 @@ describe("summary body", () => {
     );
   });
 
+  it("does not claim a sandbox for a verifier that read a pack", () => {
+    const body = build([finding({ id: "c1" })], {
+      lanes: [
+        {
+          role: "verifier",
+          model: "@cf/deepseek-ai/deepseek-v4-flash-0731",
+          status: "completed",
+        },
+      ],
+      verification: { mode: "packed" },
+    });
+
+    expect(body).toContain(
+      "1 candidate: 1 verified by deepseek-v4-flash-0731, 0 unverified",
+    );
+    expect(body).not.toContain("verified in sandbox");
+  });
+
   it("keeps a pre-existing defect the verifier reproduced in sight", () => {
     // 6797 carried a P1 reproduced by a sandbox test on a route the change
     // never touched; buried in the coverage block, nobody read it.

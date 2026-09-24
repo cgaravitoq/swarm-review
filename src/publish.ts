@@ -110,6 +110,7 @@ export type SwarmReceipt = {
     error?: string | null;
   }[];
   wallSeconds?: number;
+  verification?: { mode: string };
 };
 
 /**
@@ -440,8 +441,9 @@ const coverageLine = (
   if (reviewers.length > 0) parts.push(`reviewers ${reviewers.join(", ")}`);
   const verifiers = models("verifier");
   const verified = receipt.findings.length - counts.unverified;
+  const where = receipt.verification?.mode === "packed" ? "" : " in sandbox";
   parts.push(
-    `${count(receipt.findings.length, "candidate")}: ${verified} verified${verifiers.length > 0 ? ` in sandbox by ${verifiers.join(", ")}` : ""}, ${counts.unverified} unverified, ${counts.rejected} rejected, ${counts.outOfDiff} out-of-diff`,
+    `${count(receipt.findings.length, "candidate")}: ${verified} verified${verifiers.length > 0 ? `${where} by ${verifiers.join(", ")}` : ""}, ${counts.unverified} unverified, ${counts.rejected} rejected, ${counts.outOfDiff} out-of-diff`,
   );
   if (receipt.wallSeconds !== undefined) parts.push(`${receipt.wallSeconds} s`);
   return parts.join(" · ");
