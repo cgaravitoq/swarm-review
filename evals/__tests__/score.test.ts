@@ -94,7 +94,45 @@ describe("scoreT1a", () => {
       KEYS,
     );
 
-    expect(partial.usage).toEqual({ inputTokens: 300, unended: null });
+    expect(partial.usage).toEqual({ inputTokens: null, unended: null });
+  });
+
+  it("leaves a token total unobserved when a trial's counts say its sum is short", () => {
+    const ledger = (overrides: Record<string, number>) => ({
+      requests: 2,
+      retries: 0,
+      inputTokens: 100,
+      outputTokens: 10,
+      denials: 0,
+      unended: 0,
+      inputUnobserved: 0,
+      outputUnobserved: 0,
+      ...overrides,
+    });
+    const scored = (usage: Record<string, number>) =>
+      scoreT1a(
+        [
+          { ...t1aTrial("s1", "completed", []), usage },
+          { ...t1aTrial("s2", "completed", []), usage: ledger({}) },
+        ],
+        KEYS,
+      ).usage;
+
+    // A request that never ended is missing from both sums; an ended one that
+    // never reported a side is missing from that side's sum only.
+    expect(scored(ledger({ unended: 1 }))).toEqual({
+      ...ledger({ requests: 4, unended: 1 }),
+      inputTokens: null,
+      outputTokens: null,
+    });
+    expect(scored(ledger({ inputUnobserved: 1 }))).toEqual({
+      ...ledger({ requests: 4, inputUnobserved: 1 }),
+      inputTokens: null,
+      outputTokens: 20,
+    });
+    expect(scored(ledger({}))).toEqual(
+      ledger({ requests: 4, inputTokens: 200, outputTokens: 20 }),
+    );
   });
 
   it("treats a duplicate verdict as no decision at all", () => {

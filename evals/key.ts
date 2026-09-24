@@ -14,7 +14,7 @@
 
 import { existsSync } from "node:fs";
 import { readFile, writeFile } from "node:fs/promises";
-import { scoreT1b, type T1bScoredTrial } from "./score";
+import { scoreT1b, sumIsShort, type T1bScoredTrial } from "./score";
 
 export const LABELS = [
   "keyed-match",
@@ -168,8 +168,8 @@ const optionalNumber = (value: unknown) =>
  * spend, not a broken run, so it reads as absent instead of failing the sheet.
  *
  * A side the control side recorded as unobserved reads null, and so does a
- * sum its `inputUnobserved` or `outputUnobserved` count says is short: either
- * one read as a number would be quoted as the lane's whole spend.
+ * sum its own counts say is short (`sumIsShort`): either one read as a number
+ * would be quoted as the lane's whole spend.
  */
 const optionalUsage = (value: unknown) => {
   if (typeof value !== "object" || value === null || Array.isArray(value)) {
@@ -179,15 +179,15 @@ const optionalUsage = (value: unknown) => {
   const input = usage["inputTokens"] ?? usage["input"];
   const output = usage["outputTokens"] ?? usage["output"];
   if (input === undefined && output === undefined) return null;
-  const side = (tokens: unknown, unobserved: unknown) =>
+  const observed = (tokens: unknown, side: "input" | "output") =>
     typeof tokens === "number" &&
     Number.isInteger(tokens) &&
-    (unobserved === undefined || unobserved === 0)
+    !sumIsShort(usage, side)
       ? tokens
       : null;
   return {
-    inputTokens: side(input, usage["inputUnobserved"]),
-    outputTokens: side(output, usage["outputUnobserved"]),
+    inputTokens: observed(input, "input"),
+    outputTokens: observed(output, "output"),
   };
 };
 

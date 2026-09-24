@@ -15,6 +15,7 @@
 
 import type { SwarmReceipt } from "../../src/publish";
 import { publicationDisposition } from "../../src/publish";
+import { sumIsShort } from "../score";
 import type { AacrCase } from "./dataset";
 
 /** The floor `src/publish.ts` defaults to; `bun run src/publish.ts` posts P2 up. */
@@ -353,17 +354,15 @@ export const commentFrom = (entry: {
 });
 
 /**
- * A token total, or nothing when the usage never observed it: a sum its
- * unobserved count says is short is left out rather than published as whole.
+ * A token total, or nothing when the usage never observed it: a sum its own
+ * counts say is short is left out rather than published as whole.
  */
 const tokenTotal = (
   usage: Readonly<Record<string, number | null>> | null,
   keys: readonly string[],
-  unobserved: string,
+  side: "input" | "output",
 ) => {
-  if (!usage) return undefined;
-  const short = usage[unobserved];
-  if (short !== undefined && short !== 0) return undefined;
+  if (!usage || sumIsShort(usage, side)) return undefined;
   for (const key of keys) {
     const value = usage[key];
     if (typeof value === "number") return value;
@@ -378,12 +377,12 @@ const usageSummary = (
   const input = tokenTotal(
     usage,
     ["input_tokens", "inputTokens", "input"],
-    "inputUnobserved",
+    "input",
   );
   const output = tokenTotal(
     usage,
     ["output_tokens", "outputTokens", "output"],
-    "outputUnobserved",
+    "output",
   );
   if (input !== undefined) summary["input_tokens"] = input;
   if (output !== undefined) summary["output_tokens"] = output;

@@ -338,9 +338,24 @@ export function scoreT1b(trials: readonly T1bScoredTrial[]) {
 }
 
 /**
+ * Whether a usage record's own counts say its `side` token sum is short: an
+ * ended request never reported that side, or a request never ended at all. A
+ * count the record does not carry predates the count and says nothing; one it
+ * carries as null was never observed, so the sum cannot be called whole.
+ */
+export const sumIsShort = (
+  usage: Readonly<Record<string, unknown>>,
+  side: "input" | "output",
+) =>
+  [usage[`${side}Unobserved`], usage["unended"]].some(
+    (count) => count !== undefined && count !== 0,
+  );
+
+/**
  * Sums usage without inventing any. A count one trial recorded as unobserved
- * poisons that total on purpose, as `totalCost` poisons cost, so the number
- * cannot be quoted as if it were measured.
+ * poisons that total on purpose, as `totalCost` poisons cost, and so does a
+ * token sum the summed counts say is short, so neither number can be quoted
+ * as if it were measured.
  */
 const totalUsage = (
   trials: readonly {
@@ -352,6 +367,12 @@ const totalUsage = (
     for (const [key, value] of Object.entries(trial.usage ?? {})) {
       const sum = totals[key];
       totals[key] = sum === null || value === null ? null : (sum ?? 0) + value;
+    }
+  }
+  for (const side of ["input", "output"] as const) {
+    const key = `${side}Tokens`;
+    if (totals[key] !== undefined && sumIsShort(totals, side)) {
+      totals[key] = null;
     }
   }
   return totals;

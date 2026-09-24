@@ -580,7 +580,7 @@ describe("buildTrials", () => {
               model: "m",
               status: "completed",
               finishReason: "stop",
-              usage: { inputTokens: null, outputTokens: 5, unended: 1 },
+              usage: { inputTokens: null, outputTokens: 5, unended: 0 },
             },
             {
               laneId: "verifier",
@@ -607,6 +607,67 @@ describe("buildTrials", () => {
       { inputTokens: 100, outputTokens: null },
     ]);
     expect(buildTrials(KEY, sheet)[0]?.usage).toEqual({
+      inputTokens: null,
+      outputTokens: null,
+    });
+  });
+
+  it("leaves both token sums unobserved when a lane's request never ended", () => {
+    const sheet = buildSheet(KEY, "W2", [
+      {
+        receiptPath: "r1.json",
+        receipt: swarmReceipt({
+          candidates: [],
+          findings: [],
+          lanes: [
+            {
+              laneId: "reviewer-1",
+              role: "reviewer",
+              model: "m",
+              status: "completed",
+              finishReason: "stop",
+              usage: {
+                requests: 6,
+                retries: 0,
+                inputTokens: 14823,
+                outputTokens: 495,
+                denials: 0,
+                unended: 1,
+                inputUnobserved: 0,
+                outputUnobserved: 0,
+              },
+            },
+            {
+              laneId: "verifier",
+              role: "verifier",
+              model: "m",
+              status: "completed",
+              finishReason: "stop",
+              usage: {
+                requests: 2,
+                retries: 0,
+                inputTokens: 100,
+                outputTokens: 10,
+                denials: 0,
+                unended: 0,
+                inputUnobserved: 0,
+                outputUnobserved: 0,
+              },
+            },
+          ],
+        }),
+      },
+    ]);
+
+    // The first ledger admitted six requests and saw five end, so both of its
+    // sums are one request short; the second saw every request it admitted end.
+    expect(sheet.receipts[0]?.lanes.map((lane) => lane.usage)).toEqual([
+      { inputTokens: null, outputTokens: null },
+      { inputTokens: 100, outputTokens: 10 },
+    ]);
+    const trials = buildTrials(KEY, sheet);
+    expect(trials[0]?.usage).toEqual({ inputTokens: null, outputTokens: null });
+    expect(scoreT1b(trials).usage).toEqual({
       inputTokens: null,
       outputTokens: null,
     });
