@@ -3,8 +3,11 @@ description: Review a pull request with packed Workers AI lanes and publish the 
 
 inputs:
   workers-ai-api-key:
-    description: A Cloudflare API token with Workers AI access. It must reach exactly one account, which is the one billed.
+    description: A Cloudflare API token with Workers AI access. Without `cloudflare-account-id` it must reach exactly one account, which is the one billed.
     required: true
+  cloudflare-account-id:
+    description: The account the key bills, for a key that cannot list its own account.
+    default: ""
   pull-request:
     description: The pull request to review.
     default: ${{ github.event.issue.number || github.event.pull_request.number }}
@@ -30,12 +33,14 @@ runs:
       shell: bash
       env:
         WORKERS_AI_API_KEY: ${{ inputs.workers-ai-api-key }}
+        CLOUDFLARE_ACCOUNT_ID: ${{ inputs.cloudflare-account-id }}
         GITHUB_TOKEN: ${{ github.token }}
         PULL_REQUEST: ${{ inputs.pull-request }}
       run: |
-        CLOUDFLARE_ACCOUNT_ID=$(curl -fsS -H "authorization: Bearer $WORKERS_AI_API_KEY" https://api.cloudflare.com/client/v4/accounts \
-          | jq -er 'if (.result | length) == 1 then .result[0].id else error("the key reaches \(.result | length) accounts, not one") end')
-        export CLOUDFLARE_ACCOUNT_ID
+        if [ -z "$CLOUDFLARE_ACCOUNT_ID" ]; then
+          CLOUDFLARE_ACCOUNT_ID=$(curl -fsS -H "authorization: Bearer $WORKERS_AI_API_KEY" https://api.cloudflare.com/client/v4/accounts \
+            | jq -er 'if (.result | length) == 1 then .result[0].id else error("the key reaches \(.result | length) accounts, not one: pass cloudflare-account-id") end')
+        fi
         swarm_id="pr-$PULL_REQUEST-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"
         out="$RUNNER_TEMP/swarm-review"
         # A partial run still carries what its verifier confirmed, and publish
