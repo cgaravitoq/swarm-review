@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 import {
+  laneCaps,
   PROVIDER_UPSTREAM,
   readLedgerUsage,
   reserveTrial,
@@ -14,6 +15,44 @@ const paid = {
   inputUsdPerMillionTokens: 1,
   outputUsdPerMillionTokens: 10,
 };
+
+describe("one lane's input ceiling", () => {
+  it("takes the trial's caps when the caller names no ceiling", () => {
+    const caps = laneCaps("t1b");
+
+    expect(caps).toEqual(SESSION_CAPS.t1b);
+    // A copy, so nothing downstream can widen the frozen table through it.
+    expect(caps).not.toBe(SESSION_CAPS.t1b);
+  });
+
+  it("lowers the input ceiling and leaves every other cap alone", () => {
+    const caps = laneCaps("t1b", "4000000");
+
+    expect(caps.maxCumulativeInputTokens).toBe(4_000_000);
+    expect(caps).toEqual({
+      ...SESSION_CAPS.t1b,
+      maxCumulativeInputTokens: 4_000_000,
+    });
+  });
+
+  it("refuses a ceiling above the trial's, naming both numbers", () => {
+    expect(() => laneCaps("t1b", "12000001")).toThrow(
+      /--lane-input-cap 12000001 is above the t1b cumulative input cap of 12000000 tokens/,
+    );
+    // The trial's own ceiling is a lane cap, not a refusal.
+    expect(laneCaps("t1b", "12000000").maxCumulativeInputTokens).toBe(
+      12_000_000,
+    );
+  });
+
+  it("refuses a ceiling that is not a positive whole number of tokens", () => {
+    for (const raw of ["0", "-1", "4000000.5", "many", ""]) {
+      expect(() => laneCaps("t1b", raw)).toThrow(
+        /--lane-input-cap must be a positive whole number of tokens/,
+      );
+    }
+  });
+});
 
 describe("worst-case pricing", () => {
   it("prices a session at its caps including the permitted retry", () => {

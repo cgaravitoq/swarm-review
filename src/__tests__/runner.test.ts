@@ -13,6 +13,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath, URL } from "node:url";
 import { afterEach, describe, expect, it } from "vitest";
+import { laneCaps, SESSION_CAPS } from "../provider-budget";
 
 const temporaryDirectories: string[] = [];
 
@@ -1376,6 +1377,18 @@ process.stdin.on("data", (chunk) => {
           }) + "\\n");
           process.stdout.write(JSON.stringify({ type: "agent_settled" }) + "\\n");
         }, 80);
+      } else if (cmd.message.includes("token heavy turn")) {
+        // One turn whose own context is past the ceiling the lane was given:
+        // pi reports the whole call, cached or not, as the broker counts it.
+        process.stdout.write(JSON.stringify({
+          type: "turn_end",
+          message: { stopReason: "stop", usage: { input: Number(process.env.PI_INPUT_USAGE || 0), output: 1, totalTokens: 1 } },
+        }) + "\\n");
+        process.stdout.write(JSON.stringify({
+          type: "agent_end",
+          messages: [{ role: "assistant", content: [{ type: "text", text: "token heavy turn done" }] }],
+        }) + "\\n");
+        process.stdout.write(JSON.stringify({ type: "agent_settled" }) + "\\n");
       } else if (cmd.message.includes("crash now")) {
         process.stderr.write("fatal model failure in pi child\\n");
         setTimeout(() => {
@@ -2186,6 +2199,81 @@ exec /bin/date "$@"
         expect.objectContaining({ name: "requests", used: 3, cap: 4 }),
       ]);
 
+      await sendCommand(sockPath, { type: "accept" });
+      await waitForExit(runnerProc);
+    } finally {
+      runnerProc.kill();
+    }
+  });
+
+  it("fires the input budget notice at three quarters of the ceiling the lane was given", async () => {
+    // The notice is the model's only warning before the broker cuts the lane,
+    // so it has to be measured against the ceiling in force: a lane told the
+    // trial's would be cut with its answer still unwritten. The budget below is
+    // the one the local driver writes into the job for `--lane-input-cap`.
+    const cap = 4_000_000;
+    const spent = 3_100_000;
+    expect(laneCaps("t1b", String(cap)).maxCumulativeInputTokens).toBe(cap);
+    // Past three quarters of the lane's own ceiling, and nowhere near three
+    // quarters of the trial's: only the ceiling in force can explain the
+    // notice this test waits for.
+    expect(spent).toBeGreaterThanOrEqual(Math.ceil(cap * 0.75));
+    expect(spent).toBeLessThan(
+      Math.ceil(SESSION_CAPS.t1b.maxCumulativeInputTokens * 0.75),
+    );
+    const { root, sockPath, runnerProc } = await prepareSupervisedRun(
+      "budget-input-tokens",
+      "standby",
+      "openai-codex",
+      {
+        budget: { requests: 1_000, inputTokens: cap },
+        totalTimeoutSeconds: 100_000,
+      },
+      { PI_INPUT_USAGE: String(spent) },
+    );
+    try {
+      const statusPath = join(root, "status.json");
+      await waitForStandbySettled(statusPath);
+      await sendCommand(sockPath, {
+        id: "turn-1",
+        type: "prompt",
+        message: "run token heavy turn",
+      });
+      await waitForStatus(
+        statusPath,
+        (s) =>
+          s["state"] === "idle" &&
+          s["lastCandidateResult"] === "token heavy turn done",
+      );
+      // The next model call is certain at a tool boundary, so that is where the
+      // steer has to arrive.
+      await sendCommand(sockPath, {
+        id: "tool-1",
+        type: "prompt",
+        message: "run silent tool",
+      });
+      await waitForTrace(
+        join(root, "trace.jsonl"),
+        (line) =>
+          line["type"] === "budget_notice" && line["name"] === "input tokens",
+      );
+      const trace = (await readFile(join(root, "trace.jsonl"), "utf8"))
+        .trim()
+        .split("\n")
+        .map((line) => JSON.parse(line) as Record<string, unknown>);
+      expect(trace.filter((line) => line["type"] === "budget_notice")).toEqual([
+        // The standby turn's own single input token is counted too.
+        expect.objectContaining({ name: "input tokens", used: spent + 1, cap }),
+      ]);
+      const steers = await readFile(join(root, "pi-steer.log"), "utf8");
+      expect(steers).toContain(
+        `Budget notice from the runner: ${spent + 1} of ${cap} input tokens spent.`,
+      );
+
+      await waitForStatus(
+        statusPath,
+        (s) => s["state"] === "idle" && s["lastEvent"] === "agent_settled",
+      );
       await sendCommand(sockPath, { type: "accept" });
       await waitForExit(runnerProc);
     } finally {

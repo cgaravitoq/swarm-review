@@ -97,6 +97,37 @@ export const SESSION_CAPS = {
 } satisfies Record<"t1a" | "t1b", SessionCaps>;
 
 /**
+ * The caps one lane runs under, with the caller's own input ceiling in place of
+ * the trial's.
+ *
+ * The ceiling only moves down: a caller that could raise it would be describing
+ * its own budget rather than taking the frozen one, and the refusal names both
+ * numbers so it can see which one it asked for.
+ *
+ * The ceiling arrives as the caller spelled it, from a parser that has to
+ * refuse before a lane exists, and as the number that parser kept.
+ */
+export function laneCaps(
+  trialKind: "t1a" | "t1b",
+  laneInputCap?: string | number,
+): SessionCaps {
+  const trial = SESSION_CAPS[trialKind];
+  if (laneInputCap === undefined) return { ...trial };
+  const cap = Number(laneInputCap);
+  if (!Number.isInteger(cap) || cap <= 0) {
+    throw new Error(
+      `--lane-input-cap must be a positive whole number of tokens, not ${laneInputCap}`,
+    );
+  }
+  if (cap > trial.maxCumulativeInputTokens) {
+    throw new Error(
+      `--lane-input-cap ${cap} is above the ${trialKind} cumulative input cap of ${trial.maxCumulativeInputTokens} tokens`,
+    );
+  }
+  return { ...trial, maxCumulativeInputTokens: cap };
+}
+
+/**
  * How a provider bills, supplied by the caller.
  *
  * `paid` needs both rates. `subscription` carries no marginal cash cost but is
