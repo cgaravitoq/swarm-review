@@ -698,7 +698,7 @@ if [ ! -f package.json ]; then
   printf 'error: Bun could not find a package.json file to install from\\n' >&2
   exit 1
 fi
-exit 0
+exit "\${FAKE_BUN_INSTALL_EXIT:-0}"
 `,
     );
     await chmod(join(bin, "bun"), 0o755);
@@ -841,6 +841,27 @@ child.on("exit", (code) => {
     expect(await readFile(prepared.piArgv, "utf8")).toContain(
       "-- review this change",
     );
+  });
+
+  it("ends the lane with the install's own exit when bun refuses the lockfile", async () => {
+    const prepared = await prepareRun("bun-install-refused", {
+      "package.json": '{"name":"demo"}\n',
+      "bun.lock": '{"lockfileVersion":1}\n',
+    });
+
+    // An exit no wrapper would invent, so the lane can only end with it if
+    // every hop between bun and the runner's status passed it through.
+    const result = spawnSync("bash", [runnerScript, prepared.run], {
+      encoding: "utf8",
+      env: { ...prepared.env, FAKE_BUN_INSTALL_EXIT: "3" },
+    });
+    const steps = await readSteps(prepared.run);
+
+    expect(result.status).toBe(3);
+    expect(steps.find((step) => step["step"] === "install")).toMatchObject({
+      exit: 3,
+    });
+    expect(steps.some((step) => step["step"] === "review")).toBe(false);
   });
 
   it("installs with bun when the checkout root carries the binary lockfile", async () => {
