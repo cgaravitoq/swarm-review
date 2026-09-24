@@ -1048,6 +1048,7 @@ if (!/^[A-Za-z0-9](?:[A-Za-z0-9._-]*[A-Za-z0-9])?$/.test(sessionId)) {
   process.exit(2);
 }
 let stateAnswers = 0;
+let steeredToolOpen = false;
 if (process.env.PI_ARGS_LOG) {
   fs.appendFileSync(process.env.PI_ARGS_LOG, JSON.stringify(args) + "\\n");
 }
@@ -1136,6 +1137,17 @@ process.stdin.on("data", (chunk) => {
         command: "steer",
         success: true,
       }) + "\\n");
+      if (steeredToolOpen) {
+        steeredToolOpen = false;
+        process.stdout.write(JSON.stringify({
+          type: "turn_end",
+          message: { stopReason: "stop", usage: { input: 10, output: 10, totalTokens: 20 } },
+        }) + "\\n");
+        process.stdout.write(JSON.stringify({
+          type: "agent_end",
+          messages: [{ role: "assistant", content: [{ type: "text", text: "Steered review finished" }] }],
+        }) + "\\n");
+      }
     } else if (cmd.type === "abort") {
       process.stdout.write(JSON.stringify({
         id: cmdId,
@@ -1202,7 +1214,26 @@ process.stdin.on("data", (chunk) => {
         continue;
       }
 
-      if (cmd.message.includes("silent tool")) {
+      if (cmd.message.includes("steered tool")) {
+        // A real turn stays open between a tool's result and the request
+        // that follows it; this one stays open until the runner steers it.
+        process.stdout.write(JSON.stringify({
+          type: "tool_execution_start",
+          toolCallId: "call_steered_1",
+          toolName: "bash",
+          args: { command: "check.sh" },
+        }) + "\\n");
+        setTimeout(() => {
+          process.stdout.write(JSON.stringify({
+            type: "tool_execution_end",
+            toolCallId: "call_steered_1",
+            toolName: "bash",
+            isError: false,
+            result: { content: [{ type: "text", text: "tool completed" }] },
+          }) + "\\n");
+          steeredToolOpen = true;
+        }, 80);
+      } else if (cmd.message.includes("silent tool")) {
         process.stdout.write(JSON.stringify({
           type: "tool_execution_start",
           toolCallId: "call_tool_1",
@@ -1897,12 +1928,17 @@ exec /bin/date "$@"
       expect(window.seconds).toBeGreaterThanOrEqual(briefed.least);
 
       // The standby turn was request 1. Two tool turns more: the notice fires
-      // at the end of the third turn's tool, when 3 of 4 have been spent.
-      for (const id of ["tool-1", "tool-2"]) {
+      // at the end of the third turn's tool, when 3 of 4 have been spent, and
+      // that turn only ends once the notice has reached Pi, so a notice sent
+      // anywhere after the tool boundary never arrives.
+      for (const [id, tool] of [
+        ["tool-1", "silent tool"],
+        ["tool-2", "steered tool"],
+      ]) {
         await sendCommand(sockPath, {
           id,
           type: "prompt",
-          message: `run silent tool ${id}`,
+          message: `run ${tool} ${id}`,
         });
         await waitForStatus(
           statusPath,
