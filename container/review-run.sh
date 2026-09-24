@@ -980,8 +980,12 @@ const server = net.createServer((socket) => {
           socket.write(JSON.stringify({ id: reqId, type: "response", command: "cancel", success: false, error: "missing_or_invalid_reason" }) + "\n");
           continue;
         }
-        state = "cancelled";
-        terminalReason = req.reason || "cancelled";
+        // A driver cancels a failed or blocked review to end it, and the
+        // cancel is not what ended it.
+        if (state !== "failed" && state !== "blocked") {
+          state = "cancelled";
+          terminalReason = req.reason || "cancelled";
+        }
         socket.write(JSON.stringify({
           id: reqId,
           type: "response",
