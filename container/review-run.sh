@@ -763,7 +763,7 @@ function handlePiEvent(child, rawLine) {
       terminalReason = "model_error";
       writeReviewError("model_error", stopReason, errorMessage);
       writeStatus();
-      if (!lastCandidateResult) shutdownBridge(1);
+      if (!lastCandidateResult) shutdownBridge(1, child);
       return;
     }
     writeStatus();
@@ -1122,11 +1122,19 @@ const server = net.createServer((socket) => {
 });
 
 let isShuttingDown = false;
-function shutdownBridge(exitCode) {
+async function shutdownBridge(exitCode, liveChild = null) {
   if (isShuttingDown) return;
   isShuttingDown = true;
   try { server.close(); } catch {}
   try { fs.unlinkSync(sockPath); } catch {}
+  // A bridge that exits ahead of its child leaves a last status calling the
+  // child alive after both are gone, so a child still running goes first.
+  if (liveChild) {
+    if (!(await stopExactChild(liveChild, true))) {
+      detail = "child process-group termination unverified";
+    }
+    writeStatus();
+  }
   setTimeout(() => {
     try { fs.closeSync(rawFd); } catch {}
     try { fs.closeSync(traceFd); } catch {}
