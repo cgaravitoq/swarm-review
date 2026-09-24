@@ -60,107 +60,109 @@ export async function main(env: Env = process.env): Promise<void> {
   const source = join(required(env, "GITHUB_WORKSPACE"), "swarm-review-source");
   const out = join(required(env, "RUNNER_TEMP"), "swarm-review");
   const swarmId = `pr-${pullRequest}-${required(env, "GITHUB_RUN_ID")}-${required(env, "GITHUB_RUN_ATTEMPT")}`;
-  const { stdout } = await exec(
-    "gh",
-    ["api", `repos/${repository}/pulls/${pullRequest}`],
-    { env },
-  );
-  const pull = JSON.parse(stdout) as {
-    head?: { repo?: { full_name?: string } };
-  };
-  const headRepository = pull.head?.repo?.full_name;
-  if (!headRepository) throw new Error("pull request has no head repository");
-  const fork = headRepository.toLowerCase() !== repository.toLowerCase();
-  const selected = mode === "auto" ? (fork ? "packed" : "sandbox") : mode;
-  const account = await accountId(env);
-  const runEnv = { ...env, CLOUDFLARE_ACCOUNT_ID: account };
-  const args = [
-    join(actionPath, "src", "swarm.ts"),
-    "--repo",
-    repository,
-    "--source",
-    source,
-    "--pr",
-    pullRequest,
-  ];
-
-  if (selected === "sandbox") {
-    const image = imageReference(
+  let packedFork = false;
+  let runEnv = env;
+  try {
+    const { stdout } = await exec(
+      "gh",
+      ["api", `repos/${repository}/pulls/${pullRequest}`],
+      { env },
+    );
+    const pull = JSON.parse(stdout) as {
+      head?: { repo?: { full_name?: string } };
+    };
+    const headRepository = pull.head?.repo?.full_name;
+    if (!headRepository) throw new Error("pull request has no head repository");
+    const fork = headRepository.toLowerCase() !== repository.toLowerCase();
+    const selected = mode === "auto" ? (fork ? "packed" : "sandbox") : mode;
+    packedFork = fork && selected === "packed";
+    runEnv = { ...env, CLOUDFLARE_ACCOUNT_ID: await accountId(env) };
+    const args = [
+      join(actionPath, "src", "swarm.ts"),
+      "--repo",
       repository,
-      await imageTagFromFiles(
-        join(actionPath, "container"),
-        join(source, "bun.lock"),
-      ),
-    );
-    await run(
-      "docker",
-      [
-        "login",
-        "ghcr.io",
-        "-u",
-        required(env, "GITHUB_ACTOR"),
-        "--password-stdin",
-      ],
-      runEnv,
-      `${required(env, "GITHUB_TOKEN")}\n`,
-    );
-    try {
-      await run("docker", ["pull", image], runEnv);
-      console.log(`sandbox image pulled: ${image}`);
-    } catch {
-      console.log(`sandbox image missing, building: ${image}`);
+      "--source",
+      source,
+      "--pr",
+      pullRequest,
+    ];
+
+    if (selected === "sandbox") {
+      const image = imageReference(
+        repository,
+        await imageTagFromFiles(
+          join(actionPath, "container"),
+          join(source, "bun.lock"),
+        ),
+      );
       await run(
-        "bun",
+        "docker",
         [
-          "run",
-          join(actionPath, "scripts", "deploy.ts"),
-          "--image-only",
-          "--repo",
-          repository,
-          "--target",
-          source,
+          "login",
+          "ghcr.io",
+          "-u",
+          required(env, "GITHUB_ACTOR"),
+          "--password-stdin",
         ],
         runEnv,
+        `${required(env, "GITHUB_TOKEN")}\n`,
       );
-      await run("docker", ["push", image], runEnv);
-      console.log(`sandbox image pushed: ${image}`);
+      try {
+        await run("docker", ["pull", image], runEnv);
+        console.log(`sandbox image pulled: ${image}`);
+      } catch {
+        console.log(`sandbox image missing, building: ${image}`);
+        await run(
+          "bun",
+          [
+            "run",
+            join(actionPath, "scripts", "deploy.ts"),
+            "--image-only",
+            "--repo",
+            repository,
+            "--target",
+            source,
+          ],
+          runEnv,
+        );
+        await run("docker", ["push", image], runEnv);
+        console.log(`sandbox image pushed: ${image}`);
+      }
+      args.push(
+        "--sandbox",
+        "--image",
+        image,
+        "--provider",
+        "cloudflare-workers-ai",
+        "--model",
+        "@cf/deepseek-ai/deepseek-v4-flash-0731",
+        "--reviewers",
+        "3",
+        "--total-timeout",
+        "1500",
+        "--verifier-reserve",
+        "200",
+        "--lane-memory",
+        "2g",
+        "--lane-cpus",
+        "2",
+        "--lane-input-cap",
+        "4000000",
+        "--check",
+        "git --no-pager diff --stat base..HEAD",
+      );
+    } else {
+      args.push(
+        "--provider",
+        "cloudflare-workers-ai",
+        "--model",
+        "@cf/deepseek-ai/deepseek-v4-flash-0731",
+        "--reviewers",
+        "3",
+      );
     }
-    args.push(
-      "--sandbox",
-      "--image",
-      image,
-      "--provider",
-      "cloudflare-workers-ai",
-      "--model",
-      "@cf/deepseek-ai/deepseek-v4-flash-0731",
-      "--reviewers",
-      "3",
-      "--total-timeout",
-      "1500",
-      "--verifier-reserve",
-      "200",
-      "--lane-memory",
-      "2g",
-      "--lane-cpus",
-      "2",
-      "--lane-input-cap",
-      "4000000",
-      "--check",
-      "git --no-pager diff --stat base..HEAD",
-    );
-  } else {
-    args.push(
-      "--provider",
-      "cloudflare-workers-ai",
-      "--model",
-      "@cf/deepseek-ai/deepseek-v4-flash-0731",
-      "--reviewers",
-      "3",
-    );
-  }
-  args.push("--swarm-id", swarmId, "--out", out);
-  console.log(`review mode: ${selected}${fork ? " (fork)" : ""}`);
-  try {
+    args.push("--swarm-id", swarmId, "--out", out);
+    console.log(`review mode: ${selected}${fork ? " (fork)" : ""}`);
     await run("bun", args, runEnv);
   } catch (error) {
     console.error(error instanceof Error ? error.message : String(error));
@@ -177,7 +179,7 @@ export async function main(env: Env = process.env): Promise<void> {
       pullRequest,
       "--publish",
       "--allow-moved-head",
-      ...(fork && selected === "packed" ? ["--fork"] : []),
+      ...(packedFork ? ["--fork"] : []),
     ],
     runEnv,
   );

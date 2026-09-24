@@ -32,7 +32,7 @@ async function arrange(headRepo: string, pullSucceeds: boolean) {
   await writeFile(join(source, "bun.lock"), "target lockfile\n");
   await writeFile(
     join(bin, "gh"),
-    `#!/bin/sh\nprintf 'gh %s\\n' "$*" >> "$ACTION_LOG"\nprintf '%s\\n' '{"head":{"repo":{"full_name":"${headRepo}"}}}'\n`,
+    `#!/bin/sh\nprintf 'gh %s\\n' "$*" >> "$ACTION_LOG"\n[ "$ACTION_FAIL" = gh ] && exit 1\nprintf '%s\\n' '{"head":{"repo":{"full_name":"${headRepo}"}}}'\n`,
   );
   await writeFile(
     join(bin, "docker"),
@@ -40,7 +40,7 @@ async function arrange(headRepo: string, pullSucceeds: boolean) {
   );
   await writeFile(
     join(bin, "bun"),
-    '#!/bin/sh\nprintf "bun %s\\n" "$*" >> "$ACTION_LOG"\nif [ "$1" = "$ACTION_ROOT/src/swarm.ts" ]; then printf "%s\\0" "$@" > "$ACTION_ARGS"; [ "$ACTION_FAIL" = swarm ] && exit 1; fi\nexit 0\n',
+    '#!/bin/sh\nprintf "bun %s\\n" "$*" >> "$ACTION_LOG"\nif [ "$1" = "$ACTION_ROOT/src/swarm.ts" ]; then printf "%s\\0" "$@" > "$ACTION_ARGS"; [ "$ACTION_FAIL" = swarm ] && exit 1; fi\nif [ "$2" = "$ACTION_ROOT/scripts/deploy.ts" ] && [ "$ACTION_FAIL" = deploy ]; then exit 1; fi\nexit 0\n',
   );
   for (const name of ["gh", "docker", "bun"]) {
     await chmod(join(bin, name), 0o755);
@@ -179,6 +179,47 @@ describe("composite action driver", () => {
     const fixture = await arrange("acme/demo", true);
     await main({ ...fixture.env, INPUT_MODE: "packed", ACTION_FAIL: "swarm" });
     const log = await fixture.log();
+    expect(log.at(-1)).toBe(
+      `bun ${packageRoot}/src/publish.ts --receipt ${fixture.env.RUNNER_TEMP}/swarm-review/pr-42-123-1/swarm-receipt.json --repo acme/demo --pr 42 --publish --allow-moved-head`,
+    );
+  });
+
+  it("publishes without the fork note when the pull request lookup fails", async () => {
+    const fixture = await arrange("contributor/demo", true);
+    await main({ ...fixture.env, INPUT_MODE: "auto", ACTION_FAIL: "gh" });
+    const log = await fixture.log();
+    expect(log.some((line) => line.includes("src/swarm.ts"))).toBe(false);
+    expect(log.at(-1)).toBe(
+      `bun ${packageRoot}/src/publish.ts --receipt ${fixture.env.RUNNER_TEMP}/swarm-review/pr-42-123-1/swarm-receipt.json --repo acme/demo --pr 42 --publish --allow-moved-head`,
+    );
+  });
+
+  it("publishes when the registry refuses the login", async () => {
+    const fixture = await arrange("acme/demo", true);
+    await main({
+      ...fixture.env,
+      INPUT_MODE: "sandbox",
+      GITHUB_TOKEN: "wrong-token",
+    });
+    const log = await fixture.log();
+    expect(log).toContain("docker login ghcr.io -u reviewer --password-stdin");
+    expect(log.some((line) => line.includes("src/swarm.ts"))).toBe(false);
+    expect(log.at(-1)).toBe(
+      `bun ${packageRoot}/src/publish.ts --receipt ${fixture.env.RUNNER_TEMP}/swarm-review/pr-42-123-1/swarm-receipt.json --repo acme/demo --pr 42 --publish --allow-moved-head`,
+    );
+  });
+
+  it("publishes when the missing image fails to build", async () => {
+    const fixture = await arrange("acme/demo", false);
+    await main({
+      ...fixture.env,
+      INPUT_MODE: "sandbox",
+      ACTION_FAIL: "deploy",
+    });
+    const log = await fixture.log();
+    expect(log.some((line) => line.includes("scripts/deploy.ts"))).toBe(true);
+    expect(log.some((line) => line.startsWith("docker push "))).toBe(false);
+    expect(log.some((line) => line.includes("src/swarm.ts"))).toBe(false);
     expect(log.at(-1)).toBe(
       `bun ${packageRoot}/src/publish.ts --receipt ${fixture.env.RUNNER_TEMP}/swarm-review/pr-42-123-1/swarm-receipt.json --repo acme/demo --pr 42 --publish --allow-moved-head`,
     );
