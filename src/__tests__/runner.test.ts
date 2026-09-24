@@ -706,11 +706,14 @@ exit "\${FAKE_BUN_INSTALL_EXIT:-0}"
     // coreutils `timeout`, which macOS does not carry. Without it every one of
     // those steps exits 127 on this host, so the double stands in for that one
     // host tool: it takes the option shape the runner uses, cuts the child's
-    // own process group at the limit, and reports the 124 coreutils reports.
+    // own process group at the limit, and reports the statuses coreutils
+    // reports: the child's own, 128 plus the signal that killed it, 124 for a
+    // cut child, and 137 for one the -k KILL had to end.
     await writeFile(
       join(bin, "timeout"),
       `#!/usr/bin/env node
 const { spawn } = require("node:child_process");
+const { signals } = require("node:os").constants;
 
 const argv = process.argv.slice(2);
 let killAfter = null;
@@ -741,10 +744,10 @@ const limitTimer = setTimeout(() => {
     }, killAfter * 1000);
   }
 }, limit * 1000);
-child.on("exit", (code) => {
+child.on("exit", (code, signal) => {
   clearTimeout(limitTimer);
-  const status = code ?? 1;
-  process.exit(expired ? 124 : status);
+  if (expired) process.exit(signal === "SIGKILL" ? 128 + signals.SIGKILL : 124);
+  process.exit(signal ? 128 + signals[signal] : code);
 });
 `,
     );
