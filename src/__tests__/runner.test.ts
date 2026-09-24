@@ -2626,6 +2626,49 @@ process.stdin.on("data", (chunk) => {
     }
   });
 
+  it("leaves a blocked review blocked in the runner's last status after the cancel that ends it", async () => {
+    // The cloud driver cancels a lane the provider refused. The bridge exits
+    // 130 on that cancel, and the review is blocked, not failed on an exit.
+    const lane = await prepareSupervisedRun(
+      "quota-blocked-main",
+      "simulate quota blocked",
+      "openai-codex",
+      {},
+      {},
+      "main",
+    );
+    try {
+      const statusPath = join(lane.root, "status.json");
+      await waitForSocket(lane.sockPath);
+      await waitForStatus(
+        statusPath,
+        (status) =>
+          status["state"] === "blocked" &&
+          status["terminalReason"] === "quota_blocked",
+      );
+      await sendCommand(lane.sockPath, {
+        type: "cancel",
+        reason: "cancelled_by_conductor",
+      });
+      expect(await waitForExit(lane.runnerProc, SUPERVISED_WAIT_MS)).toBe(0);
+      const steps = (await readFile(join(lane.root, "steps.jsonl"), "utf8"))
+        .split("\n")
+        .filter(Boolean)
+        .map((line) => JSON.parse(line) as Record<string, unknown>);
+      expect(steps.find((step) => step["step"] === "review")).toMatchObject({
+        exit: 130,
+      });
+      expect(JSON.parse(await readFile(statusPath, "utf8"))).toMatchObject({
+        phase: "finished",
+        state: "blocked",
+        terminalReason: "quota_blocked",
+        process: { alive: false },
+      });
+    } finally {
+      lane.runnerProc.kill();
+    }
+  });
+
   const runnerScript = fileURLToPath(
     new URL("../../container/review-run.sh", import.meta.url),
   );
