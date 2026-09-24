@@ -14,6 +14,7 @@ export const IMAGE_SOURCES = {
   [REVIEW_RUNNER]: "review-run.sh",
   "/opt/review/model-broker.ts": "model-broker.ts",
   "/opt/review/response-seal.ts": "response-seal.ts",
+  "/opt/review/response-usage.ts": "response-usage.ts",
   "/opt/review/extensions/claude-code-provider.js": "claude-code-provider.js",
   "/opt/review/pi-config/models.json": "models.json",
   "/opt/review/Dockerfile": "Dockerfile",

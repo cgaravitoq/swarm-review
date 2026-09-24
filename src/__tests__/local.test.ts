@@ -1363,12 +1363,13 @@ describe("deadline and redaction", () => {
         model: "grok-4.6",
         wallSeconds: 12,
         runError: null,
+        usage: { requests: 1, retries: 0, inputTokens: 9, outputTokens: 2 },
       }),
     );
     await writeFile(
       join(directory, "report.json"),
       JSON.stringify({
-        usage: { input: 9, output: 2 },
+        usage: { input: 400, output: 500 },
         install: {
           status: "skipped",
           manifest: null,
@@ -1380,9 +1381,37 @@ describe("deadline and redaction", () => {
       runId: "lane-1",
       attemptId: "lane-1",
       outcome: "completed",
-      usage: { input: 9, output: 2 },
+      // The Worker's session totals, never the numbers the target wrote into
+      // its own report: the report is the uid the checkout runs as.
+      usage: { requests: 1, retries: 0, inputTokens: 9, outputTokens: 2 },
       installSkipped: true,
       installSkipReason: "the checkout root has no package.json",
+    });
+  });
+
+  it("reads a cloud lane's usage as unobserved when no session recorded one", async () => {
+    const directory = join(tmpdir(), `review-pi-cloud-no-usage-${Date.now()}`);
+    await mkdir(directory);
+    temporaryDirectories.push(directory);
+    await writeFile(
+      join(directory, "receipt.json"),
+      JSON.stringify({
+        runId: "lane-1",
+        provider: "xai",
+        model: "grok-4.6",
+        wallSeconds: 12,
+        runError: null,
+      }),
+    );
+    await writeFile(
+      join(directory, "report.json"),
+      JSON.stringify({ usage: { input: 400, output: 500 } }),
+    );
+
+    // The report claims tokens and no control-side session recorded any, so
+    // the lane's spend is unknown rather than the target's number.
+    await expect(readLaneReceipt(directory)).resolves.toMatchObject({
+      usage: null,
     });
   });
 
@@ -2520,6 +2549,135 @@ describe("public local CLI lifecycle", {
       `rm --force --volumes review-pi-local-${runId}`,
     );
     expect(receipt.error).not.toContain("teardown failed");
+  });
+
+  it("prices a lane from the broker ledger, not from the report the target wrote", async () => {
+    const root = await mkdtemp(join(tmpdir(), "review-pi-cli-"));
+    temporaryDirectories.push(root);
+    const arranged = await arrangeFakeDocker(root);
+    // The fake report.json claims `totalTokens: 1`; the ledger says otherwise.
+    // A row priced from the report would carry the target's number.
+    await writeFile(
+      join(arranged.container, "provider-usage.jsonl"),
+      [
+        JSON.stringify({ event: "broker_start" }),
+        JSON.stringify({
+          event: "provider_admitted",
+          attemptId: 1,
+          attempt: 0,
+          totals: {
+            requests: 1,
+            retries: 0,
+            input: 0,
+            output: 0,
+            unended: 1,
+            inputUnobserved: 0,
+            outputUnobserved: 0,
+          },
+        }),
+        JSON.stringify({
+          event: "provider_request",
+          status: 200,
+          usage: { input: 111, output: 222 },
+          totals: {
+            requests: 1,
+            retries: 0,
+            input: 111,
+            output: 222,
+            unended: 0,
+            inputUnobserved: 0,
+            outputUnobserved: 0,
+          },
+        }),
+        "",
+      ].join("\n"),
+    );
+    const runId = "ledger-priced-lane";
+    const out = join(root, "out");
+
+    const result = await runLocalCli(
+      localArguments(out, runId),
+      fakeEnvironment(arranged, runId, "success"),
+    );
+    const receipt = await readLocalReceipt(join(out, runId));
+
+    expect(result.code, result.output).toBe(0);
+    expect(receipt.usage).toEqual({
+      requests: 1,
+      retries: 0,
+      inputTokens: 111,
+      outputTokens: 222,
+      denials: 0,
+      unended: 0,
+      inputUnobserved: 0,
+      outputUnobserved: 0,
+    });
+    expect(receipt.modelRequests).toBe(1);
+  });
+
+  it("reads a ledger a killed broker tore mid-append, leaving what it lost unobserved", async () => {
+    const root = await mkdtemp(join(tmpdir(), "review-pi-cli-"));
+    temporaryDirectories.push(root);
+    const arranged = await arrangeFakeDocker(root);
+    const totals = (overrides: Record<string, number>) => ({
+      requests: 1,
+      retries: 0,
+      input: 0,
+      output: 0,
+      unended: 1,
+      inputUnobserved: 0,
+      outputUnobserved: 0,
+      ...overrides,
+    });
+    // The second admission was cut mid-append: it may have admitted a request
+    // the whole lines never counted, or been a denial nobody counted either.
+    const torn = JSON.stringify({
+      event: "provider_admitted",
+      attemptId: 2,
+      attempt: 0,
+      totals: totals({ requests: 2, input: 111, output: 222 }),
+    }).slice(0, 48);
+    await writeFile(
+      join(arranged.container, "provider-usage.jsonl"),
+      [
+        JSON.stringify({ event: "broker_start" }),
+        JSON.stringify({
+          event: "provider_admitted",
+          attemptId: 1,
+          attempt: 0,
+          totals: totals({}),
+        }),
+        JSON.stringify({
+          event: "provider_request",
+          attemptId: 1,
+          status: 200,
+          usage: { input: 111, output: 222 },
+          totals: totals({ input: 111, output: 222, unended: 0 }),
+        }),
+        torn,
+      ].join("\n"),
+    );
+    const runId = "torn-ledger-lane";
+    const out = join(root, "out");
+
+    const result = await runLocalCli(
+      localArguments(out, runId),
+      fakeEnvironment(arranged, runId, "success"),
+    );
+    const receipt = await readLocalReceipt(join(out, runId));
+
+    expect(result.code, result.output).toBe(0);
+    expect(receipt.usage).toEqual({
+      requests: 1,
+      retries: 0,
+      inputTokens: 111,
+      outputTokens: 222,
+      denials: null,
+      unended: null,
+      inputUnobserved: 0,
+      outputUnobserved: 0,
+    });
+    expect(receipt.modelRequests).toBe(1);
   });
 
   it("removes staged OAuth after a review-start failure", async () => {

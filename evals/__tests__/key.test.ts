@@ -530,6 +530,256 @@ describe("buildTrials", () => {
     expect(trials[0]?.usage).toEqual({ inputTokens: 140, outputTokens: 15 });
   });
 
+  it("reads a usage record that names no token count as absent", () => {
+    const sheet = buildSheet(KEY, "W2", [
+      {
+        receiptPath: "r1.json",
+        receipt: swarmReceipt({
+          candidates: [],
+          findings: [],
+          lanes: [
+            {
+              laneId: "reviewer-1",
+              role: "reviewer",
+              model: "m",
+              status: "completed",
+              finishReason: "stop",
+              usage: { inputTokens: 100, outputTokens: 10 },
+            },
+            {
+              laneId: "reviewer-2",
+              role: "reviewer",
+              model: "m",
+              status: "failed",
+              finishReason: null,
+              usage: { turns: 0 },
+            },
+          ],
+        }),
+      },
+    ]);
+
+    expect(sheet.receipts[0]?.lanes[1]?.usage).toBeNull();
+    expect(buildTrials(KEY, sheet)[0]?.usage).toEqual({
+      inputTokens: 100,
+      outputTokens: 10,
+    });
+  });
+
+  it("leaves a trial's token sum unobserved when a lane left its count unobserved", () => {
+    const sheet = buildSheet(KEY, "W2", [
+      {
+        receiptPath: "r1.json",
+        receipt: swarmReceipt({
+          candidates: [],
+          findings: [],
+          lanes: [
+            {
+              laneId: "reviewer-1",
+              role: "reviewer",
+              model: "m",
+              status: "completed",
+              finishReason: "stop",
+              usage: { inputTokens: null, outputTokens: 5, unended: 0 },
+            },
+            {
+              laneId: "verifier",
+              role: "verifier",
+              model: "m",
+              status: "completed",
+              finishReason: "stop",
+              usage: {
+                inputTokens: 100,
+                outputTokens: 10,
+                inputUnobserved: 0,
+                outputUnobserved: 1,
+              },
+            },
+          ],
+        }),
+      },
+    ]);
+
+    // One lane never observed its input and the other's output sum is a
+    // request short, so neither side of the trial is a number to quote.
+    expect(sheet.receipts[0]?.lanes.map((lane) => lane.usage)).toEqual([
+      { inputTokens: null, outputTokens: 5 },
+      { inputTokens: 100, outputTokens: null },
+    ]);
+    expect(buildTrials(KEY, sheet)[0]?.usage).toEqual({
+      inputTokens: null,
+      outputTokens: null,
+    });
+  });
+
+  it("leaves both token sums unobserved when a lane's request never ended", () => {
+    const sheet = buildSheet(KEY, "W2", [
+      {
+        receiptPath: "r1.json",
+        receipt: swarmReceipt({
+          candidates: [],
+          findings: [],
+          lanes: [
+            {
+              laneId: "reviewer-1",
+              role: "reviewer",
+              model: "m",
+              status: "completed",
+              finishReason: "stop",
+              usage: {
+                requests: 6,
+                retries: 0,
+                inputTokens: 14823,
+                outputTokens: 495,
+                denials: 0,
+                unended: 1,
+                inputUnobserved: 0,
+                outputUnobserved: 0,
+              },
+            },
+            {
+              laneId: "verifier",
+              role: "verifier",
+              model: "m",
+              status: "completed",
+              finishReason: "stop",
+              usage: {
+                requests: 2,
+                retries: 0,
+                inputTokens: 100,
+                outputTokens: 10,
+                denials: 0,
+                unended: 0,
+                inputUnobserved: 0,
+                outputUnobserved: 0,
+              },
+            },
+          ],
+        }),
+      },
+    ]);
+
+    // The first ledger admitted six requests and saw five end, so both of its
+    // sums are one request short; the second saw every request it admitted end.
+    expect(sheet.receipts[0]?.lanes.map((lane) => lane.usage)).toEqual([
+      { inputTokens: null, outputTokens: null },
+      { inputTokens: 100, outputTokens: 10 },
+    ]);
+    const trials = buildTrials(KEY, sheet);
+    expect(trials[0]?.usage).toEqual({ inputTokens: null, outputTokens: null });
+    expect(scoreT1b(trials).usage).toEqual({
+      inputTokens: null,
+      outputTokens: null,
+    });
+  });
+
+  it("reads a usage record whose token sums are null as a record", () => {
+    const sheet = buildSheet(KEY, "W2", [
+      {
+        receiptPath: "r1.json",
+        receipt: swarmReceipt({
+          candidates: [],
+          findings: [],
+          lanes: [
+            {
+              laneId: "reviewer-1",
+              role: "reviewer",
+              model: "m",
+              status: "completed",
+              finishReason: "stop",
+              usage: { inputTokens: 100, outputTokens: 10 },
+            },
+            {
+              laneId: "reviewer-2",
+              role: "reviewer",
+              model: "m",
+              status: "completed",
+              finishReason: "stop",
+              usage: { inputTokens: null, outputTokens: null },
+            },
+          ],
+        }),
+      },
+    ]);
+
+    // A Worker session that never saw a usage frame starts its sums from null;
+    // the lane spent tokens nobody observed, so the trial has no sum to quote.
+    expect(sheet.receipts[0]?.lanes[1]?.usage).toEqual({
+      inputTokens: null,
+      outputTokens: null,
+    });
+    expect(buildTrials(KEY, sheet)[0]?.usage).toEqual({
+      inputTokens: null,
+      outputTokens: null,
+    });
+  });
+
+  it("reads a usage record that carries only a request count as a record", () => {
+    const sheet = buildSheet(KEY, "W2", [
+      {
+        receiptPath: "r1.json",
+        receipt: swarmReceipt({
+          candidates: [],
+          findings: [],
+          lanes: [
+            {
+              laneId: "reviewer-1",
+              role: "reviewer",
+              model: "m",
+              status: "completed",
+              finishReason: "stop",
+              usage: { inputTokens: 100, outputTokens: 10 },
+            },
+            {
+              laneId: "reviewer-2",
+              role: "reviewer",
+              model: "m",
+              status: "completed",
+              finishReason: "stop",
+              usage: { requests: 1, unended: 1 },
+            },
+          ],
+        }),
+      },
+    ]);
+
+    expect(sheet.receipts[0]?.lanes[1]?.usage).toEqual({
+      inputTokens: null,
+      outputTokens: null,
+    });
+    expect(buildTrials(KEY, sheet)[0]?.usage).toEqual({
+      inputTokens: null,
+      outputTokens: null,
+    });
+  });
+
+  it("reads a token sum that is not a whole number as unobserved", () => {
+    const sheet = buildSheet(KEY, "W2", [
+      {
+        receiptPath: "r1.json",
+        receipt: swarmReceipt({
+          candidates: [],
+          findings: [],
+          lanes: [
+            {
+              laneId: "reviewer-1",
+              role: "reviewer",
+              model: "m",
+              status: "completed",
+              finishReason: "stop",
+              usage: { inputTokens: 100.5, outputTokens: 10 },
+            },
+          ],
+        }),
+      },
+    ]);
+
+    expect(sheet.receipts[0]?.lanes[0]?.usage).toEqual({
+      inputTokens: null,
+      outputTokens: 10,
+    });
+  });
+
   it("deduplicates a defect two rows name", () => {
     const trials = buildTrials(
       KEY,

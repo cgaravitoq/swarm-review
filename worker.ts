@@ -82,14 +82,19 @@ export class ReviewSandbox extends Sandbox<ReviewPiEnv> {
   ) {
     const session = await this.ctx.storage.get<ModelSession>(MODEL_SESSION_KEY);
     if (!session) return;
-    if (usage) {
-      if (usage.input !== null) {
-        session.totals.input = (session.totals.input ?? 0) + usage.input;
-      }
-      if (usage.output !== null) {
-        session.totals.output = (session.totals.output ?? 0) + usage.output;
-      }
+    const input = usage?.input ?? null;
+    if (input !== null) {
+      session.totals.input = (session.totals.input ?? 0) + input;
+    } else if (session.totals.inputUnobserved !== undefined) {
+      session.totals.inputUnobserved += 1;
     }
+    const output = usage?.output ?? null;
+    if (output !== null) {
+      session.totals.output = (session.totals.output ?? 0) + output;
+    } else if (session.totals.outputUnobserved !== undefined) {
+      session.totals.outputUnobserved += 1;
+    }
+    if (session.totals.unended !== undefined) session.totals.unended -= 1;
     session.retryPending = retryable;
     await this.ctx.storage.put(MODEL_SESSION_KEY, session);
     await this.ctx.storage.put(MODEL_SEALS_KEY, [
@@ -112,6 +117,17 @@ export class ReviewSandbox extends Sandbox<ReviewPiEnv> {
     return publicModelUsage(
       await this.ctx.storage.get<ModelSession>(MODEL_SESSION_KEY),
     );
+  }
+
+  /** What the proxy checks a request against before it spends a slot on it. */
+  async openModelSession() {
+    const session = await this.ctx.storage.get<ModelSession>(MODEL_SESSION_KEY);
+    if (!session) return null;
+    return {
+      handle: session.handle,
+      caps: session.caps,
+      upstreamBaseUrl: session.upstreamBaseUrl,
+    };
   }
 
   async clearModelSession() {
@@ -271,7 +287,8 @@ export default {
         request,
         url0,
         env.CONTROL_SECRET,
-        async (runId) => getSandbox(env.REVIEW_SANDBOX, runId).modelUsage(),
+        async (runId) =>
+          getSandbox(env.REVIEW_SANDBOX, runId).openModelSession(),
         async (runId) =>
           getSandbox(env.REVIEW_SANDBOX, runId).consumeModelAttempt(),
         async (runId, usage, retryable, seal) =>

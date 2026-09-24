@@ -4,8 +4,8 @@
 
 import { mkdir, writeFile } from "node:fs/promises";
 import { join } from "node:path";
+import { readUsage } from "../container/response-usage";
 import { writeLocalReceipt } from "./local";
-import { readUsage } from "./model-proxy";
 
 const FAST_MAX_TOKENS = 8192;
 const FAST_TIMEOUT_MS = 180_000;
@@ -152,6 +152,12 @@ Static evidence is enough. Emit exactly one verdict per candidate, and end your 
 status is confirmed, rejected, or duplicate (with duplicateOf). diffRelation is added, touched or untouched. declaredIntent is a verbatim sentence from the pull request body, or null.
 `;
 
+/** A packed answer's spend. A side the answer never reported is null, never zero. */
+export type PackedUsage = {
+  inputTokens: number | null;
+  outputTokens: number | null;
+};
+
 /**
  * Spend as the answer's own record reports it.
  *
@@ -160,7 +166,7 @@ status is confirmed, rejected, or duplicate (with duplicateOf). diffRelation is 
  * call looks free. This body is already parsed, so the record is read first and
  * the line scanner stays as the fallback for a streamed one.
  */
-const usageFrom = (value: unknown) => {
+const usageFrom = (value: unknown): PackedUsage | null => {
   const record =
     typeof value === "object" && value !== null && !Array.isArray(value)
       ? (value as Record<string, unknown>)
@@ -175,8 +181,25 @@ const usageFrom = (value: unknown) => {
     record?.["outputTokens"];
   if (typeof input !== "number" && typeof output !== "number") return null;
   return {
-    ...(typeof input === "number" ? { inputTokens: input } : {}),
-    ...(typeof output === "number" ? { outputTokens: output } : {}),
+    inputTokens: typeof input === "number" ? input : null,
+    outputTokens: typeof output === "number" ? output : null,
+  };
+};
+
+/**
+ * What a packed lane asked twice spent. A side one answer never reported is
+ * unobserved for the lane, since that answer spent it too.
+ */
+export const addPackedUsage = (
+  first: PackedUsage | null,
+  second: PackedUsage | null,
+): PackedUsage | null => {
+  if (!first || !second) return null;
+  const add = (left: number | null, right: number | null) =>
+    left === null || right === null ? null : left + right;
+  return {
+    inputTokens: add(first.inputTokens, second.inputTokens),
+    outputTokens: add(first.outputTokens, second.outputTokens),
   };
 };
 
@@ -278,19 +301,10 @@ export async function completeOnce(input: {
     usageFrom(
       (record?.["response"] as Record<string, unknown> | undefined)?.["usage"],
     ) ??
-    (streamed
-      ? {
-          ...(streamed.input === null ? {} : { inputTokens: streamed.input }),
-          ...(streamed.output === null
-            ? {}
-            : { outputTokens: streamed.output }),
-        }
-      : null);
-  return {
-    content,
-    finishReason,
-    usage: usage ?? {},
-  };
+    (streamed.input === null && streamed.output === null
+      ? null
+      : { inputTokens: streamed.input, outputTokens: streamed.output });
+  return { content, finishReason, usage };
 }
 
 /** What one canary proved about one model id, with the provider's own words. */
@@ -372,7 +386,7 @@ export async function writeFastLaneArtifacts(input: {
   model: string;
   finalText: string;
   wallSeconds: number;
-  usage?: Record<string, number>;
+  usage?: Readonly<Record<string, number | null>> | null;
   error?: string;
 }) {
   await mkdir(input.artifactDir, { recursive: true });
@@ -388,7 +402,7 @@ export async function writeFastLaneArtifacts(input: {
     model: input.model,
     wallSeconds: input.wallSeconds,
     teardownSeconds: 0,
-    usage: input.usage ?? {},
+    usage: input.usage ?? null,
     error: input.error ?? null,
     shutdown: { truncatedArtifacts: [] },
   });

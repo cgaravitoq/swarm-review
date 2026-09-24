@@ -779,6 +779,7 @@ describe("deployed container image", () => {
       ["review-run.sh", REVIEW_RUNNER],
       ["model-broker.ts", MODEL_BROKER],
       ["response-seal.ts", "/opt/review/response-seal.ts"],
+      ["response-usage.ts", "/opt/review/response-usage.ts"],
       ["Dockerfile", "/opt/review/Dockerfile"],
     ]);
   });
@@ -857,12 +858,12 @@ describe("cloud model session accounting", () => {
     };
   };
 
-  const runningSandbox = async () => {
+  const runningSandbox = async (upstreamBaseUrl = broker.upstreamBaseUrl) => {
     const sandbox = new ReviewSandbox({} as never, env as never);
     Object.assign(sandbox, { ctx: { storage: storage() } });
     await sandbox.putModelSession({
       handle: broker.handle,
-      upstreamBaseUrl: broker.upstreamBaseUrl,
+      upstreamBaseUrl,
       upstreamAuthorization: broker.upstreamAuthorization,
       caps: broker.caps,
       totals: emptyModelTotals(),
@@ -908,7 +909,139 @@ describe("cloud model session accounting", () => {
 
     expect(upstream).toHaveBeenCalledTimes(2);
     expect(await sandbox.modelUsage()).toMatchObject({
-      totals: { requests: 2, retries: 1, input: 3, output: 1 },
+      totals: { requests: 2, retries: 1, input: 3, output: 1, unended: 0 },
+    });
+    // The 503 reported no usage at all, so each sum is one request short.
+    expect(await sandbox.modelUsage()).toMatchObject({
+      totals: { inputUnobserved: 1, outputUnobserved: 1 },
+    });
+  });
+
+  it("says a session total is short by the request that never reported that side", async () => {
+    const sandbox = await runningSandbox();
+    getSandbox.mockReturnValue(sandbox);
+    vi.stubGlobal(
+      "fetch",
+      vi
+        .fn<typeof fetch>()
+        .mockResolvedValueOnce(
+          new Response('data: {"usage":{"completion_tokens":7}}'),
+        )
+        .mockResolvedValueOnce(
+          new Response(
+            'data: {"usage":{"prompt_tokens":3,"completion_tokens":1}}',
+          ),
+        ),
+    );
+
+    await (await postModel("one-sided-run")).text();
+    await (await postModel("one-sided-run")).text();
+
+    // Three input tokens is what one of the two requests reported, and the
+    // count beside it is what keeps that sum from reading as the lane's input.
+    expect((await sandbox.modelUsage())?.totals).toEqual({
+      requests: 2,
+      retries: 0,
+      input: 3,
+      output: 8,
+      unended: 0,
+      inputUnobserved: 1,
+      outputUnobserved: 0,
+    });
+  });
+
+  it("keeps an attempt unended when the client walks away before the stream closes", async () => {
+    const sandbox = await runningSandbox();
+    getSandbox.mockReturnValue(sandbox);
+    // A provider that opens a body and never closes it: the flush that records
+    // the attempt never runs, so the slot is spent with no end observed.
+    vi.stubGlobal(
+      "fetch",
+      vi.fn<typeof fetch>(() =>
+        Promise.resolve(
+          new Response(new ReadableStream({ start() {} }), {
+            status: 200,
+            headers: { "content-type": "text/event-stream" },
+          }),
+        ),
+      ),
+    );
+
+    const response = await postModel("abandoned-run");
+    await response.body?.cancel();
+
+    // The request is counted and the record says it never ended, so a row that
+    // reads these totals cannot read its tokens as an observed zero.
+    expect(await sandbox.modelUsage()).toMatchObject({
+      totals: { requests: 1, unended: 1 },
+    });
+    expect(await sandbox.modelSeals()).toEqual([]);
+  });
+
+  it("leaves unended unobserved on a session stored before it was counted", async () => {
+    const sandbox = new ReviewSandbox({} as never, env as never);
+    Object.assign(sandbox, { ctx: { storage: storage() } });
+    // Durable Object storage outlives a redeploy, so a session an older Worker
+    // opened reaches this one without the count.
+    await sandbox.putModelSession({
+      handle: broker.handle,
+      upstreamBaseUrl: broker.upstreamBaseUrl,
+      upstreamAuthorization: broker.upstreamAuthorization,
+      caps: broker.caps,
+      totals: { requests: 1, retries: 0, input: 5, output: 1 },
+    });
+    getSandbox.mockReturnValue(sandbox);
+    vi.stubGlobal(
+      "fetch",
+      vi.fn<typeof fetch>(() =>
+        Promise.resolve(
+          new Response(
+            'data: {"usage":{"prompt_tokens":3,"completion_tokens":1}}',
+          ),
+        ),
+      ),
+    );
+
+    await (await postModel("stored-before-run")).text();
+
+    expect((await sandbox.modelUsage())?.totals).toEqual({
+      requests: 2,
+      retries: 0,
+      input: 8,
+      output: 2,
+    });
+  });
+
+  it("leaves the unobserved counts absent on a session stored before they were counted", async () => {
+    const sandbox = new ReviewSandbox({} as never, env as never);
+    Object.assign(sandbox, { ctx: { storage: storage() } });
+    await sandbox.putModelSession({
+      handle: broker.handle,
+      upstreamBaseUrl: broker.upstreamBaseUrl,
+      upstreamAuthorization: broker.upstreamAuthorization,
+      caps: broker.caps,
+      totals: { requests: 1, retries: 0, input: 5, output: 1, unended: 0 },
+    });
+    getSandbox.mockReturnValue(sandbox);
+    vi.stubGlobal(
+      "fetch",
+      vi.fn<typeof fetch>(() =>
+        Promise.resolve(
+          new Response('data: {"choices":[{"delta":{"content":"ok"}}]}'),
+        ),
+      ),
+    );
+
+    await (await postModel("stored-before-counts-run")).text();
+
+    // Requests nobody counted before cannot be counted from here, so the
+    // count stays absent rather than starting a number that reads as whole.
+    expect((await sandbox.modelUsage())?.totals).toEqual({
+      requests: 2,
+      retries: 0,
+      input: 5,
+      output: 1,
+      unended: 0,
     });
   });
 
@@ -927,6 +1060,24 @@ describe("cloud model session accounting", () => {
     expect(upstream).not.toHaveBeenCalled();
     expect(await sandbox.modelUsage()).toMatchObject({
       totals: { requests: 0, retries: 0 },
+    });
+  });
+
+  it("admits nothing for a request it refuses before the upstream", async () => {
+    // The run request only asks for an https prefix, so a base no URL parser
+    // accepts reaches the session. Nothing can be sent there, and a slot spent
+    // before that refusal would be an admission no end ever records.
+    const sandbox = await runningSandbox("https://api.x.ai:99999/v1");
+    getSandbox.mockReturnValue(sandbox);
+    const upstream = vi.fn<typeof fetch>();
+    vi.stubGlobal("fetch", upstream);
+
+    const refused = await postModel("unroutable-run");
+
+    expect(refused.status).toBe(403);
+    expect(upstream).not.toHaveBeenCalled();
+    expect(await sandbox.modelUsage()).toMatchObject({
+      totals: { requests: 0, unended: 0 },
     });
   });
 

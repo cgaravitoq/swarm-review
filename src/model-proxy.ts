@@ -7,8 +7,14 @@
  * run-scoped URL under /model/<runId>/<capability>/.
  */
 
-import { responseSealer } from "../container/response-seal";
+import {
+  responseSealer,
+  WORKER_SSE_LINE_CHARS,
+} from "../container/response-seal";
+import { type ModelUsage, usageReader } from "../container/response-usage";
 import { assertCloudRunId } from "./isolation";
+
+export type { ModelUsage };
 
 export type ModelCaps = {
   maxRequests: number;
@@ -18,14 +24,36 @@ export type ModelCaps = {
   maxRequestBytes: number;
 };
 
-/** Provider-reported usage. A field the body never carried is null, never zero. */
-export type ModelUsage = { input: number | null; output: number | null };
-
 export type ModelTotals = {
   requests: number;
   retries: number;
   input: number | null;
   output: number | null;
+  /**
+   * Attempts admitted whose end this session has not seen.
+   *
+   * `recordAttempt` runs at the stream's flush, so a client that walks away
+   * from a response leaves its slot spent and its end unobserved. The count is
+   * the control side's own statement of that, and the totals a row reads from
+   * it carry one request's tokens less than the requests it names.
+   *
+   * Absent on a session a Worker stored before the count existed: Durable
+   * Object storage outlives a redeploy, and admissions nobody counted cannot
+   * be counted down.
+   */
+  unended?: number;
+  /**
+   * Ended attempts whose response never reported that side of their usage: an
+   * attempt the upstream never answered, an answer without a body or a usage
+   * frame, or one whose frames this hop could not read.
+   *
+   * `input` and `output` add only what a provider reported, so each is short by
+   * the attempts counted here, and a reader that saw only the sums would read
+   * them as complete. Absent, like `unended`, on a session stored before the
+   * count existed.
+   */
+  inputUnobserved?: number;
+  outputUnobserved?: number;
 };
 
 export type ModelSession = {
@@ -94,6 +122,9 @@ export const emptyModelTotals = (): ModelTotals => ({
   retries: 0,
   input: null,
   output: null,
+  unended: 0,
+  inputUnobserved: 0,
+  outputUnobserved: 0,
 });
 
 export function publicModelUsage(session: ModelSession | undefined) {
@@ -127,6 +158,7 @@ export function reserveAttempt(
   const violation = capViolation(totals, caps);
   if (violation) return violation;
   totals.requests += 1;
+  if (totals.unended !== undefined) totals.unended += 1;
   if (isRetry) totals.retries += 1;
   return null;
 }
@@ -153,58 +185,6 @@ export function resolveUpstreamTarget(requestUrl: string, baseUrl: string) {
   }
   return target;
 }
-
-export const readUsage = (body: string): ModelUsage | null => {
-  const totals: ModelUsage = { input: null, output: null };
-  const numberAt = (record: Record<string, unknown>, key: string) => {
-    const value = record[key];
-    return typeof value === "number" ? value : 0;
-  };
-  const consider = (candidate: Record<string, unknown> | undefined) => {
-    if (!candidate || typeof candidate !== "object") return;
-    const anthropicInput = candidate["input_tokens"];
-    const input =
-      anthropicInput ?? candidate["prompt_tokens"] ?? candidate["inputTokens"];
-    const output =
-      candidate["output_tokens"] ??
-      candidate["completion_tokens"] ??
-      candidate["outputTokens"];
-    if (typeof input !== "number" && typeof output !== "number") return;
-    if (typeof input === "number") {
-      totals.input =
-        input +
-        (typeof anthropicInput === "number"
-          ? numberAt(candidate, "cache_read_input_tokens") +
-            numberAt(candidate, "cache_creation_input_tokens")
-          : 0);
-    }
-    if (typeof output === "number") totals.output = output;
-  };
-  for (const line of body.split("\n")) {
-    const payload = line.startsWith("data:")
-      ? line.slice(5).trim()
-      : line.trim();
-    if (!payload || payload === "[DONE]") continue;
-    try {
-      const parsed = JSON.parse(payload) as Record<string, unknown>;
-      const nestedUsage = (key: string) => {
-        const container = parsed[key];
-        return typeof container === "object" && container !== null
-          ? (container as Record<string, unknown>)["usage"]
-          : undefined;
-      };
-      consider(
-        (parsed["usage"] as Record<string, unknown> | undefined) ??
-          // OpenAI's Responses API nests it under the response, Anthropic's
-          // Messages API under the message it opens with.
-          (nestedUsage("response") as Record<string, unknown> | undefined) ??
-          (nestedUsage("message") as Record<string, unknown> | undefined) ??
-          parsed,
-      );
-    } catch {}
-  }
-  return totals.input === null && totals.output === null ? null : totals;
-};
 
 const jsonError = (status: number, reason: string) =>
   new Response(JSON.stringify({ error: { type: "review_pi_model", reason } }), {
@@ -277,7 +257,11 @@ export async function proxyModelFetch(
   request: Request,
   url: URL,
   secret: string,
-  open: (runId: string) => Promise<{ handle: string; caps: ModelCaps } | null>,
+  open: (runId: string) => Promise<{
+    handle: string;
+    caps: ModelCaps;
+    upstreamBaseUrl: string;
+  } | null>,
   consume: (
     runId: string,
   ) => Promise<
@@ -311,6 +295,20 @@ export async function proxyModelFetch(
   if (presentedHandle(request) !== opened.handle) {
     return jsonError(401, "handle_rejected");
   }
+  // Every refusal comes before `consume`: a slot spent on a request that is
+  // then refused is an admission no end ever records.
+  let target: URL;
+  try {
+    target = resolveUpstreamTarget(
+      `${rest}${url.search}`,
+      opened.upstreamBaseUrl,
+    );
+  } catch (error) {
+    return jsonError(
+      403,
+      error instanceof Error ? error.message : String(error),
+    );
+  }
   const method = request.method;
   const body =
     method === "GET" || method === "HEAD"
@@ -319,18 +317,6 @@ export async function proxyModelFetch(
   if (body === "max_request_bytes") return jsonError(413, body);
   const consumed = await consume(runId);
   if (!consumed.ok) return jsonError(429, consumed.reason);
-  let target: URL;
-  try {
-    target = resolveUpstreamTarget(
-      `${rest}${url.search}`,
-      consumed.session.upstreamBaseUrl,
-    );
-  } catch (error) {
-    return jsonError(
-      403,
-      error instanceof Error ? error.message : String(error),
-    );
-  }
   const headers = new Headers(request.headers);
   headers.set("authorization", consumed.session.upstreamAuthorization);
   headers.delete("host");
@@ -364,19 +350,19 @@ export async function proxyModelFetch(
   }
   const decoder = new TextDecoder();
   const sealer = responseSealer();
+  const usage = usageReader({ lineChars: WORKER_SSE_LINE_CHARS });
   const stream = new TransformStream<Uint8Array, Uint8Array>({
     transform(chunk, controller) {
-      sealer.write(decoder.decode(chunk, { stream: true }));
+      const text = decoder.decode(chunk, { stream: true });
+      sealer.write(text);
+      usage.write(text);
       controller.enqueue(chunk);
     },
     async flush() {
-      sealer.write(decoder.decode());
-      await recordAttempt(
-        runId,
-        readUsage(sealer.tail()),
-        retryable,
-        sealer.seal(),
-      );
+      const text = decoder.decode();
+      sealer.write(text);
+      usage.write(text);
+      await recordAttempt(runId, usage.read(), retryable, sealer.seal());
     },
   });
   return new Response(upstream.body.pipeThrough(stream), {

@@ -169,7 +169,15 @@ describe("actual usage accounting", () => {
       event: "provider_request",
       status: 200,
       usage: { input: 2000, output: 300 },
-      totals: { requests: 3, retries: 1, input: 3000, output: 400 },
+      totals: {
+        requests: 3,
+        retries: 1,
+        input: 3000,
+        output: 400,
+        unended: 1,
+        inputUnobserved: 1,
+        outputUnobserved: 0,
+      },
     }),
     JSON.stringify({ event: "denied", reason: "max_requests" }),
   ].join("\n");
@@ -181,7 +189,49 @@ describe("actual usage accounting", () => {
       inputTokens: 3000,
       outputTokens: 400,
       denials: 1,
+      // Three slots were spent and the ledger's last totals say one of them was
+      // never seen to end: the tokens beside it are one request short, and the
+      // row has to say so rather than price a request it never read.
+      unended: 1,
+      // One ended request never reported its input, so the input sum is one
+      // request short as well, and only this count says so.
+      inputUnobserved: 1,
+      outputUnobserved: 0,
     });
+  });
+
+  it("reads an unended count the ledger never carried as unobserved", () => {
+    // A broker built before the count existed wrote totals without it.
+    const before = [
+      JSON.stringify({ event: "broker_start" }),
+      JSON.stringify({
+        event: "provider_request",
+        totals: { requests: 2, retries: 0, input: 10, output: 4 },
+      }),
+    ].join("\n");
+    expect(readLedgerUsage(before).unended).toBeNull();
+    // A broker that admitted nothing wrote no totals, and no admission is
+    // exactly what it observed.
+    expect(
+      readLedgerUsage(JSON.stringify({ event: "broker_start" })),
+    ).toMatchObject({ requests: 0, unended: 0 });
+  });
+
+  it("reads the unobserved sides a ledger never counted as unobserved", () => {
+    const before = [
+      JSON.stringify({ event: "broker_start" }),
+      JSON.stringify({
+        event: "provider_request",
+        totals: { requests: 2, retries: 0, input: 10, output: 4, unended: 0 },
+      }),
+    ].join("\n");
+    expect(readLedgerUsage(before)).toMatchObject({
+      inputUnobserved: null,
+      outputUnobserved: null,
+    });
+    expect(
+      readLedgerUsage(JSON.stringify({ event: "broker_start" })),
+    ).toMatchObject({ inputUnobserved: 0, outputUnobserved: 0 });
   });
 
   it("keeps the reservation beside the settled actual cost", () => {

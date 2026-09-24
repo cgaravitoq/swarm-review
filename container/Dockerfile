@@ -111,6 +111,7 @@ RUN groupadd --gid 1101 review-control \
 
 COPY model-broker.ts /opt/review/model-broker.ts
 COPY response-seal.ts /opt/review/response-seal.ts
+COPY response-usage.ts /opt/review/response-usage.ts
 RUN chmod 0755 /opt/review/model-broker.ts
 
 # Last but for the recipe itself, so a runner or broker edit reuses every layer

@@ -17,6 +17,7 @@ import { appendFileSync, readFileSync } from "node:fs";
 import type { IncomingMessage, ServerResponse } from "node:http";
 import { createServer } from "node:http";
 import { CONTAINER_SSE_LINE_CHARS, responseSealer } from "./response-seal";
+import { type ModelUsage, usageReader } from "./response-usage";
 
 /** The cap that would be broken by admitting one more request, or null. */
 export type BrokerCaps = {
@@ -32,6 +33,26 @@ export type BrokerTotals = {
   retries: number;
   input: number;
   output: number;
+  /**
+   * Attempts admitted whose end this broker has not seen.
+   *
+   * The slot is spent the moment the attempt is reserved, so an attempt that
+   * never ends - an upgrade this HTTP-only hop cannot complete, a provider that
+   * accepts and never answers - is counted here and nowhere else. A reader that
+   * only saw the settled lines would read a request no record names.
+   */
+  unended: number;
+  /**
+   * Ended attempts whose response never reported that side of their usage: a
+   * retried or failed attempt, an answer without a usage frame, or one whose
+   * frames this hop could not read.
+   *
+   * `input` and `output` add only what a provider reported, so each is short by
+   * the attempts counted here, and a reader that saw only the sums would read
+   * them as complete.
+   */
+  inputUnobserved: number;
+  outputUnobserved: number;
 };
 
 export type BrokerConfig = {
@@ -74,6 +95,7 @@ export function reserveAttempt(
   const violation = capViolation(totals, caps);
   if (violation) return violation;
   totals.requests += 1;
+  totals.unended += 1;
   if (isRetry) totals.retries += 1;
   return null;
 }
@@ -114,80 +136,20 @@ export function resolveUpstreamTarget(requestUrl: string, baseUrl: string) {
   return target;
 }
 
-/**
- * Provider-reported usage, whether the response was one JSON body or an SSE
- * stream. Only the last usage object in a stream is authoritative, so the scan
- * keeps overwriting rather than summing.
- */
-/**
- * Provider-reported usage, whether the response was one JSON body or an SSE
- * stream. A frame updates the fields it carries and the last value of each one
- * wins, rather than the last frame replacing the whole reading: Anthropic opens
- * with the input and closes with the output, so replacing would keep one and
- * lose the other.
- *
- * Anthropic also reports the cached halves of a prompt apart from
- * `input_tokens`, and a review that caches its context spends most of its input
- * there. Counting only `input_tokens` would show a lane sitting against its
- * token ceiling as having spent almost nothing. OpenAI-style usage already folds
- * cache reads into `prompt_tokens`, so the cache fields are added only where a
- * provider reports them on their own.
- */
-export const readUsage = (
-  body: string,
-): { input: number; output: number } | null => {
-  const totals = { input: 0, output: 0 };
-  let seen = false;
-  const numberAt = (record: Record<string, unknown>, key: string) => {
-    const value = record[key];
-    return typeof value === "number" ? value : 0;
-  };
-  const consider = (candidate: Record<string, unknown> | undefined) => {
-    if (!candidate || typeof candidate !== "object") return;
-    const anthropicInput = candidate["input_tokens"];
-    const input =
-      anthropicInput ?? candidate["prompt_tokens"] ?? candidate["inputTokens"];
-    const output =
-      candidate["output_tokens"] ??
-      candidate["completion_tokens"] ??
-      candidate["outputTokens"];
-    if (typeof input !== "number" && typeof output !== "number") return;
-    seen = true;
-    if (typeof input === "number") {
-      totals.input =
-        input +
-        (typeof anthropicInput === "number"
-          ? numberAt(candidate, "cache_read_input_tokens") +
-            numberAt(candidate, "cache_creation_input_tokens")
-          : 0);
+/** The ledger line that ends one admitted attempt, before its id and totals. */
+type AttemptEnd =
+  | { event: "provider_retry"; status: number; attempt: number }
+  | {
+      event: "provider_request";
+      status: number;
+      attempt: number;
+      path: string;
+      usage: ModelUsage;
+      seal: string | null;
     }
-    if (typeof output === "number") totals.output = output;
-  };
-  for (const line of body.split("\n")) {
-    const payload = line.startsWith("data:")
-      ? line.slice(5).trim()
-      : line.trim();
-    if (!payload || payload === "[DONE]") continue;
-    try {
-      const parsed = JSON.parse(payload) as Record<string, unknown>;
-      const nestedUsage = (key: string) => {
-        const container = parsed[key];
-        return typeof container === "object" && container !== null
-          ? (container as Record<string, unknown>)["usage"]
-          : undefined;
-      };
-      consider(
-        (parsed["usage"] as Record<string, unknown> | undefined) ??
-          // OpenAI's Responses API nests it under the response, Anthropic's
-          // Messages API under the message it opens with.
-          (nestedUsage("response") as Record<string, unknown> | undefined) ??
-          (nestedUsage("message") as Record<string, unknown> | undefined) ??
-          parsed,
-      );
-    } catch {}
-  }
-  return seen ? totals : null;
-};
+  | { event: "provider_error"; attempt: number; message: string };
+
+const UNREPORTED: ModelUsage = { input: null, output: null };
 
 const readBody = (stream: IncomingMessage) =>
   new Promise<Buffer>((resolve, reject) => {
@@ -200,7 +162,18 @@ const readBody = (stream: IncomingMessage) =>
 export function createBrokerServer(config: BrokerConfig) {
   const caps = config.caps;
   const ledgerPath = config.ledgerPath;
-  const totals = { requests: 0, retries: 0, input: 0, output: 0 };
+  const totals: BrokerTotals = {
+    requests: 0,
+    retries: 0,
+    input: 0,
+    output: 0,
+    unended: 0,
+    inputUnobserved: 0,
+    outputUnobserved: 0,
+  };
+  // Numbered across the broker's whole run, not per HTTP request: the id is
+  // what pairs an admission with its end, and pi sends many requests a lane.
+  let admitted = 0;
 
   const record = (entry: Record<string, unknown>) => {
     appendFileSync(
@@ -291,6 +264,23 @@ export function createBrokerServer(config: BrokerConfig) {
         deny(res, 429, refusal);
         return;
       }
+      // The admission is written before the attempt is sent, so the ledger
+      // names every request the caps counted. What follows the admission is
+      // this attempt's outcome, and one that never arrives leaves the request
+      // recorded as admitted and unended rather than as nothing at all.
+      admitted += 1;
+      const attemptId = admitted;
+      record({
+        event: "provider_admitted",
+        attemptId,
+        attempt,
+        path: target.pathname,
+        totals: { ...totals },
+      });
+      // What the attempt came to is recorded once, after the try: a ledger
+      // write that throws there cannot end the attempt a second time, or send
+      // a request the lane already holds the answer to again.
+      let outcome: AttemptEnd;
       try {
         const upstream = await fetch(target, {
           method: req.method ?? "POST",
@@ -303,53 +293,64 @@ export function createBrokerServer(config: BrokerConfig) {
             : { body, duplex: "half" }),
         });
         if (upstream.status >= 500 && attempt < caps.maxRetriesPerRequest) {
-          attempt += 1;
           lastError = `upstream ${upstream.status}`;
-          record({ event: "provider_retry", status: upstream.status, attempt });
-          continue;
-        }
-        for (const [name, value] of upstream.headers) {
-          if (name !== "content-encoding" && name !== "content-length") {
-            res.setHeader(name, value);
+          outcome = {
+            event: "provider_retry",
+            status: upstream.status,
+            attempt: attempt + 1,
+          };
+        } else {
+          for (const [name, value] of upstream.headers) {
+            if (name !== "content-encoding" && name !== "content-length") {
+              res.setHeader(name, value);
+            }
           }
-        }
-        res.writeHead(upstream.status);
-        // Pi streams, so the answer is forwarded chunk by chunk. Buffering the
-        // whole body here would turn a streamed review into one long silence
-        // and break the activity the run is watched through. The sealer hashes
-        // the answer as it passes and keeps only the tail the usage frame is in.
-        const decoder = new TextDecoder();
-        const sealer = responseSealer({
-          lineChars: CONTAINER_SSE_LINE_CHARS,
-        });
-        if (upstream.body) {
-          for await (const chunk of upstream.body) {
-            sealer.write(decoder.decode(chunk, { stream: true }));
-            res.write(Buffer.from(chunk));
+          res.writeHead(upstream.status);
+          // Pi streams, so the answer is forwarded chunk by chunk. Buffering
+          // the whole body here would turn a streamed review into one long
+          // silence and break the activity the run is watched through. The
+          // sealer hashes the answer as it passes, and the usage reader reads
+          // every frame as it passes rather than the tail the answer ends on.
+          const decoder = new TextDecoder();
+          const sealer = responseSealer({
+            lineChars: CONTAINER_SSE_LINE_CHARS,
+          });
+          const usage = usageReader({ lineChars: CONTAINER_SSE_LINE_CHARS });
+          if (upstream.body) {
+            for await (const chunk of upstream.body) {
+              const text = decoder.decode(chunk, { stream: true });
+              sealer.write(text);
+              usage.write(text);
+              res.write(Buffer.from(chunk));
+            }
+            const text = decoder.decode();
+            sealer.write(text);
+            usage.write(text);
           }
-          sealer.write(decoder.decode());
+          res.end();
+          outcome = {
+            event: "provider_request",
+            status: upstream.status,
+            attempt,
+            path: target.pathname,
+            usage: usage.read(),
+            seal: upstream.body ? sealer.seal() : null,
+          };
         }
-        res.end();
-        const usage = readUsage(sealer.tail());
-        if (usage) {
-          totals.input += usage.input;
-          totals.output += usage.output;
-        }
-        record({
-          event: "provider_request",
-          status: upstream.status,
-          attempt,
-          path: target.pathname,
-          usage,
-          seal: upstream.body ? sealer.seal() : null,
-          totals: { ...totals },
-        });
-        return;
       } catch (error) {
         lastError = error instanceof Error ? error.message : String(error);
-        record({ event: "provider_error", attempt, message: lastError });
-        attempt += 1;
+        outcome = { event: "provider_error", attempt, message: lastError };
       }
+      const reported =
+        outcome.event === "provider_request" ? outcome.usage : UNREPORTED;
+      if (reported.input === null) totals.inputUnobserved += 1;
+      else totals.input += reported.input;
+      if (reported.output === null) totals.outputUnobserved += 1;
+      else totals.output += reported.output;
+      totals.unended -= 1;
+      record({ ...outcome, attemptId, totals: { ...totals } });
+      if (outcome.event === "provider_request") return;
+      attempt += 1;
     }
     deny(res, 502, `upstream_unreachable: ${lastError}`);
   });

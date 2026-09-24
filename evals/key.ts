@@ -14,7 +14,7 @@
 
 import { existsSync } from "node:fs";
 import { readFile, writeFile } from "node:fs/promises";
-import { scoreT1b, type T1bScoredTrial } from "./score";
+import { scoreT1b, sumIsShort, type T1bScoredTrial } from "./score";
 
 export const LABELS = [
   "keyed-match",
@@ -60,7 +60,7 @@ export type SheetLane = {
   model: string | null;
   status: string;
   finishReason: string | null;
-  usage: { inputTokens: number; outputTokens: number } | null;
+  usage: { inputTokens: number | null; outputTokens: number | null } | null;
 };
 
 export type SheetReceipt = {
@@ -114,7 +114,7 @@ export type ScoringSheet = {
     lanes: readonly {
       role: string;
       status: string;
-      usage: { inputTokens: number; outputTokens: number } | null;
+      usage: { inputTokens: number | null; outputTokens: number | null } | null;
     }[];
   }[];
   rows: readonly {
@@ -164,20 +164,49 @@ const optionalNumber = (value: unknown) =>
 /**
  * The lane receipt's usage in either shape: the host's own `inputTokens` and
  * `outputTokens`, or the Pi receipt's `input`, `output`, `turns`, `cacheRead`,
- * `totalTokens` and `costUsd`. A shape neither reader understands is unknown
- * spend, not a broken run, so it reads as absent instead of failing the sheet.
+ * `totalTokens` and `costUsd`. A record that names a token sum or a count
+ * beside one is read even when every one of them is null, since that is what
+ * a lane that observed nothing records; a shape that names none of them is
+ * unknown spend, not a broken run, so it reads as absent instead of failing
+ * the sheet.
+ *
+ * A side the control side recorded as unobserved reads null, and so does a
+ * sum its own counts say is short (`sumIsShort`): either one read as a number
+ * would be quoted as the lane's whole spend.
  */
 const optionalUsage = (value: unknown) => {
   if (typeof value !== "object" || value === null || Array.isArray(value)) {
     return null;
   }
   const usage = value as Readonly<Record<string, unknown>>;
-  const input = usage["inputTokens"] ?? usage["input"];
-  const output = usage["outputTokens"] ?? usage["output"];
-  if (typeof input !== "number" || typeof output !== "number") return null;
-  if (!Number.isInteger(input) || !Number.isInteger(output)) return null;
-  return { inputTokens: input, outputTokens: output };
+  const input =
+    usage["inputTokens"] !== undefined ? usage["inputTokens"] : usage["input"];
+  const output =
+    usage["outputTokens"] !== undefined
+      ? usage["outputTokens"]
+      : usage["output"];
+  const named = [
+    input,
+    output,
+    usage["unended"],
+    usage["inputUnobserved"],
+    usage["outputUnobserved"],
+  ];
+  if (named.every((field) => field === undefined)) return null;
+  const observed = (tokens: unknown, side: "input" | "output") =>
+    typeof tokens === "number" &&
+    Number.isInteger(tokens) &&
+    !sumIsShort(usage, side)
+      ? tokens
+      : null;
+  return {
+    inputTokens: observed(input, "input"),
+    outputTokens: observed(output, "output"),
+  };
 };
+
+const sumObserved = (total: number | null, lane: number | null) =>
+  total === null || lane === null ? null : total + lane;
 
 const readLocations = (value: unknown, where: string): KeyLocation[] =>
   array(value, where).map((entry, index) => {
@@ -511,11 +540,25 @@ export function buildTrials(
         });
       }
     }
-    const usage = receipt.lanes.reduce(
-      (total, lane) => ({
-        inputTokens: total.inputTokens + (lane.usage?.inputTokens ?? 0),
-        outputTokens: total.outputTokens + (lane.usage?.outputTokens ?? 0),
-      }),
+    // A lane with no usage record adds nothing, as it always has; a side one
+    // lane left unobserved leaves that side of the trial unobserved.
+    const usage = receipt.lanes.reduce<{
+      inputTokens: number | null;
+      outputTokens: number | null;
+    }>(
+      (total, lane) =>
+        lane.usage
+          ? {
+              inputTokens: sumObserved(
+                total.inputTokens,
+                lane.usage.inputTokens,
+              ),
+              outputTokens: sumObserved(
+                total.outputTokens,
+                lane.usage.outputTokens,
+              ),
+            }
+          : total,
       { inputTokens: 0, outputTokens: 0 },
     );
     return {

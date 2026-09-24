@@ -183,7 +183,7 @@ const FINDINGS = [
 const lane = (
   laneId: string,
   role: string,
-  usage: Record<string, number> | null,
+  usage: Record<string, number | null> | null,
   install: Record<string, unknown> = {},
 ) => ({
   laneId,
@@ -477,6 +477,90 @@ describe("prepareCheckout", () => {
 });
 
 describe("runAacrCase", () => {
+  it("keeps a count a lane left unobserved out of the sums it publishes", async () => {
+    const out = await scratch();
+    const { runGit } = gitRecorder();
+    const { runSwarm } = writingSwarm(
+      receipt({
+        lanes: [
+          lane("reviewer-1", "reviewer", {
+            inputTokens: 100,
+            outputTokens: 10,
+            unended: 0,
+            inputUnobserved: null,
+            outputUnobserved: 0,
+          }),
+          lane("verifier", "verifier", {
+            inputTokens: 300,
+            outputTokens: 30,
+            unended: 0,
+            inputUnobserved: 0,
+            outputUnobserved: 0,
+          }),
+        ],
+      }),
+    );
+
+    const sidecar = await runAacrCase(
+      ENTRY,
+      { out, runId: "run-1", maxCostUsd: 25, targeted: false },
+      { runGit, runSwarm },
+    );
+
+    // A receipt that recorded a count as unobserved is read, not refused, and
+    // the sum of that count stays unobserved instead of reading as zero.
+    expect(sidecar.usage).toEqual({
+      inputTokens: 400,
+      outputTokens: 40,
+      unended: 0,
+      inputUnobserved: null,
+      outputUnobserved: 0,
+    });
+    const candidates = JSON.parse(
+      await readFile(casePaths(out, ENTRY.instanceId).candidates, "utf8"),
+    );
+    // Nobody counted what the input sum is short by, so only the output is
+    // published.
+    expect(candidates.review.summary).toEqual({ output_tokens: 40 });
+  });
+
+  it("publishes neither token sum when a lane's request never ended", async () => {
+    const out = await scratch();
+    const { runGit } = gitRecorder();
+    const { runSwarm } = writingSwarm(
+      receipt({
+        lanes: [
+          lane("reviewer-1", "reviewer", {
+            inputTokens: 14823,
+            outputTokens: 495,
+            unended: 1,
+            inputUnobserved: 0,
+            outputUnobserved: 0,
+          }),
+          lane("verifier", "verifier", {
+            inputTokens: 300,
+            outputTokens: 30,
+            unended: 0,
+            inputUnobserved: 0,
+            outputUnobserved: 0,
+          }),
+        ],
+      }),
+    );
+
+    await runAacrCase(
+      ENTRY,
+      { out, runId: "run-1", maxCostUsd: 25, targeted: false },
+      { runGit, runSwarm },
+    );
+
+    const paths = casePaths(out, ENTRY.instanceId);
+    for (const path of [paths.candidates, paths.confirmed]) {
+      const result = JSON.parse(await readFile(path, "utf8"));
+      expect(result.review.summary).toEqual({});
+    }
+  });
+
   it("writes both result shapes and the sidecar from one receipt", async () => {
     const out = await scratch();
     const { runGit } = gitRecorder();

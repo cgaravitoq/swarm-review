@@ -1,13 +1,17 @@
 import { createHash } from "node:crypto";
-import { mkdtemp, readFile, rm } from "node:fs/promises";
-import { createServer, type IncomingMessage, type Server } from "node:http";
+import { mkdir, mkdtemp, readFile, rm } from "node:fs/promises";
+import {
+  createServer,
+  type IncomingMessage,
+  type Server,
+  type ServerResponse,
+} from "node:http";
 import { connect } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
   createBrokerServer,
-  readUsage,
   reserveAttempt,
   resolveUpstreamTarget,
 } from "../../container/model-broker";
@@ -35,6 +39,25 @@ const listen = (server: Server) =>
 
 const close = (server: Server) =>
   new Promise<void>((resolve) => server.close(() => resolve()));
+
+/** What each request the broker takes ends in: null, or what its handler threw. */
+const handlerEnds = (server: Server) => {
+  const handle = server.listeners("request")[0] as (
+    request: IncomingMessage,
+    response: ServerResponse,
+  ) => Promise<void>;
+  const ends: Promise<unknown>[] = [];
+  server.removeAllListeners("request");
+  server.on("request", (request, response) => {
+    ends.push(
+      handle(request, response).then(
+        () => null,
+        (error: unknown) => error,
+      ),
+    );
+  });
+  return ends;
+};
 
 describe("model broker", () => {
   let upstream: Server;
@@ -190,7 +213,158 @@ describe("model broker", () => {
       retries: 0,
       input: 1200,
       output: 300,
+      unended: 0,
+      inputUnobserved: 0,
+      outputUnobserved: 0,
     });
+  });
+
+  it("records a request it admitted and never saw end", async () => {
+    // A provider that accepts the attempt and never answers: this is the shape
+    // the Codex provider's WebSocket transport takes through this hop. The
+    // handshake reaches a broker that speaks HTTP only, the slot is spent, and
+    // the upstream never completes an upgrade the broker cannot make. The
+    // ledger has to name the request even though no response ever closes it.
+    const silent = createServer(() => {});
+    const silentPort = await listen(silent);
+    const unendedScratch = await mkdtemp(join(tmpdir(), "broker-unended-"));
+    const unendedLedger = join(unendedScratch, "provider-usage.jsonl");
+    const { server } = createBrokerServer({
+      port: 0,
+      handle: "h",
+      upstreamBaseUrl: `http://127.0.0.1:${silentPort}/v1`,
+      upstreamAuthorization: `Bearer ${CANARY}`,
+      caps: {
+        maxRequests: 5,
+        maxRetriesPerRequest: 1,
+        maxCumulativeInputTokens: 1000,
+        maxCumulativeOutputTokens: 1000,
+        maxRequestBytes: 4096,
+      },
+      ledgerPath: unendedLedger,
+    });
+    const ends = handlerEnds(server);
+    const port = await listen(server);
+    const controller = new AbortController();
+
+    const pending = fetch(`http://127.0.0.1:${port}/codex/responses`, {
+      method: "POST",
+      headers: {
+        authorization: "Bearer h",
+        "content-type": "application/json",
+      },
+      body: "{}",
+      signal: controller.signal,
+    }).catch(() => undefined);
+
+    const ledgerEntries = async () =>
+      (await readFile(unendedLedger, "utf8"))
+        .split("\n")
+        .filter(Boolean)
+        .map((line) => JSON.parse(line) as Record<string, unknown>);
+    // The admission is written before the attempt is sent, so the request is
+    // named while the response it waits for is still open.
+    await vi.waitFor(async () => {
+      expect(
+        (await ledgerEntries()).some(
+          (entry) => entry["event"] === "provider_admitted",
+        ),
+      ).toBe(true);
+    });
+
+    const entries = await ledgerEntries();
+    const admitted = entries.filter(
+      (entry) => entry["event"] === "provider_admitted",
+    );
+    expect(admitted).toHaveLength(1);
+    // Nothing about this attempt ever ended, so nothing may read as an outcome.
+    expect(entries.some((entry) => entry["event"] === "provider_request")).toBe(
+      false,
+    );
+    expect(admitted[0]?.["totals"]).toMatchObject({
+      requests: 1,
+      retries: 0,
+      unended: 1,
+    });
+
+    controller.abort();
+    await pending;
+    silent.closeAllConnections();
+    await close(silent);
+    // The lane leaving does not end the attempt: the broker holds it until the
+    // provider goes away and records its end then, so the ledger goes after.
+    expect(await Promise.all(ends)).toEqual([null]);
+    await close(server);
+    await rm(unendedScratch, { recursive: true, force: true });
+  });
+
+  it("pairs every admission with its own end across the lane's requests", async () => {
+    // Two requests in one lane, sent together. An id that restarts with each
+    // request names both admissions and both ends alike, and no reader can
+    // say which end closed which admission.
+    await Promise.all(
+      [call(), call()].map((pending) =>
+        pending.then((response) => response.text()),
+      ),
+    );
+
+    const entries = (await readFile(ledgerPath, "utf8"))
+      .split("\n")
+      .filter(Boolean)
+      .map((line) => JSON.parse(line) as Record<string, unknown>);
+    const ids = (event: string) =>
+      entries
+        .filter((entry) => entry["event"] === event)
+        .map((entry) => entry["attemptId"])
+        .sort();
+    expect(ids("provider_admitted")).toEqual([1, 2]);
+    expect(ids("provider_request")).toEqual([1, 2]);
+  });
+
+  it("ends an attempt once when the line recording its end cannot be written", async () => {
+    const endScratch = await mkdtemp(join(tmpdir(), "broker-ledger-"));
+    const ledger = join(endScratch, "provider-usage.jsonl");
+    let sent = 0;
+    // The ledger turns into a directory while the attempt is in flight, so the
+    // append that records this attempt's end throws after the answer is out.
+    const provider = createServer(async (_request, response) => {
+      sent += 1;
+      await rm(ledger);
+      await mkdir(ledger);
+      response
+        .writeHead(200, { "content-type": "application/json" })
+        .end(upstreamBody);
+    });
+    const providerPort = await listen(provider);
+    const { server, totals } = createBrokerServer({
+      port: 0,
+      handle: "h",
+      upstreamBaseUrl: `http://127.0.0.1:${providerPort}/v1`,
+      upstreamAuthorization: `Bearer ${CANARY}`,
+      caps,
+      ledgerPath: ledger,
+    });
+    const ends = handlerEnds(server);
+    const port = await listen(server);
+
+    const response = await fetch(`http://127.0.0.1:${port}/messages`, {
+      method: "POST",
+      headers: { authorization: "Bearer h" },
+      body: "{}",
+    });
+    const text = await response.text();
+    const failures = await Promise.all(ends);
+    await close(server);
+    await close(provider);
+    await rm(endScratch, { recursive: true, force: true });
+
+    expect(response.status).toBe(200);
+    expect(text).toBe(upstreamBody);
+    expect(failures).toEqual([expect.objectContaining({ code: "EISDIR" })]);
+    // The append is all that failed: the attempt ended once, and the answer
+    // the lane already holds is never asked for a second time.
+    expect(totals).toMatchObject({ requests: 1, unended: 0 });
+    expect(sent).toBe(1);
   });
 
   const requestEntry = async () =>
@@ -202,6 +376,49 @@ describe("model broker", () => {
 
   const sha256 = (text: string) =>
     createHash("sha256").update(text, "utf8").digest("hex");
+
+  it("reads the input a long answer reported on the frame it opened with", async () => {
+    // Anthropic reports the input when the message starts and the output when
+    // it ends, so by the end of an answer longer than any tail the frame that
+    // carried the input is long gone.
+    upstreamBody = [
+      'event: message_start\ndata: {"type":"message_start","message":{"usage":{"input_tokens":1200,"cache_read_input_tokens":800,"output_tokens":1}}}',
+      `event: content_block_delta\ndata: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"${"x".repeat(RESPONSE_TAIL_CHARS + 1024)}"}}`,
+      'event: message_delta\ndata: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":42}}',
+    ].join("\n\n");
+
+    await call().then((response) => response.text());
+
+    const entry = await requestEntry();
+    expect(entry?.["usage"]).toEqual({ input: 2000, output: 42 });
+    expect(entry?.["totals"]).toMatchObject({
+      input: 2000,
+      output: 42,
+      inputUnobserved: 0,
+      outputUnobserved: 0,
+    });
+  });
+
+  it("counts a side no frame of the response reported as unobserved, never as zero", async () => {
+    upstreamBody =
+      'data: {"type":"message_delta","usage":{"output_tokens":7}}\n\n';
+
+    await call().then((response) => response.text());
+
+    const entry = await requestEntry();
+    expect(entry?.["usage"]).toEqual({ input: null, output: 7 });
+    // The input total adds nothing for this request, and the count beside it
+    // is what says the total is one request short.
+    expect(entry?.["totals"]).toEqual({
+      requests: 1,
+      retries: 0,
+      input: 0,
+      output: 7,
+      unended: 0,
+      inputUnobserved: 1,
+      outputUnobserved: 0,
+    });
+  });
 
   it("seals the answer text that crossed the broker, which report.json cannot rewrite", async () => {
     await call();
@@ -271,7 +488,8 @@ describe("model broker", () => {
   });
 
   it("seals a line past the Worker hop's bound, because this hop holds the lane's own memory", async () => {
-    const head = 'data: {"choices":[{"delta":{"content":"';
+    const head =
+      'data: {"usage":{"prompt_tokens":3,"completion_tokens":1},"choices":[{"delta":{"content":"';
     const tail = '"}}]}';
     const line = WORKER_SSE_LINE_CHARS + 1;
     const answer = "x".repeat(line - head.length - tail.length);
@@ -279,7 +497,10 @@ describe("model broker", () => {
 
     await call().then((response) => response.text());
 
-    expect((await requestEntry())?.["seal"]).toBe(sha256(answer));
+    const entry = await requestEntry();
+    expect(entry?.["seal"]).toBe(sha256(answer));
+    // The usage on that line is read under the same bound the seal is.
+    expect(entry?.["usage"]).toEqual({ input: 3, output: 1 });
   });
 
   it("stops calling the provider once a cumulative token cap is reached", async () => {
@@ -311,7 +532,56 @@ describe("model broker", () => {
       .map((line) => JSON.parse(line))
       .filter((line) => line.totals)
       .at(-1).totals;
-    expect(totals).toMatchObject({ requests: 2, retries: 1 });
+    // The retried attempt ended at its 503, so the only attempts the totals
+    // may call open are ones that never came back. Neither 503 reported any
+    // usage, so both are counted as unobserved rather than as free.
+    expect(totals).toMatchObject({
+      requests: 2,
+      retries: 1,
+      unended: 0,
+      inputUnobserved: 2,
+      outputUnobserved: 2,
+    });
+  });
+
+  it("ends every attempt a provider it cannot reach turned away", async () => {
+    const unreachable = createServer();
+    const unreachablePort = await listen(unreachable);
+    await close(unreachable);
+    await close(broker);
+    ({ server: broker } = createBrokerServer({
+      port: 0,
+      handle: "review-pi-handle",
+      upstreamBaseUrl: `http://127.0.0.1:${unreachablePort}/v1`,
+      upstreamAuthorization: `Bearer ${CANARY}`,
+      caps,
+      ledgerPath,
+    }));
+    brokerPort = await listen(broker);
+
+    const response = await call();
+
+    expect(response.status).toBe(502);
+    const entries = (await readFile(ledgerPath, "utf8"))
+      .split("\n")
+      .filter(Boolean)
+      .map((line) => JSON.parse(line));
+    // Both refusals are the ends of their admissions, so neither attempt may
+    // read as still in flight.
+    expect(
+      entries
+        .filter((entry) => entry.event === "provider_error")
+        .map((entry) => entry.attemptId),
+    ).toEqual([1, 2]);
+    expect(entries.filter((entry) => entry.totals).at(-1).totals).toMatchObject(
+      {
+        requests: 2,
+        retries: 1,
+        unended: 0,
+        inputUnobserved: 2,
+        outputUnobserved: 2,
+      },
+    );
   });
 
   it("refuses a request body past the cap before it reaches the provider", async () => {
@@ -319,35 +589,6 @@ describe("model broker", () => {
 
     expect(response.status).toBe(413);
     expect(received).toHaveLength(0);
-  });
-
-  it("reads usage from the last event of a streamed response", () => {
-    const stream = [
-      'data: {"usage":{"input_tokens":10,"output_tokens":1}}',
-      'data: {"usage":{"input_tokens":10,"output_tokens":42}}',
-      "data: [DONE]",
-    ].join("\n");
-
-    expect(readUsage(stream)).toEqual({ input: 10, output: 42 });
-    expect(readUsage("not json at all")).toBeNull();
-  });
-
-  it("counts the cached halves of an Anthropic prompt as input, not as nothing", () => {
-    // Anthropic opens with the input and closes with the output, and reports the
-    // cached halves of the prompt beside `input_tokens` rather than inside it.
-    // Replacing one reading with the other, or counting only `input_tokens`,
-    // would let a cached review run against the token caps for free.
-    const claudeCode = [
-      'event: message_start\ndata: {"type":"message_start","message":{"usage":{"input_tokens":2,"cache_read_input_tokens":100,"cache_creation_input_tokens":3894,"output_tokens":1}}}',
-      'event: message_delta\ndata: {"type":"message_delta","usage":{"output_tokens":7}}',
-    ].join("\n");
-
-    expect(readUsage(claudeCode)).toEqual({ input: 3996, output: 7 });
-    // OpenAI-style usage already folds cache reads into `prompt_tokens`, so the
-    // same body must not be counted twice.
-    expect(
-      readUsage('data: {"usage":{"prompt_tokens":30,"completion_tokens":4}}'),
-    ).toEqual({ input: 30, output: 4 });
   });
 });
 
@@ -498,6 +739,7 @@ describe("a target that tries to choose the provider", () => {
       },
       ledgerPath: ledger,
     });
+    const ends = handlerEnds(server);
     const port = await listen(server);
 
     const started = Date.now();
@@ -511,6 +753,9 @@ describe("a target that tries to choose the provider", () => {
     const firstAt = Date.now() - started;
     await reader.cancel();
 
+    // The caller left after the first frame, but the broker reads the answer
+    // to its end and records it then, so the ledger is read and removed after.
+    expect(await Promise.all(ends)).toEqual([null]);
     await close(server);
     await close(provider);
     const ledgerText = await readFile(ledger, "utf8");
@@ -566,12 +811,28 @@ describe("attempt reservation", () => {
   };
 
   it("spends the slot in the same tick it tests it", () => {
-    const totals = { requests: 0, retries: 0, input: 0, output: 0 };
+    const totals = {
+      requests: 0,
+      retries: 0,
+      input: 0,
+      output: 0,
+      unended: 0,
+      inputUnobserved: 0,
+      outputUnobserved: 0,
+    };
 
     expect(reserveAttempt(totals, caps, false)).toBeNull();
     expect(totals.requests).toBe(1);
     expect(reserveAttempt(totals, caps, true)).toBeNull();
-    expect(totals).toEqual({ requests: 2, retries: 1, input: 0, output: 0 });
+    expect(totals).toEqual({
+      requests: 2,
+      retries: 1,
+      input: 0,
+      output: 0,
+      unended: 2,
+      inputUnobserved: 0,
+      outputUnobserved: 0,
+    });
     // The third attempt is refused instead of being counted after the fact.
     expect(reserveAttempt(totals, caps, false)).toBe("max_requests");
     expect(totals.requests).toBe(2);
@@ -580,14 +841,30 @@ describe("attempt reservation", () => {
   it("refuses once the cumulative token totals are already spent", () => {
     expect(
       reserveAttempt(
-        { requests: 0, retries: 0, input: 100, output: 0 },
+        {
+          requests: 0,
+          retries: 0,
+          input: 100,
+          output: 0,
+          unended: 0,
+          inputUnobserved: 0,
+          outputUnobserved: 0,
+        },
         caps,
         false,
       ),
     ).toBe("max_input_tokens");
     expect(
       reserveAttempt(
-        { requests: 0, retries: 0, input: 0, output: 100 },
+        {
+          requests: 0,
+          retries: 0,
+          input: 0,
+          output: 100,
+          unended: 0,
+          inputUnobserved: 0,
+          outputUnobserved: 0,
+        },
         caps,
         false,
       ),

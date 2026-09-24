@@ -1,6 +1,9 @@
 import { createHash } from "node:crypto";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { RESPONSE_TAIL_CHARS } from "../../container/response-seal";
+import {
+  RESPONSE_TAIL_CHARS,
+  WORKER_SSE_LINE_CHARS,
+} from "../../container/response-seal";
 import {
   emptyModelTotals,
   type ModelCaps,
@@ -10,7 +13,6 @@ import {
   modelsJsonForProxy,
   proxyModelFetch,
   publicModelUsage,
-  readUsage,
   reserveAttempt,
 } from "../model-proxy";
 
@@ -43,7 +45,11 @@ const sessionConsumer =
 
 const sessionOpener =
   (caps = capsFor()) =>
-  async () => ({ handle: "review-pi-handle", caps });
+  async () => ({
+    handle: "review-pi-handle",
+    caps,
+    upstreamBaseUrl: "https://api.x.ai/v1",
+  });
 
 const proxyTarget = async (runId: string, secret = "control-secret") => {
   const capability = await modelCapability(runId, secret);
@@ -53,24 +59,6 @@ const proxyTarget = async (runId: string, secret = "control-secret") => {
 };
 
 describe("model proxy", () => {
-  it("counts the cached halves of an Anthropic prompt as input, not as nothing", () => {
-    // Anthropic opens with the input and closes with the output, and reports the
-    // cached halves of the prompt beside `input_tokens` rather than inside it.
-    // Replacing one reading with the other, or counting only `input_tokens`,
-    // would let a cached review run against the token caps for free.
-    const claudeCode = [
-      'event: message_start\ndata: {"type":"message_start","message":{"usage":{"input_tokens":2,"cache_read_input_tokens":100,"cache_creation_input_tokens":3894,"output_tokens":1}}}',
-      'event: message_delta\ndata: {"type":"message_delta","usage":{"output_tokens":7}}',
-    ].join("\n");
-
-    expect(readUsage(claudeCode)).toEqual({ input: 3996, output: 7 });
-    // OpenAI-style usage already folds cache reads into `prompt_tokens`, so the
-    // same body must not be counted twice.
-    expect(
-      readUsage('data: {"usage":{"prompt_tokens":30,"completion_tokens":4}}'),
-    ).toEqual({ input: 30, output: 4 });
-  });
-
   it("rejects a capability that does not match the run", async () => {
     const upstream = vi.fn<typeof fetch>(() =>
       Promise.resolve(new Response("unexpected")),
@@ -246,7 +234,7 @@ describe("model proxy", () => {
         maxCumulativeOutputTokens: 1000,
         maxRequestBytes: 1024,
       },
-      totals: { requests: 1, retries: 0, input: 4, output: 2 },
+      totals: { requests: 1, retries: 0, input: 4, output: 2, unended: 0 },
     });
     expect(JSON.stringify(usage)).not.toContain("real-secret");
     expect(usage).toMatchObject({
@@ -387,22 +375,7 @@ describe("model proxy", () => {
     },
   );
 
-  it("leaves the input of a usage frame the body never carried unobserved", () => {
-    // Anthropic reports the input on the frame it opens with and the output on
-    // the one it closes with. A reading that answers zero for the half it never
-    // saw prices an unobserved request as a request that spent nothing.
-    expect(readUsage('data: {"usage":{"output_tokens":7}}')).toEqual({
-      input: null,
-      output: 7,
-    });
-    expect(readUsage('data: {"usage":{"input_tokens":11}}')).toEqual({
-      input: 11,
-      output: null,
-    });
-    expect(readUsage("data: [DONE]")).toBeNull();
-  });
-
-  it("records the input as unobserved once the tail no longer carries it", async () => {
+  it("reads the input a long answer reported on the frame it opened with", async () => {
     const body = [
       'event: message_start\ndata: {"type":"message_start","message":{"usage":{"input_tokens":1200,"output_tokens":1}}}',
       `event: content_block_delta\ndata: {"type":"content_block_delta","delta":{"type":"text_delta","text":"${"x".repeat(70_000)}"}}`,
@@ -445,7 +418,7 @@ describe("model proxy", () => {
     );
 
     expect(await response.text()).toHaveLength(bytes.byteLength);
-    expect(recorded).toEqual([{ input: null, output: 42 }]);
+    expect(recorded).toEqual([{ input: 1200, output: 42 }]);
   });
 
   it("seals the answer text it streamed", async () => {
@@ -538,6 +511,65 @@ describe("model proxy", () => {
     expect(seals).toEqual([
       createHash("sha256").update(long, "utf8").digest("hex"),
       null,
+    ]);
+  });
+
+  it("holds a line to the Worker hop's own bound, never the container's", async () => {
+    // This proxy is the only hop a cloud lane's model bytes cross, and the
+    // bound it can hold is the isolate's. The container's larger bound belongs
+    // to the broker, which runs beside the lane's own memory; taking it here
+    // would hold a line this isolate cannot read and seal over a guess.
+    const head =
+      'data: {"usage":{"prompt_tokens":3,"completion_tokens":1},"choices":[{"delta":{"content":"';
+    const tail = '"}}]}';
+    const lineOf = (chars: number) => {
+      const answer = "x".repeat(chars - head.length - tail.length);
+      return { answer, frame: `${head}${answer}${tail}\n\n` };
+    };
+    const atBound = lineOf(WORKER_SSE_LINE_CHARS);
+    const pastBound = lineOf(WORKER_SSE_LINE_CHARS + 1);
+    const bodies = [atBound.frame, pastBound.frame];
+    vi.stubGlobal(
+      "fetch",
+      vi.fn<typeof fetch>(() =>
+        Promise.resolve(new Response(bodies.shift() ?? "", { status: 200 })),
+      ),
+    );
+    const url = await proxyTarget("run-worker-bound");
+    const seals: (string | null)[] = [];
+    const usages: (ModelUsage | null)[] = [];
+
+    for (let call = 0; call < 2; call += 1) {
+      const response = await proxyModelFetch(
+        new Request(url, {
+          method: "POST",
+          headers: { authorization: "Bearer review-pi-handle" },
+          body: "{}",
+        }),
+        url,
+        "control-secret",
+        sessionOpener(),
+        sessionConsumer(),
+        async (_runId, usage, _retryable, seal) => {
+          seals.push(seal);
+          usages.push(usage);
+        },
+      );
+      await response.text();
+    }
+
+    // The line at the bound is read and sealed; the one past it is a line this
+    // hop cannot hold, so the response answers null rather than a digest of a
+    // guess, and its usage as unobserved rather than a count read off a line
+    // the hop never held. A proxy that took the container's bound would read
+    // both.
+    expect(seals).toEqual([
+      createHash("sha256").update(atBound.answer, "utf8").digest("hex"),
+      null,
+    ]);
+    expect(usages).toEqual([
+      { input: 3, output: 1 },
+      { input: null, output: null },
     ]);
   });
 
