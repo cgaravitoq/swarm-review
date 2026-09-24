@@ -139,15 +139,6 @@ export async function main(env: Env = process.env): Promise<void> {
     } catch (error) {
       console.error(`run comment not posted: ${reason(error)}`);
     }
-    try {
-      await mkdir(swarmDir, { recursive: true });
-      await writeFile(
-        join(swarmDir, "run.json"),
-        JSON.stringify({ fork: packedFork, packedRunner }),
-      );
-    } catch (error) {
-      console.error(`run notes not written: ${reason(error)}`);
-    }
     stage = "account lookup";
     runEnv = { ...env, CLOUDFLARE_ACCOUNT_ID: await accountId(env) };
     const args = [
@@ -241,7 +232,22 @@ export async function main(env: Env = process.env): Promise<void> {
     args.push("--swarm-id", swarmId, "--out", out);
     console.log(`review mode: ${selected}${fork ? " (fork)" : ""}`);
     stage = "review";
-    await run("bun", args, runEnv);
+    try {
+      await run("bun", args, runEnv);
+    } finally {
+      // The swarm creates its own directory and refuses one that exists, so
+      // the notes land only once it has run.
+      await mkdir(swarmDir, { recursive: true })
+        .then(() =>
+          writeFile(
+            join(swarmDir, "run.json"),
+            JSON.stringify({ fork: packedFork, packedRunner }),
+          ),
+        )
+        .catch((error: unknown) =>
+          console.error(`run notes not written: ${reason(error)}`),
+        );
+    }
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
     console.error(message);
