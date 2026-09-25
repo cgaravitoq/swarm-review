@@ -109,6 +109,37 @@ describe("credential vault", () => {
     });
   });
 
+  it("keeps a pair seeded while a refresh is pending instead of the rotation", async () => {
+    const old = jwt(Math.floor(Date.now() / 1000) + 60, "old");
+    const seeded = jwt(Math.floor(Date.now() / 1000) + 3600, "seeded");
+    const rotated = jwt(Math.floor(Date.now() / 1000) + 3600, "rotated");
+    const { vault, values } = setup();
+    await vault.seed("openai-codex", auth(old));
+    let release: (response: Response) => void = () => {};
+    const held = new Promise<Response>((resolve) => {
+      release = resolve;
+    });
+    const upstream = vi.fn<typeof fetch>(async () => held);
+    vi.stubGlobal("fetch", upstream);
+    const attempt = vault.credential("openai-codex");
+    await vi.waitFor(() => expect(upstream).toHaveBeenCalledOnce());
+    await vault.seed("openai-codex", auth(seeded, "fake-refresh-seeded"));
+    release(
+      Response.json({
+        access_token: rotated,
+        refresh_token: "fake-refresh-rotated",
+      }),
+    );
+    expect(await attempt).toEqual({
+      authorization: `Bearer ${seeded}`,
+      accountId: "fake-account",
+    });
+    expect(values.get("openai-codex")).toMatchObject({
+      accessToken: seeded,
+      refreshToken: "fake-refresh-seeded",
+    });
+  });
+
   it("stores a Claude setup token and reveals only status", async () => {
     const { vault } = setup();
     await vault.seed("claude-code", { token: "fake-claude-token" });

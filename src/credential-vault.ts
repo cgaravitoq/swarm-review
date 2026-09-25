@@ -180,6 +180,14 @@ export class CredentialVault {
     } catch {
       throw new Error("credential_refresh_invalid");
     }
+    const latest = await this.storage.get<CodexCredential>(CODEX_KEY);
+    if (
+      latest &&
+      (latest.accessToken !== current.accessToken ||
+        latest.refreshToken !== current.refreshToken)
+    ) {
+      return latest;
+    }
     await this.storage.put(CODEX_KEY, rotated);
     return rotated;
   }
