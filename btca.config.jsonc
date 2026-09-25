@@ -1,5 +1,6 @@
 {
   "$schema": "https://btca.dev/btca.schema.json",
+  "dataDirectory": ".btca",
   "resources": [
     {
       "type": "git",
@@ -79,5 +80,6 @@
       "specialNotes": "GitHub App for PR auto-review. License caution: GitHub reports no license, so read it for architecture only, do not copy. Useful mechanics: src/auth/github-app.ts caches the installation Octokit for 55 minutes, src/jobs/queue.ts gives each installation its own PQueue(concurrency: 1), per-repo config comes from .kodiai.yml, and publishing goes through pulls.createReview."
     }
   ],
-  "dataDirectory": ".btca"
+  "provider": "openai",
+  "model": "gpt-6-luna"
 }
