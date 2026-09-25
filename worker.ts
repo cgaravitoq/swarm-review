@@ -17,10 +17,13 @@ import { CredentialVault } from "./src/credential-vault";
 import { gitCapability, proxyGitFetch } from "./src/git-proxy";
 import {
   allowedRepositories,
+  checkRunEvent,
   completeCheck,
   createCheck,
   GitHubRequestError,
   installationToken,
+  offerCheck,
+  openPull,
   type PullRequestEvent,
   pullRequestEvent,
   verifyWebhook,
@@ -158,9 +161,23 @@ export class PullRequestReview extends DurableObject<ReviewPiEnv> {
     return true;
   }
 
+  async offer(event: PullRequestEvent, delivery: string) {
+    if (await this.ctx.storage.get(`delivery:${delivery}`)) return false;
+    await this.ctx.storage.put(`delivery:${delivery}`, true);
+    const offers =
+      (await this.ctx.storage.get<PullRequestEvent[]>("offers")) ?? [];
+    await this.ctx.storage.put("offers", [...offers, event]);
+    await this.ctx.storage.setAlarm(Date.now());
+    return true;
+  }
+
   override async alarm() {
     let retry = false;
-    for (const step of [() => this.retireSuperseded(), () => this.advance()]) {
+    for (const step of [
+      () => this.retireSuperseded(),
+      () => this.offerReviews(),
+      () => this.advance(),
+    ]) {
       try {
         retry = (await step()) || retry;
       } catch {
@@ -213,6 +230,25 @@ export class PullRequestReview extends DurableObject<ReviewPiEnv> {
       (await this.ctx.storage.get<AppReview[]>("superseded")) ?? []
     ).filter((previous) => !retired.has(previous.generation));
     await this.ctx.storage.put("superseded", left);
+    return left.length > 0;
+  }
+
+  private async offerReviews() {
+    const offers =
+      (await this.ctx.storage.get<PullRequestEvent[]>("offers")) ?? [];
+    const offered = new Set<string>();
+    for (const offer of offers) {
+      try {
+        await offerCheck(await this.token(offer), offer);
+        offered.add(offer.head);
+      } catch (error) {
+        if (refusedForGood(error)) offered.add(offer.head);
+      }
+    }
+    const left = (
+      (await this.ctx.storage.get<PullRequestEvent[]>("offers")) ?? []
+    ).filter((offer) => !offered.has(offer.head));
+    await this.ctx.storage.put("offers", left);
     return left.length > 0;
   }
 
@@ -1583,7 +1619,8 @@ export default {
         return json({ error: "unauthorized" }, 401);
       if (!env.GITHUB_APP_ID || !env.GITHUB_APP_PRIVATE_KEY)
         return json({ error: "github_app_unconfigured" }, 503);
-      if (request.headers.get("x-github-event") !== "pull_request")
+      const kind = request.headers.get("x-github-event");
+      if (kind !== "pull_request" && kind !== "check_run")
         return json({ ignored: true });
       const delivery = request.headers.get("x-github-delivery");
       if (!delivery || !/^[a-fA-F0-9-]{36}$/.test(delivery))
@@ -1594,11 +1631,45 @@ export default {
       } catch {
         return json({ error: "invalid_webhook" }, 400);
       }
-      const event = pullRequestEvent(payload);
-      if (!event) return json({ ignored: true });
       const allowed = allowedRepositories(env.TARGET_REPOSITORIES);
-      if (!allowed.has(event.repository.toLowerCase()))
+      if (kind === "pull_request") {
+        const parsed = pullRequestEvent(payload);
+        if (!parsed) return json({ ignored: true });
+        if (!allowed.has(parsed.event.repository.toLowerCase()))
+          return json({ error: "repository_mismatch" }, 403);
+        const review = env.PULL_REQUEST_REVIEWS.getByName(
+          `${parsed.event.repository.toLowerCase()}#${parsed.event.number}`,
+        );
+        const accepted =
+          parsed.action === "review"
+            ? await review.accept(parsed.event, delivery, url0.origin)
+            : await review.offer(parsed.event, delivery);
+        return json({ accepted }, 202);
+      }
+      const rerun = checkRunEvent(payload);
+      if (!rerun) return json({ ignored: true });
+      if (!allowed.has(rerun.repository.toLowerCase()))
         return json({ error: "repository_mismatch" }, 403);
+      let event: PullRequestEvent | null;
+      try {
+        event = await openPull(
+          await installationToken(
+            env.GITHUB_APP_ID,
+            env.GITHUB_APP_PRIVATE_KEY,
+            rerun.installationId,
+            rerun.repository,
+          ),
+          rerun.repository,
+          rerun.number,
+          rerun.installationId,
+        );
+      } catch (error) {
+        return json(
+          { error: "github_unavailable", detail: messageOf(error) },
+          502,
+        );
+      }
+      if (event?.head !== rerun.head) return json({ ignored: true });
       const accepted = await env.PULL_REQUEST_REVIEWS.getByName(
         `${event.repository.toLowerCase()}#${event.number}`,
       ).accept(event, delivery, url0.origin);

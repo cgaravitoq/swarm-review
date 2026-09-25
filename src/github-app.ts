@@ -68,19 +68,15 @@ export async function verifyWebhook(
   return mismatch === 0;
 }
 
-export function pullRequestEvent(value: unknown): PullRequestEvent | null {
-  if (typeof value !== "object" || value === null || Array.isArray(value))
-    return null;
-  const body = value as Record<string, unknown>;
-  if (
-    !["opened", "reopened", "ready_for_review"].includes(String(body["action"]))
-  )
-    return null;
-  const repository = body["repository"] as Record<string, unknown> | undefined;
-  const pull = body["pull_request"] as Record<string, unknown> | undefined;
-  const installation = body["installation"] as
-    | Record<string, unknown>
-    | undefined;
+export const REVIEW_ACTION = "review";
+
+function reviewablePull(
+  repository: unknown,
+  number: unknown,
+  value: unknown,
+  installationId: unknown,
+): PullRequestEvent | null {
+  const pull = value as Record<string, unknown> | undefined;
   const head = pull?.["head"] as Record<string, unknown> | undefined;
   const base = pull?.["base"] as Record<string, unknown> | undefined;
   if (
@@ -91,25 +87,118 @@ export function pullRequestEvent(value: unknown): PullRequestEvent | null {
   )
     return null;
   if (
-    typeof repository?.["full_name"] !== "string" ||
-    !/^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/.test(repository["full_name"]) ||
-    !Number.isSafeInteger(body["number"]) ||
-    Number(body["number"]) <= 0 ||
+    typeof repository !== "string" ||
+    !/^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/.test(repository) ||
+    !Number.isSafeInteger(number) ||
+    Number(number) <= 0 ||
     typeof head?.["sha"] !== "string" ||
     !/^[a-f0-9]{40}$/.test(head["sha"]) ||
     typeof base?.["sha"] !== "string" ||
     !/^[a-f0-9]{40}$/.test(base["sha"]) ||
-    !Number.isSafeInteger(installation?.["id"]) ||
-    Number(installation?.["id"]) <= 0
+    !Number.isSafeInteger(installationId) ||
+    Number(installationId) <= 0
   )
     return null;
   return {
-    repository: repository["full_name"],
-    number: Number(body["number"]),
+    repository,
+    number: Number(number),
     head: head["sha"],
     base: base["sha"],
-    installationId: Number(installation?.["id"]),
+    installationId: Number(installationId),
   };
+}
+
+export function pullRequestEvent(
+  value: unknown,
+): { action: "review" | "offer"; event: PullRequestEvent } | null {
+  if (typeof value !== "object" || value === null || Array.isArray(value))
+    return null;
+  const body = value as Record<string, unknown>;
+  const action = ["opened", "reopened", "ready_for_review"].includes(
+    String(body["action"]),
+  )
+    ? "review"
+    : body["action"] === "synchronize"
+      ? "offer"
+      : null;
+  if (!action) return null;
+  const event = reviewablePull(
+    (body["repository"] as Record<string, unknown> | undefined)?.["full_name"],
+    body["number"],
+    body["pull_request"],
+    (body["installation"] as Record<string, unknown> | undefined)?.["id"],
+  );
+  return event ? { action, event } : null;
+}
+
+export function checkRunEvent(value: unknown) {
+  if (typeof value !== "object" || value === null || Array.isArray(value))
+    return null;
+  const body = value as Record<string, unknown>;
+  const run = body["check_run"] as Record<string, unknown> | undefined;
+  const requested = body["requested_action"] as
+    | Record<string, unknown>
+    | undefined;
+  if (
+    body["action"] !== "rerequested" &&
+    !(
+      body["action"] === "requested_action" &&
+      requested?.["identifier"] === REVIEW_ACTION
+    )
+  )
+    return null;
+  const head = run?.["head_sha"];
+  const repository = (
+    body["repository"] as Record<string, unknown> | undefined
+  )?.["full_name"];
+  const installationId = (
+    body["installation"] as Record<string, unknown> | undefined
+  )?.["id"];
+  const pull = (
+    Array.isArray(run?.["pull_requests"]) ? run["pull_requests"] : []
+  ).find(
+    (entry: Record<string, unknown> | null) =>
+      (entry?.["head"] as Record<string, unknown> | undefined)?.["sha"] ===
+      head,
+  ) as Record<string, unknown> | undefined;
+  if (
+    run?.["name"] !== "swarm-review" ||
+    typeof head !== "string" ||
+    !/^[a-f0-9]{40}$/.test(head) ||
+    typeof repository !== "string" ||
+    !/^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/.test(repository) ||
+    !Number.isSafeInteger(pull?.["number"]) ||
+    Number(pull?.["number"]) <= 0 ||
+    !Number.isSafeInteger(installationId) ||
+    Number(installationId) <= 0
+  )
+    return null;
+  return {
+    repository,
+    number: Number(pull?.["number"]),
+    head,
+    installationId: Number(installationId),
+  };
+}
+
+export async function openPull(
+  token: string,
+  repository: string,
+  number: number,
+  installationId: number,
+): Promise<PullRequestEvent | null> {
+  const response = await fetch(`${api}/repos/${repository}/pulls/${number}`, {
+    headers: headers(token),
+  });
+  if (!response.ok)
+    throw new GitHubRequestError(
+      `fetch_pull_${response.status}`,
+      response.status,
+    );
+  const pull: unknown = await response.json();
+  return (pull as { state?: unknown } | null)?.state === "open"
+    ? reviewablePull(repository, number, pull, installationId)
+    : null;
 }
 
 const base64url = (bytes: Uint8Array) =>
@@ -212,6 +301,40 @@ export async function createCheck(
   const id = (value as { id?: unknown })?.id;
   if (!Number.isSafeInteger(id)) throw new Error("invalid_check_run");
   return id as number;
+}
+
+export async function offerCheck(
+  token: string,
+  event: PullRequestEvent,
+): Promise<void> {
+  const response = await fetch(`${api}/repos/${event.repository}/check-runs`, {
+    method: "POST",
+    headers: headers(token),
+    body: JSON.stringify({
+      name: "swarm-review",
+      head_sha: event.head,
+      status: "completed",
+      conclusion: "neutral",
+      completed_at: new Date().toISOString(),
+      output: {
+        title: "Swarm review not started",
+        summary:
+          "New commits do not start a review. Choose Review to review this head.",
+      },
+      actions: [
+        {
+          label: "Review",
+          description: "Review this pull request head",
+          identifier: REVIEW_ACTION,
+        },
+      ],
+    }),
+  });
+  if (!response.ok)
+    throw new GitHubRequestError(
+      `offer_check_${response.status}`,
+      response.status,
+    );
 }
 
 export async function completeCheck(

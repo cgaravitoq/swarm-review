@@ -57,6 +57,7 @@ const signed = async (
   body: string,
   secret = "webhook-secret",
   delivery = "12345678-1234-1234-1234-123456789abc",
+  kind = "pull_request",
 ) => {
   const key = await crypto.subtle.importKey(
     "raw",
@@ -73,7 +74,7 @@ const signed = async (
     headers: {
       "x-hub-signature-256": `sha256=${Array.from(digest, (byte) => byte.toString(16).padStart(2, "0")).join("")}`,
       "x-github-delivery": delivery,
-      "x-github-event": "pull_request",
+      "x-github-event": kind,
     },
     body,
   });
@@ -284,7 +285,7 @@ describe("GitHub App webhook", () => {
         },
       },
     ],
-    ["action", { action: "synchronize" }],
+    ["action", { action: "closed" }],
     ["repository", { repository: { full_name: "acme/unlisted" } }],
   ])("skips %s", async (_name, change) => {
     const { env, storage } = fixture();
@@ -895,5 +896,166 @@ describe("superseded cloud review", () => {
     });
     await job.cancel();
     expect(destroy).toHaveBeenCalledOnce();
+  });
+});
+
+const checkRun = (overrides: Record<string, unknown> = {}) => ({
+  action: "requested_action",
+  requested_action: { identifier: "review" },
+  check_run: {
+    name: "swarm-review",
+    head_sha: HEAD,
+    pull_requests: [{ number: 7, head: { sha: HEAD }, base: { sha: BASE } }],
+  },
+  repository: { full_name: "acme/demo" },
+  installation: { id: 42 },
+  ...overrides,
+});
+
+describe("Checks tab", () => {
+  it("answers a push with a neutral check offering Review and starts no review", async () => {
+    const { env, pr, stored, job, started } = fixture();
+    const gh = github();
+    await started();
+    const generation = stored.get("current");
+    gh.calls.length = 0;
+    const response = await worker.fetch(
+      await signed(
+        JSON.stringify(
+          event({
+            action: "synchronize",
+            pull_request: { ...event().pull_request, head: { sha: MOVED } },
+          }),
+        ),
+        "webhook-secret",
+        "62345678-1234-1234-1234-123456789abc",
+      ),
+      env as never,
+    );
+    expect(response.status).toBe(202);
+    await pr.alarm();
+    const offer = gh.sent().filter((call) => call.method === "POST");
+    expect(offer.map((call) => call.url)).toEqual([`${API}/check-runs`]);
+    const body = offer[0]!.body as { completed_at: string };
+    expect(body).toEqual({
+      name: "swarm-review",
+      head_sha: MOVED,
+      status: "completed",
+      conclusion: "neutral",
+      completed_at: body.completed_at,
+      output: {
+        title: "Swarm review not started",
+        summary:
+          "New commits do not start a review. Choose Review to review this head.",
+      },
+      actions: [
+        {
+          label: "Review",
+          description: "Review this pull request head",
+          identifier: "review",
+        },
+      ],
+    });
+    expect(job.start).toHaveBeenCalledOnce();
+    expect(job.cancel).not.toHaveBeenCalled();
+    expect(stored.get("current")).toEqual(generation);
+    expect(stored.get("offers")).toEqual([]);
+  });
+
+  it.each([
+    ["requested_action", checkRun()],
+    [
+      "rerequested",
+      checkRun({ action: "rerequested", requested_action: undefined }),
+    ],
+  ])(
+    "starts one new generation on %s when the check's head is still the PR head",
+    async (_name, payload) => {
+      const { env, pr, stored, job, started } = fixture();
+      const gh = github();
+      await started();
+      gh.calls.length = 0;
+      const body = JSON.stringify(payload);
+      const delivery = "72345678-1234-1234-1234-123456789abc";
+      expect(
+        await (
+          await worker.fetch(
+            await signed(body, "webhook-secret", delivery, "check_run"),
+            env as never,
+          )
+        ).json(),
+      ).toEqual({ accepted: true });
+      expect(
+        await (
+          await worker.fetch(
+            await signed(body, "webhook-secret", delivery, "check_run"),
+            env as never,
+          )
+        ).json(),
+      ).toEqual({ accepted: false });
+      const pull = gh.sent()[0]!;
+      expect(pull).toMatchObject({ method: "GET", url: `${API}/pulls/7` });
+      expect(pull.headers.get("authorization")).toBe(
+        "Bearer installation-token",
+      );
+      expect(stored.get("current")).toMatchObject({
+        generation: 2,
+        phase: "pending",
+        event: {
+          repository: "acme/demo",
+          number: 7,
+          head: HEAD,
+          base: BASE,
+          installationId: 42,
+        },
+      });
+      await pr.alarm();
+      expect(job.cancel).toHaveBeenCalledOnce();
+      expect(job.start).toHaveBeenCalledTimes(2);
+      expect(stored.get("current")).toMatchObject({
+        generation: 2,
+        phase: "running",
+        checkRunId: 100,
+      });
+    },
+  );
+
+  it.each([
+    ["another action", checkRun({ requested_action: { identifier: "other" } })],
+    [
+      "another check",
+      checkRun({ check_run: { ...checkRun().check_run, name: "ci" } }),
+    ],
+  ])("ignores %s", async (_name, payload) => {
+    const { env, storage } = fixture();
+    const gh = github();
+    const response = await worker.fetch(
+      await signed(
+        JSON.stringify(payload),
+        "webhook-secret",
+        undefined,
+        "check_run",
+      ),
+      env as never,
+    );
+    expect(await response.json()).toEqual({ ignored: true });
+    expect(gh.calls).toEqual([]);
+    expect(storage.put).not.toHaveBeenCalled();
+  });
+
+  it("ignores a re-run whose check is no longer on the PR head", async () => {
+    const { env, storage } = fixture();
+    github({ pullHead: MOVED });
+    const response = await worker.fetch(
+      await signed(
+        JSON.stringify(checkRun()),
+        "webhook-secret",
+        undefined,
+        "check_run",
+      ),
+      env as never,
+    );
+    expect(await response.json()).toEqual({ ignored: true });
+    expect(storage.put).not.toHaveBeenCalled();
   });
 });
