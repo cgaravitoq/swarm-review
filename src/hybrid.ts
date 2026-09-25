@@ -136,6 +136,7 @@ function runPi(input: {
     let stopReason: string | null = null;
     let usage: LaneResult["usage"] = null;
     let finalText = "";
+    let piError: string | null = null;
     let cut: "deadline" | "turn cap" | null = null;
     let complete = false;
     const kill = (reason: "deadline" | "turn cap") => {
@@ -167,15 +168,20 @@ function runPi(input: {
         const message = record(event["message"]);
         if (typeof message?.["stopReason"] === "string")
           stopReason = message["stopReason"];
+        if (typeof message?.["errorMessage"] === "string")
+          piError = message["errorMessage"].slice(0, 500);
         const observed = record(message?.["usage"]);
         if (observed) {
           const inputTokens = observed["input"];
           const outputTokens = observed["output"];
           const totalTokens = observed["totalTokens"];
+          // A turn the provider refused carries zeros Pi filled in, not a
+          // count anyone observed.
           if (
             typeof inputTokens === "number" &&
             typeof outputTokens === "number" &&
-            typeof totalTokens === "number"
+            typeof totalTokens === "number" &&
+            totalTokens > 0
           ) {
             usage ??= { input: 0, output: 0, totalTokens: 0 };
             usage.input += inputTokens;
@@ -237,7 +243,9 @@ function runPi(input: {
         usage,
         finalText,
         error:
-          status === "failed" ? stderr.trim() || `pi exited ${code}` : null,
+          status === "failed"
+            ? piError || stderr.trim() || `pi exited ${code}`
+            : null,
       });
     });
   });

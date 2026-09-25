@@ -69,6 +69,10 @@ if (process.env.PI_HANG === "cap") {
     event({type:"turn_start"});
     event({type:"turn_end",message:{stopReason:"tool_use",usage:{input:1,output:1,totalTokens:2}}});
   }, 20);
+} else if (process.env.PI_HANG === "error") {
+  event({type:"turn_start"});
+  event({type:"turn_end",message:{stopReason:"error",errorMessage:"400 status code (no body)",usage:{input:0,output:0,totalTokens:0}}});
+  event({type:"agent_end",messages:[{role:"assistant",content:[],stopReason:"error",errorMessage:"400 status code (no body)"}]});
 } else if (process.env.PI_HANG === "deadline") {
   setInterval(() => {}, 1000);
 } else {
@@ -288,6 +292,24 @@ it("kills a lane at the turn cap and declares it", async () => {
   expect(receipt.lanes?.[0]?.model).toBe("test-a");
   expect(receipt.lanes?.[0]?.stopReason).toBe("turn cap");
   expect(receipt.lanes?.[0]?.turns).toBe(8);
+});
+
+it("records Pi's own error for a lane whose turn ended in error", async () => {
+  const input = await setup();
+  const config = JSON.parse(await readFile(input.lanes, "utf8"));
+  config.reviewers[0].env.PI_HANG = "error";
+  await writeFile(input.lanes, JSON.stringify(config));
+  const result = run(input);
+  expect(result.status, result.stderr).toBe(0);
+  const receipt = JSON.parse(
+    await readFile(join(input.out, "receipt.json"), "utf8"),
+  ) as HybridReceipt & { lanes: { usage: unknown }[] };
+  expect(receipt.lanes[0]).toMatchObject({
+    status: "failed",
+    stopReason: "error",
+    error: "400 status code (no body)",
+    usage: null,
+  });
 });
 
 it("kills a lane at the deadline and writes its receipt", async () => {
