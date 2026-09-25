@@ -14,10 +14,22 @@ inputs:
   mode:
     description: Use sandbox lanes, packed lanes, or choose sandbox except for forks and runners that cannot run the sandbox image.
     default: auto
+  comment-id:
+    description: The comment that asked for the review, acknowledged with a reaction. Empty acknowledges nothing, which is what a scheduled run wants.
+    default: ${{ github.event.comment.id }}
 
 runs:
   using: composite
   steps:
+    - name: Acknowledge
+      if: inputs.comment-id != ''
+      continue-on-error: true
+      shell: bash
+      env:
+        GITHUB_TOKEN: ${{ github.token }}
+        COMMENT_ID: ${{ inputs.comment-id }}
+      run: gh api --method POST "repos/$GITHUB_REPOSITORY/issues/comments/$COMMENT_ID/reactions" -f content=eyes
+
     - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       with:
         path: swarm-review-source
@@ -42,6 +54,14 @@ runs:
         PULL_REQUEST: ${{ inputs.pull-request }}
         INPUT_MODE: ${{ inputs.mode }}
       run: bun "$GITHUB_ACTION_PATH/src/action.ts"
+
+    - name: Publish
+      if: always()
+      shell: bash
+      env:
+        GITHUB_TOKEN: ${{ github.token }}
+        PULL_REQUEST: ${{ inputs.pull-request }}
+      run: bun "$GITHUB_ACTION_PATH/src/publish.ts" --receipt "$SWARM_RECEIPT" --repo "$GITHUB_REPOSITORY" --pr "$PULL_REQUEST" --publish --allow-moved-head
 
     - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
       if: always()

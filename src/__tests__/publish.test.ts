@@ -17,6 +17,7 @@ import {
   publicationDisposition,
   REVIEW_EVENT,
   REVIEW_SIDE,
+  readRunNotes,
   refusalReason,
   revalidatePullRequest,
   reviewMarker,
@@ -850,6 +851,37 @@ describe("publish options", () => {
   });
 });
 
+describe("run notes", () => {
+  const directories: string[] = [];
+
+  afterEach(async () => {
+    for (const directory of directories.splice(0)) {
+      await rm(directory, { recursive: true, force: true });
+    }
+  });
+
+  const notesFor = async (raw: string | null) => {
+    const directory = await mkdtemp(join(tmpdir(), "review-pi-notes-"));
+    directories.push(directory);
+    const artifactRoot = join(directory, "swarm-1");
+    if (raw !== null) await writeFile(`${artifactRoot}.run.json`, raw);
+    return readRunNotes(artifactRoot);
+  };
+
+  it("reads the fork and the runner the action recorded", async () => {
+    expect(await notesFor('{"fork":true,"packedRunner":"ARM64"}')).toEqual({
+      fork: true,
+      packedRunner: "ARM64",
+    });
+  });
+
+  it("carries no note the action did not write", async () => {
+    expect(await notesFor('{"fork":false}')).toEqual({ fork: false });
+    expect(await notesFor(null)).toEqual({ fork: false });
+    expect(await notesFor("not json")).toEqual({ fork: false });
+  });
+});
+
 describe("moved head", () => {
   const head = "a".repeat(40);
   const later = "b".repeat(40);
@@ -1065,10 +1097,12 @@ describe("a run that publishes no review", () => {
   const artifact = async (
     swarm: SwarmReceipt | ReturnType<typeof preparationFailureReceipt>,
     phases: { runId: string; phase: string; state: string }[] = [],
+    notes: { fork?: boolean; packedRunner?: string } = {},
   ) => {
     const suiteDir = await artifactDirectory();
     const receiptPath = join(suiteDir, "swarm-receipt.json");
     await writeFile(receiptPath, JSON.stringify(swarm));
+    await writeFile(`${suiteDir}.run.json`, JSON.stringify(notes));
     for (const phase of phases) {
       await mkdir(join(suiteDir, phase.runId), { recursive: true });
       await writeFile(
@@ -1112,6 +1146,7 @@ describe("a run that publishes no review", () => {
     moved = false,
     seeded = [] as Comment[],
     editable = true,
+    viewerFails = false,
     reviews = [] as { id: number; body: string }[],
   } = {}) => {
     const comments: Comment[] = [...seeded];
@@ -1121,22 +1156,29 @@ describe("a run that publishes no review", () => {
         (init?.headers as Record<string, string> | undefined)?.["accept"] ?? "",
       );
       if (url === "https://api.github.com/graphql") {
-        return Response.json(
-          { data: { viewer: { login: bot } } },
-          { status: 200 },
-        );
+        return viewerFails
+          ? Response.json({ message: "Bad credentials" }, { status: 401 })
+          : Response.json(
+              { data: { viewer: { login: bot } } },
+              { status: 200 },
+            );
       }
       if (url.includes("/issues/comments/")) {
         const id = Number(commentUrl.exec(url)?.[1]);
         const comment = comments.find((entry) => entry.id === id);
+        const deleting = method === "DELETE" && init?.body === undefined;
         const body = method === "PATCH" ? commentBody(init) : null;
-        if (!comment || body === null) {
+        if (!comment || (!deleting && body === null)) {
           return Response.json({ message: "Not Found" }, { status: 404 });
         }
         if (!editable || comment.user.login !== bot) {
           return Response.json({ message: "Forbidden" }, { status: 403 });
         }
-        comment.body = body;
+        if (deleting) {
+          comments.splice(comments.indexOf(comment), 1);
+          return new Response(null, { status: 204 });
+        }
+        comment.body = body ?? "";
         return Response.json(comment, { status: 200 });
       }
       if (url.includes("/issues/7/comments")) {
@@ -1208,6 +1250,18 @@ describe("a run that publishes no review", () => {
     ],
   });
 
+  const reviewing = `${marker}\n\n**swarm-review is reviewing** this pull request with \`packed\` lanes.`;
+
+  /** Every request on an existing comment, as method, URL and body. */
+  const commentRequests = (fetchMock: ReturnType<typeof vi.fn>) =>
+    fetchMock.mock.calls
+      .filter(([url]) => String(url).includes("/issues/comments/"))
+      .map(([url, init]) => [
+        (init as RequestInit | undefined)?.method,
+        url,
+        (init as RequestInit | undefined)?.body,
+      ]);
+
   const completed = (): SwarmReceipt => ({
     swarmId: "swarm-1",
     status: "completed",
@@ -1243,7 +1297,7 @@ describe("a run that publishes no review", () => {
     ).toHaveLength(0);
   });
 
-  it("posts no comment when the receipt publishes a review", async () => {
+  it("posts no comment once the review is published", async () => {
     const api = github();
     const receiptPath = await artifact(completed());
 
@@ -1251,17 +1305,99 @@ describe("a run that publishes no review", () => {
 
     expect(api.comments).toEqual([]);
     expect(
-      api.fetchMock.mock.calls.some(([url]) =>
-        String(url).includes("/issues/"),
-      ),
-    ).toBe(false);
-    expect(
       api.fetchMock.mock.calls.filter(
         ([url, init]) =>
           String(url).includes("/pulls/7/reviews") &&
           (init as RequestInit | undefined)?.method === "POST",
       ),
     ).toHaveLength(1);
+  });
+
+  it("deletes every comment the run opened once the review is published", async () => {
+    const api = github({
+      seeded: [
+        { id: 30, user: { login: bot }, body: reviewing },
+        { id: 31, user: { login: bot }, body: reviewing },
+      ],
+    });
+    const receiptPath = await artifact(completed());
+
+    await expect(publish(receiptPath)).resolves.toBeUndefined();
+
+    expect(api.comments).toEqual([]);
+    expect(commentRequests(api.fetchMock)).toEqual([
+      [
+        "DELETE",
+        "https://api.github.com/repos/acme/demo/issues/comments/30",
+        undefined,
+      ],
+      [
+        "DELETE",
+        "https://api.github.com/repos/acme/demo/issues/comments/31",
+        undefined,
+      ],
+    ]);
+  });
+
+  it("turns one of the run's comments into the refusal and deletes the rest", async () => {
+    const api = github({
+      seeded: [
+        { id: 30, user: { login: bot }, body: reviewing },
+        { id: 31, user: { login: bot }, body: reviewing },
+      ],
+    });
+    const receiptPath = await artifact(failed());
+
+    await expect(publish(receiptPath)).rejects.toThrow(
+      "publication requires a completed or partial review",
+    );
+
+    expect(api.comments).toMatchObject([
+      {
+        id: 30,
+        body: expect.stringContaining("**swarm-review published no review.**"),
+      },
+    ]);
+    expect(
+      commentRequests(api.fetchMock).map(([method, url]) => [method, url]),
+    ).toEqual([
+      ["PATCH", "https://api.github.com/repos/acme/demo/issues/comments/30"],
+      ["DELETE", "https://api.github.com/repos/acme/demo/issues/comments/31"],
+    ]);
+  });
+
+  it("keeps the published review when the run's comment cannot be deleted", async () => {
+    const api = github({
+      seeded: [{ id: 30, user: { login: bot }, body: reviewing }],
+      editable: false,
+    });
+    const receiptPath = await artifact(completed());
+    const errors = vi.spyOn(console, "error").mockImplementation(() => {});
+
+    await expect(publish(receiptPath)).resolves.toBeUndefined();
+
+    expect(errors).toHaveBeenCalledWith(
+      expect.stringMatching(
+        /^run comment 30 not deleted: GitHub comment delete failed: 403/,
+      ),
+    );
+    errors.mockRestore();
+    expect(process.exitCode).toBe(0);
+    expect(api.comments).toHaveLength(1);
+  });
+
+  it("logs a viewer lookup that failed instead of claiming silence", async () => {
+    const api = github({ viewerFails: true });
+    const receiptPath = await artifact(completed());
+    const errors = vi.spyOn(console, "error").mockImplementation(() => {});
+
+    await expect(publish(receiptPath)).resolves.toBeUndefined();
+
+    expect(errors).toHaveBeenCalledWith(
+      "viewer lookup failed, so the run's comment cannot be claimed: GitHub viewer request failed: 401",
+    );
+    errors.mockRestore();
+    expect(api.comments).toEqual([]);
   });
 
   it("comments the stage and message the action recorded when no receipt was written", async () => {
@@ -1323,11 +1459,11 @@ describe("a run that publishes no review", () => {
     expect(body).toContain("| `reviewer-2` | `failed` | no status.json |");
   });
 
-  it("publishes the packed fork note in the review body", async () => {
+  it("publishes the packed fork note the run recorded", async () => {
     const api = github();
-    const receiptPath = await artifact(completed());
+    const receiptPath = await artifact(completed(), [], { fork: true });
 
-    await publish(receiptPath, env, ["--publish", "--fork"]);
+    await publish(receiptPath);
 
     const request = api.fetchMock.mock.calls.find(
       ([url, init]) =>
@@ -1343,16 +1479,14 @@ describe("a run that publishes no review", () => {
     expect(payload.body).toContain("- fork reviewed with packed lanes");
   });
 
-  it("publishes both packed lane notes when the runner cannot run the sandbox image", async () => {
+  it("publishes both packed lane notes the run recorded", async () => {
     const api = github();
-    const receiptPath = await artifact(completed());
+    const receiptPath = await artifact(completed(), [], {
+      fork: true,
+      packedRunner: "ARM64",
+    });
 
-    await publish(receiptPath, env, [
-      "--publish",
-      "--fork",
-      "--packed-runner",
-      "ARM64",
-    ]);
+    await publish(receiptPath);
 
     const request = api.fetchMock.mock.calls.find(
       ([url, init]) =>
@@ -1634,10 +1768,14 @@ describe("a run that publishes no review", () => {
     expect(reason.match(/`/g)).toHaveLength(2);
   });
 
-  it("fails without a review or a comment when this run's review is already published", async () => {
+  it("deletes the run's comment when its review is already on the pull request", async () => {
     const api = github({
+      seeded: [{ id: 30, user: { login: bot }, body: reviewing }],
       reviews: [
-        { id: 3, body: `${reviewMarker("swarm-1", head)}\nearlier review` },
+        {
+          id: 3,
+          body: `${reviewMarker("swarm-1", head)}\nearlier review`,
+        },
       ],
     });
     const receiptPath = await artifact(completed());
@@ -1654,7 +1792,14 @@ describe("a run that publishes no review", () => {
           (init as RequestInit | undefined)?.method === "POST",
       ),
     ).toHaveLength(0);
-    expect(issueRequests(api.fetchMock)).toHaveLength(0);
+    expect(api.comments).toEqual([]);
+    expect(commentRequests(api.fetchMock)).toEqual([
+      [
+        "DELETE",
+        "https://api.github.com/repos/acme/demo/issues/comments/30",
+        undefined,
+      ],
+    ]);
   });
 
   it("comments a head that moved off the frozen SHA", async () => {

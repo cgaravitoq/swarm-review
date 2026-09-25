@@ -52,6 +52,11 @@ The `mode` input defaults to `auto`: pull requests from this repository use thre
 Set `mode: packed` or `mode: sandbox` to choose explicitly; `mode: sandbox` needs an `X64` runner and refuses any other before the registry login.
 The action pulls the image tagged from its container sources and the pull request head's lockfile, or builds and pushes it when absent.
 
+A run acknowledges itself in that pull request.
+The `comment-id` input defaults to `github.event.comment.id`, and the action's first step reacts with an eyes reaction to that comment, which the calling workflow grants with `issues: write`; a run with no comment to acknowledge, such as a scheduled one, skips it.
+Once the mode is chosen the action opens one status comment for the run and links the run's artifact page.
+Publishing is its own step and runs whatever the review step did: a submitted review deletes the run's comment, and a run with no review turns it into the stage the run died in.
+
 ## A Claude Code subscription lane
 
 A lane can review on a Claude Code subscription instead of a provider API key, which is the only route to the Opus models here.

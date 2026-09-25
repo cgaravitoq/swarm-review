@@ -7,7 +7,8 @@
  * out of the review as out-of-diff, and unverified and rejected candidates stay
  * in the receipt. Comments attach to the GitHub three-dot diff
  * (merge-base...head) on side RIGHT at the frozen head SHA. The GitHub
- * credential stays on the host. Publishing is opt-in.
+ * credential stays on the host. Publishing is opt-in; a published run deletes
+ * the comment it opened and a refused one turns it into the refusal.
  */
 
 import { readdir, readFile } from "node:fs/promises";
@@ -147,7 +148,6 @@ export function parsePublishOptions(argv: string[]) {
   const pullRequest = flag(argv, "pr");
   const expectedHead = flag(argv, "expected-head");
   const expectedMergeBase = flag(argv, "expected-merge-base");
-  const packedRunner = flag(argv, "packed-runner");
   return {
     receiptPath,
     repo,
@@ -156,8 +156,6 @@ export function parsePublishOptions(argv: string[]) {
     ...(expectedMergeBase ? { expectedMergeBase } : {}),
     publish: argv.includes("--publish"),
     allowMovedHead: argv.includes("--allow-moved-head"),
-    fork: argv.includes("--fork"),
-    ...(packedRunner ? { packedRunner } : {}),
     minSeverity: flag(argv, "min-severity") ?? "P2",
   };
 }
@@ -932,11 +930,10 @@ export const runIdentity = (env: Record<string, string | undefined>) => {
 
 export type RunIdentity = NonNullable<ReturnType<typeof runIdentity>>;
 
-const REFUSAL_MARKER_PREFIX = "<!-- swarm-review:run:";
+const RUN_MARKER_PREFIX = "<!-- swarm-review:run:";
 
 /** One comment per run: the marker is what a re-run finds and edits. */
-export const refusalMarker = (runId: string) =>
-  `${REFUSAL_MARKER_PREFIX}${runId} -->`;
+export const runMarker = (runId: string) => `${RUN_MARKER_PREFIX}${runId} -->`;
 
 /** The step a lane was in when it stopped, as its own status.json records it. */
 export type LanePhase = {
@@ -1020,6 +1017,35 @@ const runFailure = async (
     : null;
 };
 
+/**
+ * What the action recorded for the review it is about to run.
+ *
+ * The notes travel beside the receipt's directory rather than as flags, so
+ * publish reads the same run's own record whatever the review step did with
+ * them.
+ */
+export type RunNotes = { fork: boolean; packedRunner?: string };
+
+export async function readRunNotes(artifactRoot: string): Promise<RunNotes> {
+  const raw = await readFile(`${artifactRoot}.run.json`, "utf8").catch(
+    () => null,
+  );
+  if (raw === null) return { fork: false };
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(raw);
+  } catch {
+    return { fork: false };
+  }
+  if (typeof parsed !== "object" || parsed === null) return { fork: false };
+  const record = parsed as Record<string, unknown>;
+  const packedRunner = record["packedRunner"];
+  return {
+    fork: record["fork"] === true,
+    ...(typeof packedRunner === "string" ? { packedRunner } : {}),
+  };
+}
+
 /** One lane as the comment names it. */
 export type RefusalLane = {
   lane: string;
@@ -1095,7 +1121,7 @@ export const refusalCommentBody = (input: {
   lanes: readonly RefusalLane[];
 }) =>
   [
-    refusalMarker(input.runId),
+    runMarker(input.runId),
     "",
     `**swarm-review published no review.** \`${input.reason}\``,
     ...(input.lanes.length === 0
@@ -1109,6 +1135,25 @@ export const refusalCommentBody = (input: {
               `| ${statusCell(lane.lane)} | ${statusCell(lane.status)} | ${phaseCell(lane.phase)} |`,
           ),
         ]),
+    "",
+    `[Run artifact](${input.url})`,
+  ].join("\n");
+
+/**
+ * What the run's comment says while the lanes are reading the change.
+ *
+ * `action.ts` opens it as soon as the mode is chosen, so a reader who asked
+ * for the review sees one run's answer in one place, from the first minute.
+ */
+export const runningCommentBody = (input: {
+  runId: string;
+  mode: string;
+  url: string;
+}) =>
+  [
+    runMarker(input.runId),
+    "",
+    `**swarm-review is reviewing** this pull request with \`${input.mode}\` lanes.`,
     "",
     `[Run artifact](${input.url})`,
   ].join("\n");
@@ -1161,6 +1206,25 @@ export async function updateIssueComment(
   }
 }
 
+export async function deleteIssueComment(
+  repo: string,
+  commentId: number,
+  token: string,
+) {
+  const response = await fetch(
+    `https://api.github.com/repos/${repo}/issues/comments/${commentId}`,
+    {
+      method: "DELETE",
+      headers: githubHeaders(token, "application/vnd.github+json"),
+    },
+  );
+  if (!response.ok) {
+    throw new Error(
+      `GitHub comment delete failed: ${response.status}: ${await response.text()}`,
+    );
+  }
+}
+
 /**
  * The login the token acts as. REST's `/user` refuses an installation token,
  * while GraphQL's viewer answers for it and for a personal token alike.
@@ -1185,44 +1249,81 @@ export async function fetchViewerLogin(token: string) {
 }
 
 /**
- * The run's own comment, edited when it is already there and posted when not.
+ * Every comment this run opened.
  *
- * Only a comment the token's identity wrote can be edited, so one carrying the
- * marker under another author is not this run's. An edit that still fails
- * leaves a fresh comment rather than none.
+ * Only a comment the token's identity wrote is the run's, so one carrying the
+ * marker under another author is left alone. A re-run of the same run id keeps
+ * the attempts it replaced, so there can be more than one.
  */
-export async function upsertRefusalComment(input: {
+async function runComments(input: {
+  repo: string;
+  pullRequest: number;
+  token: string;
+  runId: string;
+}) {
+  const marker = runMarker(input.runId);
+  const viewer = await fetchViewerLogin(input.token).catch((error: unknown) => {
+    console.error(
+      `viewer lookup failed, so the run's comment cannot be claimed: ${error instanceof Error ? error.message : String(error)}`,
+    );
+    return null;
+  });
+  return (
+    await fetchIssueComments(input.repo, input.pullRequest, input.token)
+  ).filter(
+    (comment) =>
+      viewer !== null &&
+      comment.user?.login === viewer &&
+      (comment.body ?? "").startsWith(`${marker}\n`),
+  );
+}
+
+async function deleteRunComment(
+  repo: string,
+  commentId: number,
+  token: string,
+) {
+  try {
+    await deleteIssueComment(repo, commentId, token);
+  } catch (error: unknown) {
+    console.error(
+      `run comment ${commentId} not deleted: ${error instanceof Error ? error.message : String(error)}`,
+    );
+  }
+}
+
+/**
+ * Leaves the run exactly one comment: the first of its own that takes the
+ * edit, every other one deleted, and one posted when none took it.
+ */
+export async function upsertRunComment(input: {
   repo: string;
   pullRequest: number;
   token: string;
   runId: string;
   body: string;
 }) {
-  const marker = refusalMarker(input.runId);
-  const viewer = await fetchViewerLogin(input.token).catch(() => null);
-  const existing = (
-    await fetchIssueComments(input.repo, input.pullRequest, input.token)
-  ).find(
-    (comment) =>
-      viewer !== null &&
-      comment.user?.login === viewer &&
-      (comment.body ?? "").startsWith(`${marker}\n`),
-  );
-  if (existing) {
-    try {
-      await updateIssueComment(
-        input.repo,
-        existing.id,
-        input.token,
-        input.body,
-      );
-      return "edited" as const;
-    } catch (error: unknown) {
-      console.error(
-        `refusal comment ${existing.id} not edited: ${error instanceof Error ? error.message : String(error)}`,
-      );
+  let kept = false;
+  for (const comment of await runComments(input)) {
+    if (!kept) {
+      try {
+        await updateIssueComment(
+          input.repo,
+          comment.id,
+          input.token,
+          input.body,
+        );
+        kept = true;
+        continue;
+      } catch (error: unknown) {
+        console.error(
+          `run comment ${comment.id} not edited: ${error instanceof Error ? error.message : String(error)}`,
+        );
+      }
     }
+    await deleteRunComment(input.repo, comment.id, input.token);
   }
+  if (kept) return "edited" as const;
   await postIssueComment(
     input.repo,
     input.pullRequest,
@@ -1249,7 +1350,7 @@ async function reportRefusal(input: {
 }) {
   if (!input.run || input.pullRequest === null || input.token === null) return;
   try {
-    const outcome = await upsertRefusalComment({
+    const outcome = await upsertRunComment({
       repo: input.repo,
       pullRequest: input.pullRequest,
       token: input.token,
@@ -1270,6 +1371,34 @@ async function reportRefusal(input: {
   } catch (error: unknown) {
     console.error(
       `refusal not reported: ${error instanceof Error ? error.message : String(error)}`,
+    );
+  }
+}
+
+/**
+ * Deletes every comment the run opened once its review is on the pull
+ * request, best effort: the review is the answer, and a comment that cannot
+ * be deleted is logged and never disturbs it.
+ */
+async function clearRunComments(input: {
+  run: RunIdentity | null;
+  repo: string;
+  pullRequest: number;
+  token: string;
+}) {
+  if (!input.run) return;
+  try {
+    for (const comment of await runComments({
+      repo: input.repo,
+      pullRequest: input.pullRequest,
+      token: input.token,
+      runId: input.run.runId,
+    })) {
+      await deleteRunComment(input.repo, comment.id, input.token);
+    }
+  } catch (error: unknown) {
+    console.error(
+      `run comments not cleared: ${error instanceof Error ? error.message : String(error)}`,
     );
   }
 }
@@ -1299,6 +1428,7 @@ export async function main(
   const token = env["GITHUB_TOKEN"] ?? env["GH_TOKEN"] ?? null;
   const run = runIdentity(env);
   const artifactRoot = dirname(options.receiptPath);
+  const notes = await readRunNotes(artifactRoot);
   let receipt: SwarmReceipt | null = null;
   let pullRequest: number | null = options.pullRequest ?? null;
   try {
@@ -1325,10 +1455,19 @@ export async function main(
     );
     if (alreadyPublished(validated.reviews, receipt.swarmId, expected.head)) {
       // This run's review is on the pull request, so there is no refusal to
-      // report; the job fails as it did before.
+      // report; the job fails as it did before, and the comments this run
+      // opened go as they would after its own publish.
       console.error(
         "a review for this run and SHA is already on the pull request",
       );
+      if (options.publish) {
+        await clearRunComments({
+          run,
+          repo: options.repo,
+          pullRequest,
+          token,
+        });
+      }
       process.exitCode = 1;
       return;
     }
@@ -1337,8 +1476,8 @@ export async function main(
       commentableLines(validated.diff),
       options.repo,
       options.minSeverity,
-      options.fork,
-      options.packedRunner,
+      notes.fork,
+      notes.packedRunner,
     );
     const payload = githubReviewPayload(built);
     const superseded = supersededReviews(validated.reviews);
@@ -1371,6 +1510,7 @@ export async function main(
     }
     const posted = await postReview(options.repo, pullRequest, token, payload);
     console.log(posted.html_url);
+    await clearRunComments({ run, repo: options.repo, pullRequest, token });
     for (const review of superseded) {
       try {
         await updateReviewBody(
