@@ -84,6 +84,7 @@ RUN mkdir -p /opt/review/extensions \
 COPY claude-code-provider.js /opt/review/extensions/claude-code-provider.js
 
 COPY models.json /opt/review/pi-config/models.json
+COPY context/swarm.js /opt/review/swarm.js
 
 # Reader cases build and test Rust crates in this repository, so a review that
 # cannot run `cargo` silently degrades to reading the diff. Admission refuses a

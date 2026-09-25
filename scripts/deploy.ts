@@ -1,9 +1,11 @@
 import { spawn } from "node:child_process";
-import { cp, glob, mkdir, rm, stat } from "node:fs/promises";
+import { createHash } from "node:crypto";
+import { cp, glob, mkdir, readFile, rm, stat } from "node:fs/promises";
 import { dirname, join, relative, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import ts from "typescript";
 import { imageReference, imageTagFromFiles } from "../src/image-tag";
+import { IMAGE_SOURCES } from "../src/protocol";
 
 const packageRoot = join(dirname(fileURLToPath(import.meta.url)), "..");
 const contextDir = join(packageRoot, "container", "context");
@@ -116,8 +118,44 @@ const materialize = async (checkout: string) => {
       preserveTimestamps: true,
     });
   }
+  await new Promise<void>((resolvePromise, reject) => {
+    const bundle = spawn(
+      "bun",
+      [
+        "build",
+        join(packageRoot, "src/swarm.ts"),
+        "--target",
+        "bun",
+        "--outfile",
+        join(contextDir, "swarm.js"),
+      ],
+      { cwd: packageRoot, stdio: ["ignore", "ignore", "pipe"] },
+    );
+    let error = "";
+    bundle.stderr.on("data", (chunk: Buffer) => {
+      error += chunk.toString();
+    });
+    bundle.on("error", reject);
+    bundle.on("close", (code) =>
+      code === 0
+        ? resolvePromise()
+        : reject(new Error(`engine bundle failed: ${error}`)),
+    );
+  });
   return manifests.length;
 };
+
+export const imageSourceHashes = async () =>
+  Object.fromEntries(
+    await Promise.all(
+      Object.entries(IMAGE_SOURCES).map(async ([path, name]) => [
+        path,
+        createHash("sha256")
+          .update(await readFile(join(packageRoot, "container", name)))
+          .digest("hex"),
+      ]),
+    ),
+  );
 
 const wrangler = (args: string[], tee = false) =>
   new Promise<string>((resolvePromise, reject) => {
@@ -202,7 +240,12 @@ const main = async () => {
   }
 
   const deployed = await wrangler(
-    ["deploy", ...deployArguments(process.argv.slice(2))],
+    [
+      "deploy",
+      ...deployArguments(process.argv.slice(2)),
+      "--var",
+      `IMAGE_SOURCE_HASHES:${JSON.stringify(await imageSourceHashes())}`,
+    ],
     true,
   );
   const name = containerAppName();

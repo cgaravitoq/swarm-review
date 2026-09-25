@@ -1,5 +1,6 @@
 import {
   chmod,
+  cp,
   mkdir,
   mkdtemp,
   readFile,
@@ -44,7 +45,7 @@ async function arrange(headRepo: string, pullSucceeds: boolean) {
   );
   await writeFile(
     join(bin, "bun"),
-    '#!/bin/sh\nprintf "bun %s\\n" "$*" >> "$ACTION_LOG"\nif [ "$1" = "$ACTION_ROOT/src/swarm.ts" ]; then printf "%s\\0" "$@" > "$ACTION_ARGS"; out=; id=; previous=; for arg; do case "$previous" in --out) out=$arg;; --swarm-id) id=$arg;; esac; previous=$arg; done; [ -f "$out/$id.run.json" ] || { echo "run notes missing" >&2; exit 1; }; mkdir -p "$out" && mkdir "$out/$id" || exit 1; [ "$ACTION_FAIL" = partial ] && printf "{}" > "$out/$id/swarm-receipt.json" && exit 1; [ "$ACTION_FAIL" = swarm ] && exit 1; fi\nif [ "$2" = "$ACTION_ROOT/scripts/deploy.ts" ] && [ "$ACTION_FAIL" = deploy ]; then printf "exec /bin/sh: exec format error\\ndocker build exited with code 1\\n" >&2; exit 1; fi\nexit 0\n',
+    '#!/bin/sh\nprintf "bun %s\\n" "$*" >> "$ACTION_LOG"\nif [ "$1" = "$ACTION_ROOT/src/swarm.ts" ]; then printf "%s\\0" "$@" > "$ACTION_ARGS"; out=; id=; previous=; for arg; do case "$previous" in --out) out=$arg;; --swarm-id) id=$arg;; esac; previous=$arg; done; [ -f "$out/$id.run.json" ] || { echo "run notes missing" >&2; exit 1; }; mkdir -p "$out" && mkdir "$out/$id" || exit 1; [ "$ACTION_FAIL" = partial ] && printf "{}" > "$out/$id/swarm-receipt.json" && exit 1; [ "$ACTION_FAIL" = swarm ] && exit 1; fi\nif [ "$1" = build ]; then for outfile; do :; done; [ -f "$outfile" ] || { mkdir -p "$(dirname "$outfile")" && printf bundle > "$outfile"; }; fi\nif [ "$2" = "$ACTION_ROOT/scripts/deploy.ts" ] && [ "$ACTION_FAIL" = deploy ]; then printf "exec /bin/sh: exec format error\\ndocker build exited with code 1\\n" >&2; exit 1; fi\nexit 0\n',
   );
   for (const name of ["gh", "docker", "bun"]) {
     await chmod(join(bin, name), 0o755);
@@ -132,7 +133,9 @@ describe("composite action driver", () => {
     const log = await fixture.log();
     expect(log).toContain("gh api repos/acme/demo/pulls/42");
     expect(log.some((line) => line.startsWith("docker "))).toBe(false);
-    expect(log.find((line) => line.includes("src/swarm.ts"))).toBe(
+    expect(
+      log.find((line) => line.startsWith(`bun ${packageRoot}/src/swarm.ts`)),
+    ).toBe(
       `bun ${packageRoot}/src/swarm.ts --repo acme/demo --source ${fixture.env.GITHUB_WORKSPACE}/swarm-review-source --pr 42 --provider cloudflare-workers-ai --model @cf/deepseek-ai/deepseek-v4-flash-0731 --reviewers 3 --swarm-id pr-42-123-1 --out ${fixture.env.RUNNER_TEMP}/swarm-review`,
     );
     expect(log.some((line) => line.includes("src/publish.ts"))).toBe(false);
@@ -144,9 +147,9 @@ describe("composite action driver", () => {
     await main({ ...fixture.env, INPUT_MODE: "packed" });
     const log = await fixture.log();
     expect(log.some((line) => line.startsWith("docker "))).toBe(false);
-    expect(log.find((line) => line.includes("src/swarm.ts"))).not.toContain(
-      "--sandbox",
-    );
+    expect(
+      log.find((line) => line.startsWith(`bun ${packageRoot}/src/swarm.ts`)),
+    ).not.toContain("--sandbox");
     expect(await fixture.notes()).toEqual({ fork: false });
   });
 
@@ -155,7 +158,9 @@ describe("composite action driver", () => {
     await main({ ...fixture.env, RUNNER_ARCH: "ARM64", INPUT_MODE: "auto" });
     const log = await fixture.log();
     expect(log.some((line) => line.startsWith("docker "))).toBe(false);
-    expect(log.find((line) => line.includes("src/swarm.ts"))).toBe(
+    expect(
+      log.find((line) => line.startsWith(`bun ${packageRoot}/src/swarm.ts`)),
+    ).toBe(
       `bun ${packageRoot}/src/swarm.ts --repo acme/demo --source ${fixture.env.GITHUB_WORKSPACE}/swarm-review-source --pr 42 --provider cloudflare-workers-ai --model @cf/deepseek-ai/deepseek-v4-flash-0731 --reviewers 3 --swarm-id pr-42-123-1 --out ${fixture.env.RUNNER_TEMP}/swarm-review`,
     );
     expect(await fixture.swarmArgs()).not.toContain("--sandbox");
@@ -171,9 +176,9 @@ describe("composite action driver", () => {
     await main({ ...withoutArch, INPUT_MODE: "auto" });
     const log = await fixture.log();
     expect(log.some((line) => line.startsWith("docker "))).toBe(false);
-    expect(log.find((line) => line.includes("src/swarm.ts"))).not.toContain(
-      "--sandbox",
-    );
+    expect(
+      log.find((line) => line.startsWith(`bun ${packageRoot}/src/swarm.ts`)),
+    ).not.toContain("--sandbox");
     expect(await fixture.notes()).toEqual({
       fork: false,
       packedRunner: "unknown",
@@ -199,9 +204,9 @@ describe("composite action driver", () => {
     await main({ ...fixture.env, RUNNER_ARCH: "ARM64", INPUT_MODE: "auto" });
     const log = await fixture.log();
     expect(log.some((line) => line.startsWith("docker "))).toBe(false);
-    expect(log.find((line) => line.includes("src/swarm.ts"))).not.toContain(
-      "--sandbox",
-    );
+    expect(
+      log.find((line) => line.startsWith(`bun ${packageRoot}/src/swarm.ts`)),
+    ).not.toContain("--sandbox");
     expect(await fixture.notes()).toEqual({
       fork: true,
       packedRunner: "ARM64",
@@ -221,7 +226,9 @@ describe("composite action driver", () => {
     );
     expect(log).toContain(`docker pull ${image}`);
     expect(log).toContain("docker login ghcr.io -u reviewer --password-stdin");
-    expect(log.find((line) => line.includes("src/swarm.ts"))).toBe(
+    expect(
+      log.find((line) => line.startsWith(`bun ${packageRoot}/src/swarm.ts`)),
+    ).toBe(
       `bun ${packageRoot}/src/swarm.ts --repo acme/demo --source ${fixture.env.GITHUB_WORKSPACE}/swarm-review-source --pr 42 --sandbox --image ${image} --provider cloudflare-workers-ai --model @cf/deepseek-ai/deepseek-v4-flash-0731 --reviewers 3 --total-timeout 1500 --verifier-reserve 200 --lane-memory 2g --lane-cpus 2 --lane-input-cap 4000000 --check git --no-pager diff --stat base..HEAD --swarm-id pr-42-123-1 --out ${fixture.env.RUNNER_TEMP}/swarm-review`,
     );
     expect(await fixture.swarmArgs()).toEqual([
@@ -264,6 +271,35 @@ describe("composite action driver", () => {
     expect(await fixture.notes()).toEqual({ fork: false });
   });
 
+  it("bundles the engine before deriving the image tag from a fresh action checkout", async () => {
+    const fixture = await arrange("acme/demo", true);
+    const actionRoot = join(fixture.env.GITHUB_WORKSPACE, "action");
+    await cp(join(packageRoot, "container"), join(actionRoot, "container"), {
+      recursive: true,
+      filter: (path) =>
+        !path.startsWith(join(packageRoot, "container/context")),
+    });
+    await main({
+      ...fixture.env,
+      GITHUB_ACTION_PATH: actionRoot,
+      ACTION_ROOT: actionRoot,
+      INPUT_MODE: "sandbox",
+    });
+    const log = await fixture.log();
+    const image = imageReference(
+      "acme/demo",
+      await imageTagFromFiles(
+        join(actionRoot, "container"),
+        join(fixture.env.GITHUB_WORKSPACE, "swarm-review-source", "bun.lock"),
+      ),
+    );
+    const bundle = log.indexOf(
+      `bun build ${actionRoot}/src/swarm.ts --target bun --outfile ${actionRoot}/container/context/swarm.js`,
+    );
+    expect(bundle).toBeGreaterThanOrEqual(0);
+    expect(bundle).toBeLessThan(log.indexOf(`docker pull ${image}`));
+  });
+
   it("builds and pushes the derived image when pull fails", async () => {
     const fixture = await arrange("acme/demo", false);
     await main({ ...fixture.env, INPUT_MODE: "sandbox" });
@@ -282,7 +318,9 @@ describe("composite action driver", () => {
     );
     expect(log).toContain(`docker push ${image}`);
     expect(log.indexOf(`docker push ${image}`)).toBeLessThan(
-      log.findIndex((line) => line.includes("src/swarm.ts")),
+      log.findIndex((line) =>
+        line.startsWith(`bun ${packageRoot}/src/swarm.ts`),
+      ),
     );
   });
 
@@ -351,9 +389,9 @@ describe("composite action driver", () => {
     expect(log.some((line) => line.includes("repos/acme/demo/issues/42"))).toBe(
       true,
     );
-    expect(log.find((line) => line.includes("src/swarm.ts"))).toContain(
-      "--swarm-id pr-42-123-1",
-    );
+    expect(
+      log.find((line) => line.startsWith(`bun ${packageRoot}/src/swarm.ts`)),
+    ).toContain("--swarm-id pr-42-123-1");
     expect(await fixture.notes()).toEqual({ fork: false });
   });
 
@@ -368,7 +406,9 @@ describe("composite action driver", () => {
     ).rejects.toThrow("docker login exited with code 2");
     const log = await fixture.log();
     expect(log).toContain("docker login ghcr.io -u reviewer --password-stdin");
-    expect(log.some((line) => line.includes("src/swarm.ts"))).toBe(false);
+    expect(
+      log.some((line) => line.startsWith(`bun ${packageRoot}/src/swarm.ts`)),
+    ).toBe(false);
     expect(log.some((line) => line.includes("src/publish.ts"))).toBe(false);
     expect(await fixture.logText()).toContain(
       "gh api repos/acme/demo/issues/42/comments --method POST -f body=",
@@ -391,7 +431,9 @@ describe("composite action driver", () => {
     const log = await fixture.log();
     expect(log.some((line) => line.includes("scripts/deploy.ts"))).toBe(true);
     expect(log.some((line) => line.startsWith("docker push "))).toBe(false);
-    expect(log.some((line) => line.includes("src/swarm.ts"))).toBe(false);
+    expect(
+      log.some((line) => line.startsWith(`bun ${packageRoot}/src/swarm.ts`)),
+    ).toBe(false);
     expect(await fixture.failure()).toEqual({
       stage: "image build",
       message: "docker build exited with code 1",
@@ -419,9 +461,9 @@ describe("composite action driver", () => {
     const fixture = await arrange("contributor/demo", true);
     await main({ ...fixture.env, INPUT_MODE: "sandbox" });
     const log = await fixture.log();
-    expect(log.find((line) => line.includes("src/swarm.ts"))).toContain(
-      " --sandbox --image ",
-    );
+    expect(
+      log.find((line) => line.startsWith(`bun ${packageRoot}/src/swarm.ts`)),
+    ).toContain(" --sandbox --image ");
     expect(await fixture.notes()).toEqual({ fork: false });
     expect(await fixture.logText()).toContain("with `sandbox` lanes");
   });
