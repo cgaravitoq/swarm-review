@@ -16,6 +16,7 @@ export default defineConfig({
     // that file's own `afterEach` removes the scratch a leak would still be
     // writing into.
     sequence: { hooks: "list" },
+    globalSetup: ["src/__tests__/engine-placeholder.ts"],
     setupFiles: ["src/__tests__/setup.ts"],
   },
 });
