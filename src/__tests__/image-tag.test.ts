@@ -1,5 +1,5 @@
 import { createHash } from "node:crypto";
-import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, expect, it } from "vitest";
@@ -48,6 +48,7 @@ describe("sandbox image tag", () => {
     const directory = await mkdtemp(join(tmpdir(), "review-image-choice-"));
     try {
       for (const name of Object.values(IMAGE_SOURCES)) {
+        await mkdir(join(directory, name, ".."), { recursive: true });
         await writeFile(join(directory, name), name);
       }
       const lockfile = join(directory, "bun.lock");
@@ -76,6 +77,7 @@ describe("sandbox image tag", () => {
     const directory = await mkdtemp(join(tmpdir(), "review-image-tag-"));
     try {
       for (const name of Object.values(IMAGE_SOURCES)) {
+        await mkdir(join(directory, name, ".."), { recursive: true });
         await writeFile(join(directory, name), name);
       }
       const lockfile = join(directory, "bun.lock");

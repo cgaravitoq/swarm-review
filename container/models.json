@@ -5,7 +5,7 @@
       "baseUrl": "http://127.0.0.1:8317",
       "models": [
         {
-          "id": "claude-opus-5",
+          "id": "claude-opus-5-5",
           "reasoning": true,
           "input": ["text", "image"],
           "contextWindow": 1000000,
@@ -18,6 +18,14 @@
           }
         }
       ]
+    },
+    "openai-codex": {
+      "modelOverrides": {
+        "gpt-6-luna": {
+          "contextWindow": 272000,
+          "maxTokens": 128000
+        }
+      }
     },
     "opencode-go": {
       "models": [

@@ -34,6 +34,7 @@ vi.mock("cloudflare:workers", () => ({ DurableObject: class {} }));
 const {
   default: handler,
   ReviewSandbox,
+  ReviewJob,
   CredentialVaultObject,
   CodexRelaySandbox,
 } = await import("../../worker");
@@ -43,6 +44,7 @@ const env = {
   REVIEW_SANDBOX: {} as DurableObjectNamespace<
     InstanceType<typeof ReviewSandbox>
   >,
+  REVIEW_JOBS: {} as DurableObjectNamespace<InstanceType<typeof ReviewJob>>,
   CREDENTIAL_VAULT: {} as DurableObjectNamespace<
     InstanceType<typeof CredentialVaultObject>
   >,
@@ -137,6 +139,282 @@ const startBody = (overrides: Record<string, unknown> = {}) =>
 afterEach(() => {
   vi.restoreAllMocks();
   vi.unstubAllGlobals();
+});
+
+describe("cloud reviews", () => {
+  const requestBody = {
+    repository: "acme/demo",
+    pr: 17,
+    head: "a".repeat(40),
+    base: "b".repeat(40),
+    context: "Review the authorization boundary.",
+  };
+
+  const setup = (
+    failure?: "clone" | "engine" | "fingerprint" | "deadline-engine",
+  ) => {
+    const files = new Map<string, string>([
+      [
+        "/opt/review/pi-config/models.json",
+        JSON.stringify({
+          providers: {
+            "cloudflare-workers-ai": {},
+            "openai-codex": {},
+            "claude-code": {},
+          },
+        }),
+      ],
+    ]);
+    const r2 = new Map<string, unknown>();
+    const object = {
+      put: vi.fn(async (key: string, value: string) => {
+        r2.set(key, JSON.parse(value));
+      }),
+      get: vi.fn(async (key: string) =>
+        r2.has(key) ? { json: async () => r2.get(key) } : null,
+      ),
+      head: vi.fn(async (key: string) => (r2.has(key) ? { key } : null)),
+    };
+    const stored = new Map<string, unknown>();
+    const storage = {
+      put: vi.fn(async (key: string, value: unknown) => {
+        stored.set(key, value);
+      }),
+      get: vi.fn(async (key: string) => stored.get(key)),
+      setAlarm: vi.fn(async (_time: number) => undefined),
+    };
+    const sandbox = {
+      mkdir: vi.fn(async () => undefined),
+      writeFile: vi.fn(async (file: string, body: string) => {
+        files.set(file, body);
+      }),
+      putProbeSessions: vi.fn(
+        async (_sessions: Record<string, unknown>) => undefined,
+      ),
+      clearProbeSessions: vi.fn(async () => undefined),
+      destroy: vi.fn(async () => undefined),
+      startProcess: vi.fn(async (_command: string) => {
+        if (failure === "engine") throw new Error("engine failed");
+        if (failure === "deadline-engine") {
+          (stored.get("review") as { deadlineAt: string }).deadlineAt =
+            new Date(Date.now() - 1).toISOString();
+          return { getStatus: vi.fn(async () => "running") };
+        }
+        const directory =
+          [...files.keys()]
+            .find((file) => file.endsWith("/lanes.json"))
+            ?.replace(/\/lanes.json$/, "") ?? "";
+        files.set(
+          `${directory}/out/status.json`,
+          JSON.stringify({
+            phase: "done",
+            reviewers: [],
+            candidates: 0,
+            verified: 0,
+            deadlineAt: "test",
+          }),
+        );
+        files.set(
+          `${directory}/out/receipt.json`,
+          JSON.stringify({
+            swarmId: "test",
+            status: "completed",
+            findings: [],
+          }),
+        );
+        return { getStatus: vi.fn(async () => "completed") };
+      }),
+      exec: vi.fn(async (command: string) => {
+        if (command.includes("sha256sum"))
+          return {
+            stdout: fingerprintStdout(
+              failure === "fingerprint"
+                ? { "/opt/review/swarm.js": "c".repeat(64) }
+                : {},
+            ),
+            exitCode: 0,
+          };
+        if (command.includes(" clone --depth 1"))
+          return { stdout: "", exitCode: failure === "clone" ? 1 : 0 };
+        if (command.startsWith("stat -c")) {
+          const file = command.match(/'([^']+)'/)?.[1] ?? "";
+          return {
+            stdout: files.has(file) ? `${files.get(file)?.length}\n` : "-1\n",
+            exitCode: 0,
+          };
+        }
+        if (command.startsWith("head -c")) {
+          const file = command.match(/'([^']+)'/)?.[1] ?? "";
+          return { stdout: files.get(file) ?? "", exitCode: 0 };
+        }
+        return { stdout: "", exitCode: 0 };
+      }),
+    };
+    const job = new ReviewJob({} as never, {} as never);
+    const reviewEnv = {
+      ...env,
+      WORKERS_AI_API_KEY: "fake-workers-bearer",
+      WORKERS_AI_ACCOUNT_ID: "fake-account",
+      IMAGE_SOURCE_HASHES: JSON.stringify(expectedSources()),
+      PROBE_RESULTS: Object.assign({} as R2Bucket, object),
+      REVIEW_JOBS: Object.assign({} as typeof env.REVIEW_JOBS, {
+        getByName: () => job,
+      }),
+    };
+    Object.assign(job, { ctx: { storage }, env: reviewEnv });
+    getSandbox.mockImplementation(() => sandbox);
+    return { files, r2, object, storage, stored, sandbox, job, reviewEnv };
+  };
+
+  const post = (
+    reviewEnv: ReturnType<typeof setup>["reviewEnv"],
+    body: unknown = requestBody,
+  ) =>
+    handler.fetch(
+      authorized("https://review.invalid/reviews", {
+        method: "POST",
+        body: JSON.stringify(body),
+      }),
+      reviewEnv,
+    );
+
+  it("accepts immediately, runs the engine as uid 1102 with broker handles, and stores R2 state and receipt", async () => {
+    const fixture = setup();
+    const response = await post(fixture.reviewEnv);
+    expect(response.status).toBe(202);
+    const { reviewId } = (await response.json()) as { reviewId: string };
+    expect(fixture.storage.setAlarm).toHaveBeenCalledOnce();
+    expect(fixture.sandbox.exec).not.toHaveBeenCalled();
+    expect(fixture.r2.has(`reviews/${reviewId}/status.json`)).toBe(true);
+    await fixture.job.alarm();
+    const commands = fixture.sandbox.exec.mock.calls.map(
+      ([command]) => command,
+    );
+    expect(commands[0]).toContain("/opt/review/swarm.js");
+    expect(
+      commands.some(
+        (command) =>
+          command.includes("git -c") &&
+          command.includes(" clone --depth 1") &&
+          command.includes("pull/17/head"),
+      ),
+    ).toBe(true);
+    const engine = fixture.sandbox.startProcess.mock.calls[0]?.[0] as string;
+    expect(engine).toContain(
+      `setpriv --reuid=${TARGET_UID} --regid=${TARGET_UID} --clear-groups env -i`,
+    );
+    expect(engine).toContain("'/opt/review/swarm.js' '--hybrid'");
+    expect(engine).toContain(
+      "'--head' 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa'",
+    );
+    const lanes = [...fixture.files.entries()].find(([file]) =>
+      file.endsWith("/lanes.json"),
+    );
+    expect(lanes).toBeDefined();
+    const parsed = JSON.parse(lanes?.[1] ?? "{}") as {
+      reviewers: {
+        family: string;
+        piDir: string;
+        env: Record<string, string>;
+      }[];
+      verifiers: unknown[];
+    };
+    expect(parsed.reviewers.map((lane) => lane.family)).toEqual([
+      "workers-ai",
+      "openai-codex",
+      "claude-code",
+    ]);
+    expect(parsed.verifiers).toHaveLength(3);
+    expect(lanes?.[1]).not.toContain("fake-workers-bearer");
+    expect(parsed.reviewers[0]?.env).toEqual({
+      CLOUDFLARE_ACCOUNT_ID: "fake-account",
+    });
+    expect(fixture.sandbox.putProbeSessions).toHaveBeenCalledOnce();
+    expect(fixture.sandbox.destroy).toHaveBeenCalledOnce();
+    expect(fixture.r2.has(`reviews/${reviewId}/receipt.json`)).toBe(true);
+    const got = await handler.fetch(
+      authorized(`https://review.invalid/reviews/${reviewId}`),
+      fixture.reviewEnv,
+    );
+    expect(await got.json()).toMatchObject({
+      status: { phase: "done" },
+      receipt: { status: "completed" },
+    });
+  });
+
+  it.each(["clone", "engine", "fingerprint"] as const)(
+    "destroys the Sandbox after %s fails",
+    async (failure) => {
+      const fixture = setup(failure);
+      const response = await post(fixture.reviewEnv);
+      const { reviewId } = (await response.json()) as { reviewId: string };
+      await fixture.job.alarm();
+      expect(fixture.sandbox.destroy).toHaveBeenCalledOnce();
+      expect(fixture.r2.get(`reviews/${reviewId}/status.json`)).toMatchObject({
+        phase: "failed",
+      });
+      expect(fixture.r2.get(`reviews/${reviewId}/receipt.json`)).toMatchObject({
+        status: "failed",
+      });
+      if (failure === "fingerprint") {
+        expect(fixture.sandbox.startProcess).not.toHaveBeenCalled();
+        expect(
+          JSON.stringify(fixture.r2.get(`reviews/${reviewId}/receipt.json`)),
+        ).toContain("/opt/review/swarm.js");
+      }
+    },
+  );
+
+  it("cuts an expired review before the engine and records the deadline", async () => {
+    const fixture = setup();
+    const response = await post(fixture.reviewEnv);
+    const { reviewId } = (await response.json()) as { reviewId: string };
+    const review = fixture.stored.get("review") as { deadlineAt: string };
+    review.deadlineAt = new Date(Date.now() - 1).toISOString();
+    await fixture.job.alarm();
+    expect(fixture.sandbox.startProcess).not.toHaveBeenCalled();
+    expect(fixture.sandbox.destroy).toHaveBeenCalledOnce();
+    expect(fixture.r2.get(`reviews/${reviewId}/receipt.json`)).toMatchObject({
+      failure: { stage: "deadline" },
+    });
+  });
+
+  it("cuts a running engine at the deadline and destroys its Sandbox", async () => {
+    const fixture = setup("deadline-engine");
+    const response = await post(fixture.reviewEnv);
+    const { reviewId } = (await response.json()) as { reviewId: string };
+    await fixture.job.alarm();
+    expect(fixture.sandbox.startProcess).toHaveBeenCalledOnce();
+    expect(fixture.sandbox.destroy).toHaveBeenCalledOnce();
+    expect(fixture.r2.get(`reviews/${reviewId}/receipt.json`)).toMatchObject({
+      failure: { stage: "deadline" },
+    });
+  });
+
+  it("refuses a different repository before allocating a job", async () => {
+    const fixture = setup();
+    const response = await post(fixture.reviewEnv, {
+      ...requestBody,
+      repository: "acme/other",
+    });
+    expect(response.status).toBe(403);
+    expect(fixture.storage.setAlarm).not.toHaveBeenCalled();
+    expect(fixture.sandbox.destroy).not.toHaveBeenCalled();
+  });
+
+  it("a retried alarm keeps a stored receipt while destroying its Sandbox", async () => {
+    const fixture = setup();
+    const response = await post(fixture.reviewEnv);
+    const { reviewId } = (await response.json()) as { reviewId: string };
+    fixture.stored.set("state", "running");
+    fixture.r2.set(`reviews/${reviewId}/receipt.json`, { status: "completed" });
+    await fixture.job.alarm();
+    expect(fixture.sandbox.destroy).toHaveBeenCalledOnce();
+    expect(fixture.r2.get(`reviews/${reviewId}/receipt.json`)).toEqual({
+      status: "completed",
+    });
+    expect(fixture.stored.get("state")).toBe("done");
+  });
 });
 
 const PROBE_RUN_ID =
@@ -1714,6 +1992,7 @@ describe("deployed container image", () => {
         "/opt/review/extensions/claude-code-provider.js",
       ],
       ["models.json", "/opt/review/pi-config/models.json"],
+      ["context/swarm.js", "/opt/review/swarm.js"],
       ["model-broker.ts", MODEL_BROKER],
       ["response-seal.ts", "/opt/review/response-seal.ts"],
       ["response-usage.ts", "/opt/review/response-usage.ts"],
@@ -1731,7 +2010,11 @@ describe("deployed container image", () => {
       .filter(Boolean)
       .map((file) => path.relative("container", file));
 
-    expect(tracked.sort()).toEqual(Object.values(IMAGE_SOURCES).sort());
+    expect(tracked.sort()).toEqual(
+      Object.values(IMAGE_SOURCES)
+        .filter((file) => file !== "context/swarm.js")
+        .sort(),
+    );
   });
 
   it("pins what each image installs in its Dockerfile's own bytes", async () => {

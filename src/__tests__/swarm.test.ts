@@ -2571,6 +2571,10 @@ exec /usr/bin/git "$@"
         !path.startsWith(join(packageRoot, "container/context")),
     });
     await mkdir(join(laneContainer, "context"));
+    await cp(
+      join(packageRoot, "container/context/swarm.js"),
+      join(laneContainer, "context/swarm.js"),
+    );
     await writeFile(
       join(laneContainer, "context/bun.lock"),
       '{"lockfileVersion":1}\n',

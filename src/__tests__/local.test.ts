@@ -241,6 +241,10 @@ const stageDriver = async (root: string, lockfile?: string) => {
   if (lockfile !== undefined) {
     await mkdir(join(container, "context"));
     await writeFile(join(container, "context/bun.lock"), lockfile);
+    await cp(
+      join(packageRoot, "container/context/swarm.js"),
+      join(container, "context/swarm.js"),
+    );
   }
   return { script: join(driver, "src/local.ts"), container };
 };

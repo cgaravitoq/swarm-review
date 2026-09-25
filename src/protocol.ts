@@ -1,6 +1,7 @@
 const RUN_ROOT = "/workspace/runs";
 
 export const REVIEW_RUNNER = "/opt/review/review-run.sh";
+export const REVIEW_ENGINE = "/opt/review/swarm.js";
 
 /**
  * Every file in `container/` the image is built from: container path to
@@ -17,6 +18,7 @@ export const IMAGE_SOURCES = {
   "/opt/review/response-usage.ts": "response-usage.ts",
   "/opt/review/extensions/claude-code-provider.js": "claude-code-provider.js",
   "/opt/review/pi-config/models.json": "models.json",
+  [REVIEW_ENGINE]: "context/swarm.js",
   "/opt/review/Dockerfile": "Dockerfile",
 } satisfies Readonly<Record<string, string>>;
 

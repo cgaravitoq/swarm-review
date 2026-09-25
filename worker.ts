@@ -54,6 +54,7 @@ import {
   MAX_ARTIFACT_BYTES,
   parseExpectedSources,
   parseSourceFingerprint,
+  REVIEW_ENGINE,
   REVIEW_RUNNER,
   runDir,
   sourceFingerprintCommand,
@@ -65,6 +66,61 @@ const MODEL_SESSION_KEY = "modelSession";
 const PROBE_SESSIONS_KEY = "probeSessions";
 const MODEL_SEALS_KEY = "modelSeals";
 const COMMAND_SEQUENCE_KEY = "commandSequence";
+const REVIEW_DEADLINE_MS = 8 * 60_000;
+const REVIEW_FAMILIES = {
+  "workers-ai": {
+    provider: "cloudflare-workers-ai",
+    model: "@cf/deepseek-ai/deepseek-v4-flash-0731",
+  },
+  "openai-codex": { provider: "openai-codex", model: "gpt-6-luna" },
+  "claude-code": { provider: "claude-code", model: "claude-opus-5-5" },
+} as const;
+
+type CloudReview = {
+  reviewId: string;
+  repository: string;
+  pr: number;
+  head: string;
+  base: string;
+  context?: string;
+  origin: string;
+  deadlineAt: string;
+};
+
+export class ReviewJob extends DurableObject<ReviewPiEnv> {
+  async start(review: CloudReview) {
+    await this.ctx.storage.put("review", review);
+    await this.ctx.storage.setAlarm(Date.now());
+  }
+
+  override async alarm() {
+    const review = await this.ctx.storage.get<CloudReview>("review");
+    if (!review) return;
+    const state = await this.ctx.storage.get<string>("state");
+    if (state === "done") return;
+    if (state === "running") {
+      const shutdown = await destroySandbox(
+        getSandbox(this.env.REVIEW_SANDBOX, review.reviewId),
+      );
+      const receipt = await this.env.PROBE_RESULTS.head(
+        reviewKey(review.reviewId, "receipt"),
+      );
+      if (!shutdown.acknowledged || !receipt) {
+        await finishReview(
+          this.env,
+          review,
+          shutdown.acknowledged ? "interrupted" : "destroy_failed",
+          null,
+        );
+      }
+      await this.ctx.storage.put("state", "done");
+      return;
+    }
+    await this.ctx.storage.put("state", "running");
+    await runCloudReview(this.env, review);
+    await this.ctx.storage.put("state", "done");
+  }
+}
 
 export class CredentialVaultObject extends DurableObject<unknown> {
   private readonly vault: CredentialVault;
@@ -231,9 +287,13 @@ type ReviewPiEnv = Record<
   Record<"CREDENTIAL_VAULT", DurableObjectNamespace<CredentialVaultObject>> &
   Record<"CODEX_RELAY", DurableObjectNamespace<CodexRelaySandbox>> &
   Record<"PROBE_RESULTS", R2Bucket> &
+  Record<"REVIEW_JOBS", DurableObjectNamespace<ReviewJob>> &
   Record<"CONTROL_SECRET" | "GITHUB_READ_TOKEN", string> & {
     /** https clone URL the run's containers fetch through the Git proxy. */
     TARGET_REPOSITORY?: string;
+    IMAGE_SOURCE_HASHES?: string;
+    WORKERS_AI_API_KEY?: string;
+    WORKERS_AI_ACCOUNT_ID?: string;
   };
 
 const ARTIFACTS = [
@@ -444,6 +504,322 @@ const parsePiSummary = (stdout: string) => {
     return null;
   }
 };
+
+const reviewKey = (reviewId: string, name: string) =>
+  `reviews/${reviewId}/${name}.json`;
+
+const putReviewJson = (
+  env: ReviewPiEnv,
+  reviewId: string,
+  name: string,
+  value: unknown,
+) =>
+  env.PROBE_RESULTS.put(reviewKey(reviewId, name), JSON.stringify(value), {
+    httpMetadata: { contentType: "application/json" },
+  });
+
+const failedReviewStatus = (review: CloudReview, reason: string) => ({
+  phase: "failed",
+  reviewers: Object.entries(REVIEW_FAMILIES).map(([family, { model }]) => ({
+    family,
+    model,
+    state: "unobserved",
+  })),
+  candidates: 0,
+  verified: 0,
+  deadlineAt: review.deadlineAt,
+  reason,
+});
+
+async function finishReview(
+  env: ReviewPiEnv,
+  review: CloudReview,
+  reason: string,
+  receipt: unknown,
+) {
+  await putReviewJson(
+    env,
+    review.reviewId,
+    "status",
+    failedReviewStatus(review, reason),
+  );
+  await putReviewJson(env, review.reviewId, "receipt", {
+    ...(typeof receipt === "object" && receipt !== null
+      ? receipt
+      : {
+          swarmId: review.reviewId,
+          requested: {
+            head: review.head,
+            base: review.base,
+            pullRequest: review.pr,
+          },
+          findings: [],
+        }),
+    status: "failed",
+    failure: {
+      stage: reason === "deadline" ? "deadline" : "cloud_review",
+      message: reason,
+    },
+  });
+}
+
+const reviewRemaining = (review: CloudReview) => {
+  const remaining = Date.parse(review.deadlineAt) - Date.now();
+  if (remaining <= 0) throw new Error("deadline");
+  return remaining;
+};
+
+const reviewStep = <T>(review: CloudReview, label: string, work: Promise<T>) =>
+  bounded(label, work, Math.min(reviewRemaining(review), RPC_TIMEOUT_MS));
+
+async function runCloudReview(env: ReviewPiEnv, review: CloudReview) {
+  const sandbox = getSandbox(env.REVIEW_SANDBOX, review.reviewId);
+  const directory = runDir(review.reviewId);
+  let reason: string | null = null;
+  let receipt: Record<string, unknown> | null = null;
+  try {
+    reviewRemaining(review);
+    if (!env.WORKERS_AI_API_KEY || !env.WORKERS_AI_ACCOUNT_ID) {
+      throw new Error("credential_unconfigured");
+    }
+    const expected = parseExpectedSources(
+      JSON.parse(env.IMAGE_SOURCE_HASHES ?? "null"),
+    );
+    const fingerprint = await reviewStep(
+      review,
+      "review fingerprint",
+      sandbox.exec(sourceFingerprintCommand()),
+    );
+    const mismatch = firstSourceMismatch(
+      expected,
+      parseSourceFingerprint(fingerprint.stdout).sources,
+    );
+    if (mismatch) throw new Error(sourceMismatchDetail(mismatch));
+
+    await reviewStep(
+      review,
+      "review directory",
+      sandbox.mkdir(directory, { recursive: true }),
+    );
+    await reviewStep(
+      review,
+      "review ownership",
+      sandbox.exec(targetChownCommand(directory)),
+    );
+    const remote = `${review.origin}/git/${await gitCapability(review.reviewId, env.CONTROL_SECRET)}`;
+    const gitHeader = posixQuote(
+      `http.extraHeader=x-review-run: ${review.reviewId}`,
+    );
+    const clone = `${directory}/clone`;
+    const cloneCommand = `${asTarget} git -c ${gitHeader} clone --depth 1 --no-tags --quiet ${posixQuote(remote)} ${posixQuote(clone)} && cd ${posixQuote(clone)} && ${asTarget} git -c ${gitHeader} fetch --depth 1 origin ${posixQuote(`pull/${review.pr}/head`)} && ${asTarget} git checkout --quiet --detach ${posixQuote(review.head)} && test "$(${asTarget} git rev-parse HEAD)" = ${posixQuote(review.head)} && ${asTarget} git -c ${gitHeader} fetch --depth 1 origin ${posixQuote(review.base)}`;
+    const cloned = await reviewStep(
+      review,
+      "review clone",
+      sandbox.exec(cloneCommand),
+    );
+    if (cloned.exitCode !== 0) throw new Error("clone_failed");
+
+    const laneModels = await readArtifact(sandbox, PI_MODELS_PATH);
+    if (!laneModels.exists || laneModels.truncated)
+      throw new Error("models_unavailable");
+    const capability = await modelCapability(
+      review.reviewId,
+      env.CONTROL_SECRET,
+    );
+    const baseUrl = modelProxyBaseUrl(
+      review.origin,
+      review.reviewId,
+      capability,
+    );
+    const handles = Object.fromEntries(
+      Object.keys(REVIEW_FAMILIES).flatMap((family) => [
+        [
+          `${family}-reviewer`,
+          family === "openai-codex"
+            ? openaiCodexBrokerHandle(crypto.randomUUID())
+            : `review-pi-${crypto.randomUUID()}`,
+        ],
+        [
+          `${family}-verifier`,
+          family === "openai-codex"
+            ? openaiCodexBrokerHandle(crypto.randomUUID())
+            : `review-pi-${crypto.randomUUID()}`,
+        ],
+      ]),
+    );
+    const sessions: Record<string, ModelSession> = {};
+    type ReviewLane = {
+      family: string;
+      provider: string;
+      model: string;
+      piDir: string;
+      extensions: string[];
+      env: Record<string, string | undefined>;
+    };
+    const reviewers: ReviewLane[] = [];
+    const verifiers: ReviewLane[] = [];
+    for (const [family, { provider, model }] of Object.entries(
+      REVIEW_FAMILIES,
+    )) {
+      for (const role of ["reviewer", "verifier"] as const) {
+        const handle = handles[`${family}-${role}`];
+        if (!handle) throw new Error("missing_handle");
+        sessions[handle] = {
+          handle,
+          upstreamBaseUrl:
+            family === "workers-ai"
+              ? `https://api.cloudflare.com/client/v4/accounts/${env.WORKERS_AI_ACCOUNT_ID}/ai/v1`
+              : family === "openai-codex"
+                ? "https://chatgpt.com/backend-api"
+                : "https://api.anthropic.com",
+          ...(family === "workers-ai"
+            ? { upstreamAuthorization: `Bearer ${env.WORKERS_AI_API_KEY}` }
+            : { credentialProvider: family }),
+          caps: { ...SESSION_CAPS.t1b },
+          totals: emptyModelTotals(),
+        };
+        const piDir = `${directory}/pi-${family}-${role}`;
+        await reviewStep(
+          review,
+          "review pi directory",
+          sandbox.mkdir(piDir, { recursive: true }),
+        );
+        await reviewStep(
+          review,
+          "review models",
+          sandbox.writeFile(
+            `${piDir}/models.json`,
+            modelsJsonForProxy(laneModels.content, provider, handle, baseUrl),
+          ),
+        );
+        await reviewStep(
+          review,
+          "review settings",
+          sandbox.writeFile(`${piDir}/settings.json`, PI_PROBE_SETTINGS),
+        );
+        const lane = {
+          family,
+          provider,
+          model,
+          piDir,
+          extensions: family === "claude-code" ? [CLAUDE_CODE_EXTENSION] : [],
+          env:
+            family === "workers-ai"
+              ? { CLOUDFLARE_ACCOUNT_ID: env.WORKERS_AI_ACCOUNT_ID }
+              : {},
+        };
+        (role === "reviewer" ? reviewers : verifiers).push(lane);
+      }
+    }
+    await reviewStep(
+      review,
+      "review sessions",
+      sandbox.putProbeSessions(sessions),
+    );
+    await reviewStep(
+      review,
+      "review lanes",
+      sandbox.writeFile(
+        `${directory}/lanes.json`,
+        JSON.stringify({ reviewers, verifiers }),
+      ),
+    );
+    if (review.context)
+      await reviewStep(
+        review,
+        "review context",
+        sandbox.writeFile(`${directory}/context.txt`, review.context),
+      );
+    await reviewStep(
+      review,
+      "review ownership",
+      sandbox.exec(targetChownCommand(directory)),
+    );
+
+    const args = [
+      REVIEW_ENGINE,
+      "--hybrid",
+      "--repo",
+      review.repository,
+      "--source",
+      clone,
+      "--pr",
+      String(review.pr),
+      "--head",
+      review.head,
+      "--base",
+      review.base,
+      "--lanes",
+      `${directory}/lanes.json`,
+      "--total-timeout",
+      String(Math.max(1, Math.floor(reviewRemaining(review) / 1000))),
+      "--out",
+      `${directory}/out`,
+    ];
+    if (review.context) args.push("--context", `${directory}/context.txt`);
+    const command = `cd ${posixQuote(clone)} && ${asTarget} env -i HOME=/home/review-target PATH=/usr/local/bun/bin:/usr/local/bin:/usr/bin:/bin bun ${args.map(posixQuote).join(" ")}`;
+    const process = await reviewStep(
+      review,
+      "review engine",
+      sandbox.startProcess(command, { autoCleanup: false }),
+    );
+    let terminalStatus = "running";
+    for (;;) {
+      const status = await reviewStep(
+        review,
+        "review engine status",
+        process.getStatus(),
+      );
+      const statusFile = await readArtifact(
+        sandbox,
+        `${directory}/out/status.json`,
+      );
+      if (statusFile.exists && !statusFile.truncated) {
+        await putReviewJson(
+          env,
+          review.reviewId,
+          "status",
+          JSON.parse(statusFile.content),
+        );
+      }
+      if (status !== "running" && status !== "starting") {
+        terminalStatus = status;
+        break;
+      }
+      await new Promise((wake) =>
+        setTimeout(wake, Math.min(5_000, reviewRemaining(review))),
+      );
+    }
+    if (terminalStatus !== "completed") throw new Error("engine_failed");
+    const finalStatus = await readArtifact(
+      sandbox,
+      `${directory}/out/status.json`,
+    );
+    if (!finalStatus.exists || finalStatus.truncated)
+      throw new Error("status_unavailable");
+    await putReviewJson(
+      env,
+      review.reviewId,
+      "status",
+      JSON.parse(finalStatus.content),
+    );
+    const output = await readArtifact(sandbox, `${directory}/out/receipt.json`);
+    if (!output.exists || output.truncated)
+      throw new Error("receipt_unavailable");
+    receipt = JSON.parse(output.content);
+    await putReviewJson(env, review.reviewId, "receipt", receipt);
+  } catch (error) {
+    reason =
+      Date.now() >= Date.parse(review.deadlineAt)
+        ? "deadline"
+        : messageOf(error);
+  } finally {
+    await sandbox.clearProbeSessions().catch(() => undefined);
+    const shutdown = await destroySandbox(sandbox);
+    if (!shutdown.acknowledged) reason = `destroy_failed: ${shutdown.error}`;
+    if (reason) await finishReview(env, review, reason, receipt);
+  }
+}
 
 async function operatorProbe(
   request: Request,
@@ -848,6 +1224,102 @@ export default {
       request.method === "POST"
     ) {
       return operatorProbe(request, env, url.origin);
+    }
+
+    if (
+      segments[0] === "reviews" &&
+      request.method === "POST" &&
+      segments.length === 1
+    ) {
+      if (!env.TARGET_REPOSITORY)
+        return json({ error: "target_repository_unset" }, 400);
+      if (
+        !env.WORKERS_AI_API_KEY ||
+        !env.WORKERS_AI_ACCOUNT_ID ||
+        !/^[a-zA-Z0-9_-]+$/.test(env.WORKERS_AI_ACCOUNT_ID) ||
+        !env.IMAGE_SOURCE_HASHES
+      )
+        return json({ error: "review_unconfigured" }, 400);
+      let input: Record<string, unknown>;
+      try {
+        const parsed: unknown = await request.json();
+        if (
+          typeof parsed !== "object" ||
+          parsed === null ||
+          Array.isArray(parsed)
+        )
+          throw new Error();
+        input = parsed as Record<string, unknown>;
+        parseExpectedSources(JSON.parse(env.IMAGE_SOURCE_HASHES));
+        const repository = input["repository"];
+        const configured = new URL(env.TARGET_REPOSITORY).pathname
+          .replace(/^\//, "")
+          .replace(/\.git$/, "");
+        if (
+          typeof repository !== "string" ||
+          !/^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/.test(repository) ||
+          repository.toLowerCase() !== configured.toLowerCase()
+        )
+          return json({ error: "repository_mismatch" }, 403);
+        if (
+          !Number.isSafeInteger(input["pr"]) ||
+          Number(input["pr"]) <= 0 ||
+          typeof input["head"] !== "string" ||
+          !/^[0-9a-f]{40}$/.test(input["head"]) ||
+          typeof input["base"] !== "string" ||
+          !/^[0-9a-f]{40}$/.test(input["base"]) ||
+          (input["context"] !== undefined &&
+            (typeof input["context"] !== "string" ||
+              input["context"].length > 64_000))
+        )
+          throw new Error();
+      } catch {
+        return json({ error: "invalid_review" }, 400);
+      }
+      const reviewId = assertCloudRunId(`review-${crypto.randomUUID()}`);
+      const review: CloudReview = {
+        reviewId,
+        repository: input["repository"] as string,
+        pr: input["pr"] as number,
+        head: input["head"] as string,
+        base: input["base"] as string,
+        ...(typeof input["context"] === "string"
+          ? { context: input["context"] }
+          : {}),
+        origin: url.origin,
+        deadlineAt: new Date(Date.now() + REVIEW_DEADLINE_MS).toISOString(),
+      };
+      await putReviewJson(env, reviewId, "status", {
+        phase: "reviewing",
+        reviewers: [],
+        candidates: 0,
+        verified: 0,
+        deadlineAt: review.deadlineAt,
+      });
+      await env.REVIEW_JOBS.getByName(reviewId).start(review);
+      return json({ reviewId }, 202);
+    }
+
+    if (
+      segments[0] === "reviews" &&
+      request.method === "GET" &&
+      segments.length === 2
+    ) {
+      let reviewId: string;
+      try {
+        reviewId = assertCloudRunId(segments[1] ?? "");
+      } catch {
+        return json({ error: "not_found" }, 404);
+      }
+      const status = await env.PROBE_RESULTS.get(reviewKey(reviewId, "status"));
+      if (!status) return json({ error: "not_found" }, 404);
+      const receipt = await env.PROBE_RESULTS.get(
+        reviewKey(reviewId, "receipt"),
+      );
+      return json({
+        status: await status.json(),
+        ...(receipt ? { receipt: await receipt.json() } : {}),
+      });
     }
 
     if (segments[0] === "credentials") {
