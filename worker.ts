@@ -132,7 +132,14 @@ type AppReview = {
 const SUPERSEDED_SUMMARY = "A newer pull request event superseded this review.";
 
 const refusedForGood = (error: unknown) =>
-  error instanceof GitHubRequestError && [403, 404, 422].includes(error.status);
+  error instanceof GitHubRequestError &&
+  error.retryAt === null &&
+  [403, 404, 422].includes(error.status);
+
+const retryAfter = (error: unknown) =>
+  error instanceof GitHubRequestError && error.retryAt !== null
+    ? error.retryAt
+    : true;
 
 export class PullRequestReview extends DurableObject<ReviewPiEnv> {
   async accept(event: PullRequestEvent, delivery: string, origin: string) {
@@ -172,19 +179,26 @@ export class PullRequestReview extends DurableObject<ReviewPiEnv> {
   }
 
   override async alarm() {
-    let retry = false;
+    let wakeAt = 0;
     for (const step of [
       () => this.retireSuperseded(),
       () => this.offerReviews(),
       () => this.advance(),
     ]) {
+      let retry: boolean | number;
       try {
-        retry = (await step()) || retry;
-      } catch {
-        retry = true;
+        retry = await step();
+      } catch (error) {
+        retry = retryAfter(error);
       }
+      if (retry !== false)
+        wakeAt = Math.max(
+          wakeAt,
+          Date.now() + 15_000,
+          retry === true ? 0 : retry,
+        );
     }
-    if (retry) await this.ctx.storage.setAlarm(Date.now() + 15_000);
+    if (wakeAt) await this.ctx.storage.setAlarm(wakeAt);
   }
 
   private token(event: PullRequestEvent) {
@@ -252,7 +266,7 @@ export class PullRequestReview extends DurableObject<ReviewPiEnv> {
     return left.length > 0;
   }
 
-  private async advance() {
+  private async advance(): Promise<boolean | number> {
     const state = await this.ctx.storage.get<AppReview>("current");
     if (!state || state.phase === "done") return false;
     try {
@@ -319,7 +333,18 @@ export class PullRequestReview extends DurableObject<ReviewPiEnv> {
         state.phase = "publishing";
         if (!(await this.save(state))) return false;
       }
-      const receipt = await receiptObject!.json<SwarmReceipt>();
+      const receipt = await receiptObject!
+        .json<SwarmReceipt | null>()
+        .catch(() => null);
+      if (typeof receipt !== "object" || receipt === null) {
+        await this.finish(
+          token,
+          state,
+          "neutral",
+          "Review not published: the receipt is not a JSON object.",
+        );
+        return false;
+      }
       if (receipt.status !== "completed" && receipt.status !== "partial") {
         await this.finish(
           token,
@@ -333,10 +358,26 @@ export class PullRequestReview extends DurableObject<ReviewPiEnv> {
       if (published) await this.finish(token, state, ...published);
       return false;
     } catch (error) {
-      if (!refusedForGood(error)) return true;
-      state.phase = "done";
-      state.outcome = messageOf(error);
-      await this.save(state);
+      if (!refusedForGood(error)) return retryAfter(error);
+      if (state.checkRunId === null) {
+        state.phase = "done";
+        state.outcome = messageOf(error);
+        await this.save(state);
+        return false;
+      }
+      try {
+        await this.finish(
+          await this.token(state.event),
+          state,
+          "neutral",
+          `Review could not complete: ${messageOf(error)}.`,
+        );
+      } catch (completion) {
+        if (!refusedForGood(completion)) return retryAfter(completion);
+        state.phase = "done";
+        state.outcome = messageOf(error);
+        await this.save(state);
+      }
       return false;
     }
   }
@@ -348,8 +389,17 @@ export class PullRequestReview extends DurableObject<ReviewPiEnv> {
   ): Promise<["success" | "neutral", string] | null> {
     const { repository, number } = state.event;
     const expected = { head: state.event.head, mergeBase: state.mergeBase! };
+    let confirmed: number;
     try {
       assertPublishableReceipt(receipt, expected);
+      buildReview(receipt, new Map(), repository);
+      confirmed = receipt.findings.filter(
+        (finding) => finding.status === "confirmed",
+      ).length;
+    } catch (error) {
+      return ["neutral", `Review not published: ${messageOf(error)}.`];
+    }
+    try {
       const validated = await revalidatePullRequest(
         repository,
         number,
@@ -357,9 +407,6 @@ export class PullRequestReview extends DurableObject<ReviewPiEnv> {
         expected,
         true,
       );
-      const confirmed = receipt.findings.filter(
-        (finding) => finding.status === "confirmed",
-      ).length;
       const summary = `Review published at ${expected.head.slice(0, 7)}. ${confirmed} confirmed finding(s).`;
       if (alreadyPublished(validated.reviews, receipt.swarmId, expected.head))
         return ["success", summary];

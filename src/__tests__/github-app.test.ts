@@ -783,6 +783,142 @@ describe("App review publication", () => {
     expect(storage.setAlarm).not.toHaveBeenCalled();
   });
 
+  it("retries a rate-limited review POST at the reset GitHub names", async () => {
+    const { r2, pr, stored, storage, started } = fixture();
+    let limited = 1;
+    const gh = github({
+      routes: {
+        [`POST ${API}/pulls/7/reviews`]: () =>
+          limited-- > 0
+            ? new Response("API rate limit exceeded", {
+                status: 403,
+                headers: {
+                  "x-ratelimit-remaining": "0",
+                  "x-ratelimit-reset": "4102444800",
+                },
+              })
+            : undefined,
+      },
+    });
+    const reviewId = await started();
+    r2.set(`reviews/${reviewId}/receipt.json`, receipt);
+    storage.setAlarm.mockClear();
+    await pr.alarm();
+    expect(gh.checks()).toEqual([]);
+    expect(stored.get("current")).toMatchObject({ phase: "publishing" });
+    expect(storage.setAlarm).toHaveBeenCalledExactlyOnceWith(4_102_444_800_000);
+    await pr.alarm();
+    expect(gh.reviews).toHaveLength(1);
+    expect(gh.checks()).toEqual([
+      expect.objectContaining({ conclusion: "success" }),
+    ]);
+  });
+
+  it("ends the check with the reason of a plain 403 on the review POST", async () => {
+    const { r2, pr, stored, storage, started } = fixture();
+    const gh = github({
+      routes: {
+        [`POST ${API}/pulls/7/reviews`]: () =>
+          new Response("Resource not accessible by integration", {
+            status: 403,
+          }),
+      },
+    });
+    const reviewId = await started();
+    r2.set(`reviews/${reviewId}/receipt.json`, receipt);
+    storage.setAlarm.mockClear();
+    await pr.alarm();
+    const summary =
+      "Review not published: GitHub review request failed: 403: Resource not accessible by integration.";
+    expect(gh.checks()).toEqual([
+      expect.objectContaining({
+        url: `${API}/check-runs/99`,
+        status: "completed",
+        conclusion: "neutral",
+        output: { title: "Swarm review could not complete", summary },
+      }),
+    ]);
+    expect(stored.get("current")).toMatchObject({
+      phase: "done",
+      outcome: summary,
+    });
+    expect(storage.setAlarm).not.toHaveBeenCalled();
+  });
+
+  it("completes the check of a generation GitHub ends for good after creating it", async () => {
+    const { pr, stored, storage } = fixture();
+    const gh = github({
+      routes: {
+        [`GET ${API}/compare/${BASE}...${HEAD}`]: () =>
+          new Response("Not Found", { status: 404 }),
+      },
+    });
+    await pr.accept(
+      {
+        repository: "acme/demo",
+        number: 7,
+        head: HEAD,
+        base: BASE,
+        installationId: 42,
+      },
+      "62345678-1234-1234-1234-123456789abc",
+      "https://review.invalid",
+    );
+    storage.setAlarm.mockClear();
+    await pr.alarm();
+    const summary =
+      "Review could not complete: GitHub three-dot compare failed: 404.";
+    expect(gh.checks()).toEqual([
+      expect.objectContaining({
+        url: `${API}/check-runs/99`,
+        status: "completed",
+        conclusion: "neutral",
+        output: { title: "Swarm review could not complete", summary },
+      }),
+    ]);
+    expect(stored.get("current")).toMatchObject({
+      phase: "done",
+      outcome: summary,
+    });
+    expect(storage.setAlarm).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    [
+      "no findings array",
+      { ...receipt, findings: undefined },
+      /^Review not published: .+\.$/,
+    ],
+    [
+      "a null receipt",
+      null,
+      /^Review not published: the receipt is not a JSON object\.$/,
+    ],
+  ])(
+    "ends the check of a receipt with %s instead of retrying",
+    async (_name, malformed, summary) => {
+      const { r2, pr, stored, storage, started } = fixture();
+      const gh = github();
+      const reviewId = await started();
+      r2.set(`reviews/${reviewId}/receipt.json`, malformed);
+      storage.setAlarm.mockClear();
+      await pr.alarm();
+      expect(gh.posts()).toEqual([]);
+      expect(gh.checks()).toEqual([
+        expect.objectContaining({
+          url: `${API}/check-runs/99`,
+          conclusion: "neutral",
+          output: {
+            title: "Swarm review could not complete",
+            summary: expect.stringMatching(summary),
+          },
+        }),
+      ]);
+      expect(stored.get("current")).toMatchObject({ phase: "done" });
+      expect(storage.setAlarm).not.toHaveBeenCalled();
+    },
+  );
+
   it("drops a superseded check GitHub refuses for good without blocking the next generation", async () => {
     const { pr, stored, storage, started } = fixture();
     const gh = github({
