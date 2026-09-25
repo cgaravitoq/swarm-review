@@ -443,11 +443,13 @@ export async function proxyModelFetch(
   const usage = usageReader({ lineChars: WORKER_SSE_LINE_CHARS });
   const reader = upstream.body.getReader();
   let recorded: Promise<void> | undefined;
-  const finish = (complete: boolean) => {
+  const finish = (complete: boolean, cancelled = false) => {
     const reported = usage.read();
     recorded ??= recordAttempt(
       runId,
-      complete || usage.closed() ? reported : { input: null, output: null },
+      complete || (!cancelled && usage.closed())
+        ? reported
+        : { input: null, output: null },
       retryable,
       complete ? sealer.seal() : null,
       handle,
@@ -473,7 +475,7 @@ export async function proxyModelFetch(
         controller.enqueue(value);
       } catch (error) {
         try {
-          await finish(false);
+          await finish(sealer.terminal());
         } finally {
           controller.error(error);
         }
@@ -481,7 +483,7 @@ export async function proxyModelFetch(
     },
     async cancel(reason) {
       try {
-        await finish(false);
+        await finish(sealer.terminal(), true);
       } finally {
         await reader.cancel(reason);
       }
