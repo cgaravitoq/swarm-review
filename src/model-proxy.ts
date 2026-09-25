@@ -81,6 +81,21 @@ export async function modelCapability(runId: string, secret: string) {
   return hex(digest);
 }
 
+export const OPENAI_CODEX_JWT_CLAIM = "https://api.openai.com/auth";
+const OPENAI_CODEX_HANDLE_ACCOUNT_ID = "review-pi";
+
+const jwtSegment = (value: unknown) => btoa(JSON.stringify(value));
+
+/** Pi's openai-codex adapter parses chatgpt_account_id from a three-part JWT apiKey. */
+export function openaiCodexBrokerHandle(nonce: string) {
+  return `${jwtSegment({ alg: "none", typ: "JWT" })}.${jwtSegment({
+    [OPENAI_CODEX_JWT_CLAIM]: {
+      chatgpt_account_id: OPENAI_CODEX_HANDLE_ACCOUNT_ID,
+    },
+    jti: nonce,
+  })}.${nonce}`;
+}
+
 export function modelProxyBaseUrl(
   origin: string,
   runId: string,
