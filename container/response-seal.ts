@@ -148,6 +148,7 @@ export const responseSealer = ({
   const responseItems = new Set<number>();
   let responseItem: number | null = null;
   let answered = false;
+  let terminal = false;
 
   const hashAnswer = (text: string) => {
     hash.update(text, "utf8");
@@ -168,7 +169,11 @@ export const responseSealer = ({
     }
     if (!line.startsWith("data:")) return true;
     const payload = line.slice(5).replace(/^ /, "");
-    if (payload === "" || payload === "[DONE]") return true;
+    if (payload === "") return true;
+    if (payload === "[DONE]") {
+      if (family === "chat") terminal = true;
+      return true;
+    }
     let parsed: unknown;
     try {
       parsed = JSON.parse(payload);
@@ -191,6 +196,7 @@ export const responseSealer = ({
     if (type.startsWith("response.")) {
       if (family !== null && family !== "responses") return false;
       family = "responses";
+      if (type === "response.completed") terminal = true;
       if (
         type !== "response.output_text.delta" &&
         type !== "response.refusal.delta"
@@ -213,6 +219,7 @@ export const responseSealer = ({
     if (!ANTHROPIC_EVENTS.has(type)) return true;
     if (family !== null && family !== "anthropic") return false;
     family = "anthropic";
+    if (type === "message_stop") terminal = true;
     if (type === "content_block_start") {
       const index = record["index"];
       if (!isStreamIndex(index) || anthropicBlocks.has(index)) return false;
@@ -265,6 +272,7 @@ export const responseSealer = ({
       }
     },
     tail: () => tail,
+    terminal: () => mode === "sse" && terminal,
     seal(): string | null {
       if (mode === "json") {
         const text =
