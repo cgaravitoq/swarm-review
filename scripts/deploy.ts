@@ -4,7 +4,11 @@ import { cp, glob, mkdir, readFile, rm, stat } from "node:fs/promises";
 import { dirname, join, relative, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import ts from "typescript";
-import { imageReference, imageTagFromFiles } from "../src/image-tag";
+import {
+  engineBundle,
+  imageReference,
+  imageTagFromFiles,
+} from "../src/image-tag";
 import { IMAGE_SOURCES } from "../src/protocol";
 
 const packageRoot = join(dirname(fileURLToPath(import.meta.url)), "..");
@@ -119,18 +123,14 @@ const materialize = async (checkout: string) => {
     });
   }
   await new Promise<void>((resolvePromise, reject) => {
-    const bundle = spawn(
-      "bun",
-      [
-        "build",
-        join(packageRoot, "src/swarm.ts"),
-        "--target",
-        "bun",
-        "--outfile",
-        join(contextDir, "swarm.js"),
-      ],
-      { cwd: packageRoot, stdio: ["ignore", "ignore", "pipe"] },
+    const { args, cwd } = engineBundle(
+      packageRoot,
+      join(contextDir, "swarm.js"),
     );
+    const bundle = spawn("bun", args, {
+      cwd,
+      stdio: ["ignore", "ignore", "pipe"],
+    });
     let error = "";
     bundle.stderr.on("data", (chunk: Buffer) => {
       error += chunk.toString();
