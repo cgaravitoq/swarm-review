@@ -1,12 +1,12 @@
+import { markRelayRefusal } from "./codex-relay-refusal";
+
+export { relayRefusalReason } from "./codex-relay-refusal";
+
 export const CODEX_RELAY_ID = "swarm-review-codex-egress";
 export const CODEX_RELAY_PORT = 3211;
 export const CODEX_UPSTREAM = "https://chatgpt.com/backend-api/codex/responses";
 const CODEX_RELAY_COMMAND = "/usr/local/bun/bin/bun /opt/relay/server.ts";
 const CODEX_RELAY_READY_MS = 30_000;
-const refusals = new WeakMap<Response, string>();
-
-export const relayRefusalReason = (response: Response) =>
-  refusals.get(response) ?? null;
 
 type SandboxSdk = typeof import("@cloudflare/sandbox");
 type RelayNamespace = Parameters<SandboxSdk["getSandbox"]>[0];
@@ -46,7 +46,7 @@ export function createCodexRelayTransport(
   return async (input, init) => {
     if (String(input) !== CODEX_UPSTREAM || init?.method !== "POST") {
       const response = new Response(null, { status: 404 });
-      refusals.set(response, "codex_relay_non_post");
+      markRelayRefusal(response, "codex_relay_non_post");
       return response;
     }
     try {

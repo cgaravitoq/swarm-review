@@ -43,6 +43,7 @@ import {
   type ModelCanary,
   writeFastLaneArtifacts,
 } from "./fast-review";
+import { runHybrid } from "./hybrid";
 import { laneImageReference } from "./image-tag";
 import { BROKER_LEDGER } from "./isolation";
 import {
@@ -3717,5 +3718,6 @@ async function main() {
 }
 
 if (import.meta.main) {
-  await main();
+  if (process.argv.includes("--hybrid")) await runHybrid(process.argv.slice(2));
+  else await main();
 }
