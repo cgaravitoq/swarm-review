@@ -362,7 +362,6 @@ async function operatorProbe(
   if (!env.TARGET_REPOSITORY) {
     return json({ error: "target_repository_unset" }, 400);
   }
-  let runId: string;
   let expectedSources: Record<string, string>;
   let accountId: string;
   let workersBearer: string;
@@ -371,8 +370,6 @@ async function operatorProbe(
     if (typeof input !== "object" || input === null || Array.isArray(input))
       throw new Error();
     const body = input as Record<string, unknown>;
-    if (typeof body["runId"] !== "string") throw new Error();
-    runId = assertCloudRunId(body["runId"]);
     expectedSources = parseExpectedSources(body["expectedSources"]);
     const workers = body["workersAi"];
     if (
@@ -396,6 +393,7 @@ async function operatorProbe(
     return json({ error: "invalid_probe" }, 400);
   }
 
+  const runId = assertCloudRunId(`probe-${crypto.randomUUID()}`);
   const key = `probes/${runId}.json`;
   if (await env.PROBE_RESULTS.head(key))
     return json({ error: "probe_exists" }, 409);

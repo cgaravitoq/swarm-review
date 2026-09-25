@@ -1,4 +1,4 @@
-import { createHash, randomUUID } from "node:crypto";
+import { createHash } from "node:crypto";
 import { readFile } from "node:fs/promises";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -31,7 +31,6 @@ export async function probeMany(
   );
   return Promise.all(
     Array.from({ length: count }, async () => {
-      const runId = `probe-${randomUUID()}`;
       const response = await fetch(new URL("/probe", worker), {
         method: "POST",
         headers: {
@@ -39,24 +38,24 @@ export async function probeMany(
           "content-type": "application/json",
         },
         body: JSON.stringify({
-          runId,
           expectedSources,
           workersAi: { accountId, bearer },
         }),
         redirect: "manual",
       });
-      if (!response.ok)
-        throw new Error(`probe ${runId}: HTTP ${response.status}`);
+      if (!response.ok) throw new Error(`HTTP ${response.status}`);
       const result: unknown = await response.json();
       if (
         typeof result !== "object" ||
         result === null ||
         !("key" in result) ||
-        typeof result.key !== "string"
+        typeof result.key !== "string" ||
+        !("runId" in result) ||
+        typeof result.runId !== "string"
       )
-        throw new Error(`probe ${runId}: missing R2 key`);
+        throw new Error("missing R2 key");
       return {
-        runId,
+        runId: result.runId,
         key: result.key,
         status: "status" in result ? result.status : null,
       };

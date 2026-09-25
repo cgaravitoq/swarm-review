@@ -138,6 +138,9 @@ afterEach(() => {
   vi.unstubAllGlobals();
 });
 
+const PROBE_RUN_ID =
+  /^probe-[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
+
 describe("operator probe", () => {
   it("starts a burst concurrently and reports every R2 key", async () => {
     const pending: ((response: Response) => void)[] = [];
@@ -154,6 +157,7 @@ describe("operator probe", () => {
       expect(Object.keys(body.expectedSources)).toEqual(
         Object.keys(IMAGE_SOURCES),
       );
+      expect(body).not.toHaveProperty("runId");
       return new Promise<Response>((resolve) => pending.push(resolve));
     });
     vi.stubGlobal("fetch", fetchProbe);
@@ -166,13 +170,11 @@ describe("operator probe", () => {
     );
     await vi.waitFor(() => expect(pending).toHaveLength(5));
     for (let index = 0; index < pending.length; index += 1) {
-      const requestBody = JSON.parse(
-        String(fetchProbe.mock.calls[index]?.[1]?.body),
-      );
       pending[index]?.(
         new Response(
           JSON.stringify({
-            key: `probes/${requestBody.runId}.json`,
+            key: `probes/probe-${index}.json`,
+            runId: `probe-${index}`,
             status: "ok",
           }),
         ),
@@ -187,7 +189,6 @@ describe("operator probe", () => {
   });
 
   const input = () => ({
-    runId: "probe-test",
     expectedSources: expectedSources(),
     workersAi: { accountId: "fake-account", bearer: "fake-workers-bearer" },
   });
@@ -195,6 +196,7 @@ describe("operator probe", () => {
   const setup = (
     failure?: "cold" | "clone" | "claude" | "relay" | "session",
   ) => {
+    let runId = "";
     const files = new Map<string, string>();
     const stored = new Map<string, unknown>();
     const storage = {
@@ -347,7 +349,7 @@ describe("operator probe", () => {
             "anthropic-beta: oauth-2025-04-20,claude-code-20250219",
           );
         const requestBody = files.get(
-          `/workspace/runs/probe-test/${family}-request.json`,
+          `/workspace/runs/${runId}/${family}-request.json`,
         );
         if (!requestBody) throw new Error("missing request body");
         const response = await handler.fetch(
@@ -368,7 +370,7 @@ describe("operator probe", () => {
           probeEnv,
         );
         files.set(
-          `/workspace/runs/probe-test/${family}-response.txt`,
+          `/workspace/runs/${runId}/${family}-response.txt`,
           await response.text(),
         );
         return { stdout: String(response.status), exitCode: 0 };
@@ -387,9 +389,12 @@ describe("operator probe", () => {
       return { stdout: "", exitCode: 0 };
     });
     Object.assign(sandbox, { exec });
-    getSandbox.mockImplementation((_namespace: unknown, id: string) =>
-      id === "swarm-review-codex-egress" ? relay : sandbox,
-    );
+    getSandbox.mockClear();
+    getSandbox.mockImplementation((_namespace: unknown, id: string) => {
+      if (id === "swarm-review-codex-egress") return relay;
+      runId = id;
+      return sandbox;
+    });
     return {
       sandbox,
       destroy,
@@ -414,9 +419,10 @@ describe("operator probe", () => {
       fixture.probeEnv,
     );
     expect(response.status).toBe(200);
-    expect(await response.json()).toEqual({
-      key: "probes/probe-test.json",
-      runId: "probe-test",
+    const body = (await response.json()) as { runId: string };
+    expect(body).toEqual({
+      key: `probes/${body.runId}.json`,
+      runId: expect.stringMatching(PROBE_RUN_ID),
       status: "ok",
     });
     expect(fixture.direct).toHaveBeenCalledTimes(2);
@@ -433,7 +439,7 @@ describe("operator probe", () => {
     ).toContain("clone --depth 1 --no-tags");
     expect(fixture.object.put).toHaveBeenCalledOnce();
     const [key, raw] = fixture.object.put.mock.calls[0] ?? [];
-    expect(key).toBe("probes/probe-test.json");
+    expect(key).toBe(`probes/${body.runId}.json`);
     const receipt = JSON.parse(raw ?? "");
     expect(Object.keys(receipt)).toEqual([
       "runId",
@@ -539,6 +545,27 @@ describe("operator probe", () => {
       }
     },
   );
+
+  it("names the probe's Durable Object itself, whatever run id the request carries", async () => {
+    const fixture = setup();
+    const response = await handler.fetch(
+      authorized("https://review.invalid/probe", {
+        method: "POST",
+        body: JSON.stringify({ ...input(), runId: "live-run" }),
+      }),
+      fixture.probeEnv,
+    );
+    const body = (await response.json()) as { runId: string };
+    expect(body.runId).toMatch(PROBE_RUN_ID);
+    const ids = getSandbox.mock.calls.map((call) => call[1]);
+    expect(ids).not.toContain("live-run");
+    expect([
+      ...new Set(ids.filter((id) => id !== "swarm-review-codex-egress")),
+    ]).toEqual([body.runId]);
+    expect(fixture.object.put.mock.calls[0]?.[0]).toBe(
+      `probes/${body.runId}.json`,
+    );
+  });
 
   it("refuses an unauthenticated probe before starting a Sandbox", async () => {
     const fixture = setup();
