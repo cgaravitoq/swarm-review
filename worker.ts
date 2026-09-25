@@ -19,6 +19,7 @@ import {
   allowedRepositories,
   completeCheck,
   createCheck,
+  GitHubRequestError,
   installationToken,
   type PullRequestEvent,
   pullRequestEvent,
@@ -71,6 +72,20 @@ import {
   sourceMismatchDetail,
 } from "./src/protocol";
 import { SESSION_CAPS } from "./src/provider-budget";
+import {
+  alreadyPublished,
+  assertPublishableReceipt,
+  buildReview,
+  commentableLines,
+  fetchMergeBase,
+  githubReviewPayload,
+  postReview,
+  revalidatePullRequest,
+  type SwarmReceipt,
+  supersededBody,
+  supersededReviews,
+  updateReviewBody,
+} from "./src/publish";
 
 const MODEL_SESSION_KEY = "modelSession";
 const PROBE_SESSIONS_KEY = "probeSessions";
@@ -104,10 +119,17 @@ type AppReview = {
   generation: number;
   reviewId: string | null;
   checkRunId: number | null;
+  mergeBase: string | null;
   origin: string;
   acceptedAt: number;
-  phase: "pending" | "running" | "done";
+  phase: "pending" | "running" | "publishing" | "done";
+  outcome: string | null;
 };
+
+const SUPERSEDED_SUMMARY = "A newer pull request event superseded this review.";
+
+const refusedForGood = (error: unknown) =>
+  error instanceof GitHubRequestError && [403, 404, 422].includes(error.status);
 
 export class PullRequestReview extends DurableObject<ReviewPiEnv> {
   async accept(event: PullRequestEvent, delivery: string, origin: string) {
@@ -125,9 +147,11 @@ export class PullRequestReview extends DurableObject<ReviewPiEnv> {
       generation: (current?.generation ?? 0) + 1,
       reviewId: null,
       checkRunId: null,
+      mergeBase: null,
       origin,
       acceptedAt: Date.now(),
       phase: "pending",
+      outcome: null,
     };
     await this.ctx.storage.put("current", state);
     await this.ctx.storage.setAlarm(Date.now());
@@ -135,129 +159,232 @@ export class PullRequestReview extends DurableObject<ReviewPiEnv> {
   }
 
   override async alarm() {
+    let retry = false;
+    for (const step of [() => this.retireSuperseded(), () => this.advance()]) {
+      try {
+        retry = (await step()) || retry;
+      } catch {
+        retry = true;
+      }
+    }
+    if (retry) await this.ctx.storage.setAlarm(Date.now() + 15_000);
+  }
+
+  private token(event: PullRequestEvent) {
+    return installationToken(
+      this.env.GITHUB_APP_ID,
+      this.env.GITHUB_APP_PRIVATE_KEY,
+      event.installationId,
+      event.repository,
+    );
+  }
+
+  private async save(state: AppReview) {
+    if (
+      (await this.ctx.storage.get<AppReview>("current"))?.generation !==
+      state.generation
+    )
+      return false;
+    await this.ctx.storage.put("current", state);
+    return true;
+  }
+
+  private async retireSuperseded() {
     const superseded =
       (await this.ctx.storage.get<AppReview[]>("superseded")) ?? [];
-    if (superseded.length) {
-      const previous = superseded[0]!;
+    const retired = new Set<number>();
+    for (const previous of superseded) {
       try {
-        const token = await installationToken(
-          this.env.GITHUB_APP_ID,
-          this.env.GITHUB_APP_PRIVATE_KEY,
-          previous.event.installationId,
-          previous.event.repository,
-        );
+        if (previous.reviewId)
+          await this.env.REVIEW_JOBS.getByName(previous.reviewId).cancel();
         await completeCheck(
-          token,
+          await this.token(previous.event),
           previous.event.repository,
           previous.checkRunId!,
           "neutral",
-          "A newer pull request event superseded this review.",
+          SUPERSEDED_SUMMARY,
         );
-        await this.ctx.storage.put("superseded", superseded.slice(1));
-      } catch {
-        await this.ctx.storage.setAlarm(Date.now() + 15_000);
-        return;
+        retired.add(previous.generation);
+      } catch (error) {
+        if (refusedForGood(error)) retired.add(previous.generation);
       }
     }
+    const left = (
+      (await this.ctx.storage.get<AppReview[]>("superseded")) ?? []
+    ).filter((previous) => !retired.has(previous.generation));
+    await this.ctx.storage.put("superseded", left);
+    return left.length > 0;
+  }
+
+  private async advance() {
     const state = await this.ctx.storage.get<AppReview>("current");
-    if (!state || state.phase === "done") return;
+    if (!state || state.phase === "done") return false;
     try {
-      const token = await installationToken(
-        this.env.GITHUB_APP_ID,
-        this.env.GITHUB_APP_PRIVATE_KEY,
-        state.event.installationId,
-        state.event.repository,
-      );
+      const token = await this.token(state.event);
+      const { repository } = state.event;
       if (state.phase === "pending") {
         state.checkRunId ??= await createCheck(token, state.event);
-        if (
-          (await this.ctx.storage.get<AppReview>("current"))?.generation !==
-          state.generation
-        ) {
+        if (!(await this.save(state))) {
           await completeCheck(
             token,
-            state.event.repository,
+            repository,
             state.checkRunId,
             "neutral",
-            "A newer pull request event superseded this review.",
+            SUPERSEDED_SUMMARY,
           );
-          return;
+          return false;
         }
-        await this.ctx.storage.put("current", state);
+        state.mergeBase ??= await fetchMergeBase(
+          repository,
+          state.event.base,
+          state.event.head,
+          token,
+        );
+        if (!(await this.save(state))) return false;
         const reviewId = assertCloudRunId(`review-${crypto.randomUUID()}`);
-        const review: CloudReview = {
-          reviewId,
-          repository: state.event.repository,
-          pr: state.event.number,
-          head: state.event.head,
-          base: state.event.base,
-          origin: state.origin,
-          deadlineAt: new Date(Date.now() + REVIEW_DEADLINE_MS).toISOString(),
-        };
         await putReviewJson(this.env, reviewId, "git", {
-          repository: state.event.repository,
+          repository,
           installationId: state.event.installationId,
         });
-        await startReview(this.env, review);
-        if (
-          (await this.ctx.storage.get<AppReview>("current"))?.generation !==
-          state.generation
-        )
-          return;
+        await startReview(this.env, {
+          reviewId,
+          repository,
+          pr: state.event.number,
+          head: state.event.head,
+          base: state.mergeBase,
+          origin: state.origin,
+          deadlineAt: new Date(Date.now() + REVIEW_DEADLINE_MS).toISOString(),
+        });
         state.reviewId = reviewId;
         state.phase = "running";
-        await this.ctx.storage.put("current", state);
-      }
-      if (state.reviewId && state.checkRunId) {
-        const receipt = await this.env.PROBE_RESULTS.get(
-          reviewKey(state.reviewId, "receipt"),
-        );
-        if (
-          receipt &&
-          (await this.env.REVIEW_JOBS.getByName(state.reviewId).isDone())
-        ) {
-          const value = (await receipt.json()) as {
-            status?: string;
-            findings?: { status?: string }[];
-            failure?: { message?: string };
-          };
-          const success = value.status === "completed";
-          const summary = success
-            ? `Review completed. ${value.findings?.filter((finding) => finding.status === "confirmed").length ?? 0} confirmed finding(s).`
-            : `Review could not complete: ${value.failure?.message ?? "unknown reason"}.`;
-          if (
-            (await this.ctx.storage.get<AppReview>("current"))?.generation !==
-            state.generation
-          )
-            return;
-          await completeCheck(
-            token,
-            state.event.repository,
-            state.checkRunId,
-            success ? "success" : "neutral",
-            summary,
-          );
-          state.phase = "done";
-          await this.ctx.storage.put("current", state);
-          return;
+        if (!(await this.save(state))) {
+          await this.env.REVIEW_JOBS.getByName(reviewId).cancel();
+          return false;
         }
-        if (Date.now() > state.acceptedAt + REVIEW_DEADLINE_MS + 120_000) {
-          await completeCheck(
+      }
+      const receiptObject = await this.env.PROBE_RESULTS.get(
+        reviewKey(state.reviewId!, "receipt"),
+      );
+      if (state.phase === "running") {
+        if (
+          !receiptObject ||
+          !(await this.env.REVIEW_JOBS.getByName(state.reviewId!).isDone())
+        ) {
+          if (Date.now() <= state.acceptedAt + REVIEW_DEADLINE_MS + 120_000)
+            return true;
+          await this.finish(
             token,
-            state.event.repository,
-            state.checkRunId,
+            state,
             "neutral",
             "Review did not produce a final receipt before the deadline.",
           );
-          state.phase = "done";
-          await this.ctx.storage.put("current", state);
-          return;
+          return false;
         }
+        state.phase = "publishing";
+        if (!(await this.save(state))) return false;
       }
-      await this.ctx.storage.setAlarm(Date.now() + 15_000);
-    } catch {
-      await this.ctx.storage.setAlarm(Date.now() + 15_000);
+      const receipt = await receiptObject!.json<SwarmReceipt>();
+      if (receipt.status !== "completed" && receipt.status !== "partial") {
+        await this.finish(
+          token,
+          state,
+          "neutral",
+          `Review could not complete: ${receipt.failure?.message ?? "unknown reason"}.`,
+        );
+        return false;
+      }
+      const published = await this.publish(token, state, receipt);
+      if (published) await this.finish(token, state, ...published);
+      return false;
+    } catch (error) {
+      if (!refusedForGood(error)) return true;
+      state.phase = "done";
+      state.outcome = messageOf(error);
+      await this.save(state);
+      return false;
     }
+  }
+
+  private async publish(
+    token: string,
+    state: AppReview,
+    receipt: SwarmReceipt,
+  ): Promise<["success" | "neutral", string] | null> {
+    const { repository, number } = state.event;
+    const expected = { head: state.event.head, mergeBase: state.mergeBase! };
+    try {
+      assertPublishableReceipt(receipt, expected);
+      const validated = await revalidatePullRequest(
+        repository,
+        number,
+        token,
+        expected,
+        true,
+      );
+      const confirmed = receipt.findings.filter(
+        (finding) => finding.status === "confirmed",
+      ).length;
+      const summary = `Review published at ${expected.head.slice(0, 7)}. ${confirmed} confirmed finding(s).`;
+      if (alreadyPublished(validated.reviews, receipt.swarmId, expected.head))
+        return ["success", summary];
+      if (
+        (await this.ctx.storage.get<AppReview>("current"))?.generation !==
+        state.generation
+      )
+        return null;
+      const posted = await postReview(
+        repository,
+        number,
+        token,
+        githubReviewPayload(
+          buildReview(receipt, commentableLines(validated.diff), repository),
+        ),
+      );
+      for (const older of supersededReviews(validated.reviews))
+        await updateReviewBody(
+          repository,
+          number,
+          older.id,
+          token,
+          supersededBody(older.body ?? "", {
+            swarmId: receipt.swarmId,
+            head: expected.head,
+            url: posted.html_url,
+          }),
+        ).catch(() => undefined);
+      return ["success", summary];
+    } catch (error) {
+      if (
+        error instanceof GitHubRequestError
+          ? !refusedForGood(error)
+          : error instanceof TypeError
+      )
+        throw error;
+      return ["neutral", `Review not published: ${messageOf(error)}.`];
+    }
+  }
+
+  private async finish(
+    token: string,
+    state: AppReview,
+    conclusion: "success" | "neutral",
+    summary: string,
+  ) {
+    if (
+      (await this.ctx.storage.get<AppReview>("current"))?.generation !==
+      state.generation
+    )
+      return;
+    await completeCheck(
+      token,
+      state.event.repository,
+      state.checkRunId!,
+      conclusion,
+      summary,
+    );
+    state.phase = "done";
+    state.outcome = summary;
+    await this.save(state);
   }
 }
 
@@ -269,6 +396,20 @@ export class ReviewJob extends DurableObject<ReviewPiEnv> {
 
   async isDone() {
     return (await this.ctx.storage.get<string>("state")) === "done";
+  }
+
+  async cancel() {
+    const review = await this.ctx.storage.get<CloudReview>("review");
+    if (!review || (await this.ctx.storage.get<string>("state")) === "done")
+      return;
+    await this.ctx.storage.deleteAlarm();
+    const shutdown = await destroySandbox(
+      getSandbox(this.env.REVIEW_SANDBOX, review.reviewId),
+    );
+    if (!shutdown.acknowledged)
+      throw new Error(`destroy_failed: ${shutdown.error}`);
+    await this.ctx.storage.put("state", "done");
+    await finishReview(this.env, review, "superseded", null);
   }
 
   override async alarm() {
