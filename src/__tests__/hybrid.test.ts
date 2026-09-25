@@ -487,6 +487,13 @@ it("hands a reviewer still running at the review deadline one tools-off report t
     true,
   ]);
   expect(reviewer[1]!.at).toBeLessThan(reviewDeadlineAt);
+  expect(
+    reviewer[1]!.args.slice(
+      reviewer[1]!.args.indexOf("--thinking"),
+      reviewer[1]!.args.indexOf("--thinking") + 2,
+    ),
+  ).toEqual(["--thinking", "off"]);
+  expect(reviewer[0]!.args).not.toContain("--thinking");
   expect(receipt.lanes[0]).toMatchObject({ status: "completed" });
   expect(receipt.candidates).toHaveLength(1);
   expect(receipt.findings[0]?.status).toBe("confirmed");

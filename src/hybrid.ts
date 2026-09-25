@@ -262,7 +262,12 @@ function runPi(input: {
       let stdout = "";
       child = spawn(
         "pi",
-        [...args, ...(reportTurn ? ["--no-tools"] : ["--tools", tools])],
+        [
+          ...args,
+          ...(reportTurn
+            ? ["--no-tools", "--thinking", "off"]
+            : ["--tools", tools]),
+        ],
         {
           cwd: input.source,
           env,
