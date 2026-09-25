@@ -118,6 +118,28 @@ The relay image adds only Bun and its server to the Sandbox runtime, and the rev
 The relay uses direct HTTPS because intercepted HTTPS returns a Worker-side 403 from `chatgpt.com`.
 `allowedHosts` filters intercepted HTTP here, but does not restrict direct HTTPS in the current Containers SDK; the fixed URL in relay code is the enforced outbound destination for relay requests.
 
+## Operator probe
+
+The authenticated `POST /probe` route starts one fresh review Sandbox, measures its first image fingerprint command, clones the configured repository with `--depth 1` through the read-only git proxy, and sends one request per model family through `/model/`.
+The Worker stores `probes/<runId>.json` in the `PROBE_RESULTS` R2 bucket and returns only its key and overall status.
+Each phase records a status, failure phase, HTTP status when observed, and milliseconds from the Worker's monotonic `performance.now()` clock.
+A skipped phase has `durationMs: null`.
+The receipt does not contain request bodies, provider output, handles or credentials.
+The Sandbox is destroyed after the probe, including failed phases.
+
+The operator supplies a Workers AI bearer and account ID; the Worker uses its credential vault for openai-codex and claude-code.
+Set `WORKER_ORIGIN`, `CONTROL_SECRET`, `CLOUDFLARE_ACCOUNT_ID`, and `WORKERS_AI_API_KEY` in the shell environment, then run:
+
+```sh
+bun run scripts/probe.ts "$WORKER_ORIGIN" 1
+bun run scripts/probe.ts "$WORKER_ORIGIN" 5
+bunx wrangler r2 object get "swarm-review-probes/probes/<runId>.json" --remote --pipe
+```
+
+The script starts all probes in a burst concurrently and prints every R2 key.
+The bucket must exist before deployment; this repository only declares its binding.
+The local tests prove request routing, isolation and receipt shape with fakes; real provider responses, cold start timings and R2 persistence require a deployed probe.
+
 ## Commands
 
 | Command | What it runs |
