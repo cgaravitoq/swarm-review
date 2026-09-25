@@ -102,7 +102,7 @@ bun run deploy --target /path/to/checkout --var TARGET_REPOSITORY:https://github
 `--target` is read locally, to bake the target's lockfile into the image; every other flag goes to `wrangler deploy`.
 
 The Worker can hold its own `openai-codex` and `claude-code` subscription credentials in the `CREDENTIAL_VAULT` Durable Object.
-After deployment, an operator sets `WORKER_ORIGIN` and `CONTROL_SECRET` in the shell, authenticates a separate `CODEX_HOME` with `codex login`, then sends its `auth.json` directly to the Worker through stdin:
+After deployment, an operator exports `WORKER_ORIGIN` and `CONTROL_SECRET` (`export CONTROL_SECRET=...`) so the script's environment carries them, authenticates a separate `CODEX_HOME` with `codex login`, then sends its `auth.json` directly to the Worker through stdin:
 
 ```sh
 bun run scripts/seed-credential.ts "$WORKER_ORIGIN" openai-codex < "$CODEX_HOME/auth.json"
