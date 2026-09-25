@@ -13,6 +13,7 @@
     "biome": "biome check .",
     "lint": "oxlint .",
     "deploy": "bun run scripts/deploy.ts",
+    "create-app": "bun run scripts/create-app.ts",
     "poc:teardown": "wrangler delete --force",
     "review:local": "bun run src/local.ts",
     "review:eval": "bun run evals/run.ts",
