@@ -144,9 +144,9 @@ const laneSummary = (receipt: SwarmReceipt) => {
   const lanes = Array.isArray(receipt.lanes) ? receipt.lanes : [];
   if (lanes.length === 0) return "The receipt names no lanes.";
   return lanes
-    .map((lane) => {
-      const error = lane.error ?? lane.contractError ?? lane.blockerReason;
-      return `- ${plain(lane.role)} ${plain(lane.family)} ${plain(lane.model)}: ${plain(lane.status)}${lane.stopReason ? `, stop reason ${plain(lane.stopReason)}` : ""}${error ? `, error ${plain(error)}` : ""}`;
+    .map((lane: (typeof lanes)[number] | null) => {
+      const error = lane?.error ?? lane?.contractError ?? lane?.blockerReason;
+      return `- ${plain(lane?.role)} ${plain(lane?.family)} ${plain(lane?.model)}: ${plain(lane?.status)}${lane?.stopReason ? `, stop reason ${plain(lane.stopReason)}` : ""}${error ? `, error ${plain(error)}` : ""}`;
     })
     .join("\n");
 };

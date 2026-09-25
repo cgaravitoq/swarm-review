@@ -705,6 +705,32 @@ describe("GitHub App webhook", () => {
     ]);
   });
 
+  it("ends the check of a failed receipt whose lane is not an object", async () => {
+    const { pr, r2, stored, storage, started } = fixture();
+    const gh = github();
+    const reviewId = await started();
+    r2.set(`reviews/${reviewId}/receipt.json`, {
+      status: "failed",
+      failure: { stage: "cloud_review", message: "engine_failed" },
+      lanes: [null],
+    });
+    storage.setAlarm.mockClear();
+    await pr.alarm();
+    expect(gh.checks()).toEqual([
+      expect.objectContaining({
+        url: `${API}/check-runs/99`,
+        conclusion: "neutral",
+        output: {
+          title: "Swarm review could not complete",
+          summary:
+            "Review could not complete: engine_failed.\n\n- `none` `none` `none`: `none`",
+        },
+      }),
+    ]);
+    expect(stored.get("current")).toMatchObject({ phase: "done" });
+    expect(storage.setAlarm).not.toHaveBeenCalled();
+  });
+
   it("binds a git capability to its allowed repository", async () => {
     const { env, r2 } = fixture();
     r2.set("reviews/review-one/git.json", {
