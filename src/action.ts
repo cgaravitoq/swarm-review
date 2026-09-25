@@ -2,7 +2,7 @@ import { execFile, spawn } from "node:child_process";
 import { access, appendFile, mkdir, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { promisify } from "node:util";
-import { imageReference, imageTagFromFiles } from "./image-tag";
+import { engineBundle, imageReference, imageTagFromFiles } from "./image-tag";
 import { runIdentity, runningCommentBody } from "./publish";
 
 const exec = promisify(execFile);
@@ -39,10 +39,17 @@ const lastLine = (stderr: string) => {
 const reason = (error: unknown) =>
   error instanceof Error ? error.message : String(error);
 
-function run(command: string, args: string[], env: Env, input?: string) {
+function run(
+  command: string,
+  args: string[],
+  env: Env,
+  options: { input?: string; cwd?: string } = {},
+) {
+  const { input, cwd } = options;
   return new Promise<void>((resolve, reject) => {
     const child = spawn(command, args, {
       env,
+      cwd,
       stdio: [input === undefined ? "inherit" : "pipe", "inherit", "pipe"],
     });
     // Only the tail is kept: a build's stderr runs to megabytes, and its last
@@ -176,21 +183,14 @@ export async function main(env: Env = process.env): Promise<void> {
           "--password-stdin",
         ],
         runEnv,
-        `${required(env, "GITHUB_TOKEN")}\n`,
+        { input: `${required(env, "GITHUB_TOKEN")}\n` },
       );
       stage = "engine bundle";
-      await run(
-        "bun",
-        [
-          "build",
-          join(actionPath, "src", "swarm.ts"),
-          "--target",
-          "bun",
-          "--outfile",
-          join(actionPath, "container", "context", "swarm.js"),
-        ],
-        runEnv,
+      const bundle = engineBundle(
+        actionPath,
+        join(actionPath, "container", "context", "swarm.js"),
       );
+      await run("bun", bundle.args, runEnv, { cwd: bundle.cwd });
       stage = "image pull";
       const image = imageReference(
         repository,
