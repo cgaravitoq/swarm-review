@@ -84,7 +84,7 @@ if ((process.env.PI_HANG === "cap" || process.env.PI_HANG === "time") && !report
   event({type:"turn_end",message:{stopReason:"stop",usage:{input:2,output:3,totalTokens:5}}});
   const answer = verifying
     ? {verdicts:[{id:"c1",status:"confirmed",severity:"P1",evidenceStrength:"static",diffRelation:"added",declaredIntent:null,reason:"value changes for callers"}]}
-    : {status:"complete",blockerReason:"",findings:[{severity:"P1",file:"a.ts",line:1,mechanism:"value changes",evidence:"diff",affectedBehavior:"caller sees 2"}]};
+    : process.env.PI_REPORT === "none" ? {status:"complete",blockerReason:"",findings:[]} : {status:"complete",blockerReason:"",findings:[{severity:"P1",file:"a.ts",line:1,mechanism:"value changes",evidence:"diff",affectedBehavior:"caller sees 2"}]};
   const fence = String.fromCharCode(96).repeat(3);
   const text = process.env.PI_REPORT === "empty" && !verifying ? "" : process.env.PI_REPORT === "invalid" && !verifying ? "not a report" : process.env.PI_REPORT === "large" && !verifying ? "🧪".repeat(5000) + fence + "json\\n" + JSON.stringify(answer) + "\\n" + fence : fence + "json\\n" + JSON.stringify(answer) + "\\n" + fence;
   event({type:"agent_end",messages:[{role:"assistant",content:[{type:"text",text}]}]});
@@ -257,6 +257,118 @@ it("leaves a candidate unverified when every verifier is from the finder family"
   expect((await readFile(input.log, "utf8")).trim().split("\n")).toHaveLength(
     1,
   );
+});
+
+async function familyLanes(
+  input: Awaited<ReturnType<typeof setup>>,
+  reviewers: [string, Record<string, string>][],
+  verifiers: [string, Record<string, string>][],
+) {
+  const config = JSON.parse(await readFile(input.lanes, "utf8"));
+  const base = config.reviewers[0];
+  const lane = ([family, env]: [string, Record<string, string>]) => ({
+    ...base,
+    family,
+    env: { ...base.env, PI_FAMILY: family, ...env },
+  });
+  await writeFile(
+    input.lanes,
+    JSON.stringify({
+      reviewers: reviewers.map(lane),
+      verifiers: verifiers.map(lane),
+    }),
+  );
+}
+
+it("sends a candidate to a family whose reviewer completed over one whose reviewer was cut", async () => {
+  const input = await setup();
+  await familyLanes(
+    input,
+    [
+      ["claude-code", {}],
+      ["workers-ai", { PI_HANG: "deadline" }],
+      ["openai-codex", { PI_REPORT: "none" }],
+    ],
+    [
+      ["workers-ai", {}],
+      ["openai-codex", {}],
+      ["claude-code", {}],
+    ],
+  );
+  const result = run(input, 5);
+  expect(result.status, result.stderr).toBe(0);
+  const receipt = JSON.parse(
+    await readFile(join(input.out, "receipt.json"), "utf8"),
+  ) as HybridReceipt;
+  expect(
+    receipt.lanes.filter((lane) => lane.role === "verifier"),
+  ).toMatchObject([{ family: "openai-codex", status: "completed" }]);
+  expect(
+    (await calls(input.log))
+      .filter((call) => call.phase === "verifying")
+      .map((call) => call.family),
+  ).toEqual(["openai-codex"]);
+  expect(receipt.findings[0]?.status).toBe("confirmed");
+});
+
+it("never sends a candidate to a family whose reviewer failed", async () => {
+  const input = await setup();
+  await familyLanes(
+    input,
+    [
+      ["claude-code", {}],
+      ["openai-codex", { PI_HANG: "error" }],
+    ],
+    [
+      ["openai-codex", {}],
+      ["workers-ai", {}],
+    ],
+  );
+  const result = run(input);
+  expect(result.status, result.stderr).toBe(0);
+  const receipt = JSON.parse(
+    await readFile(join(input.out, "receipt.json"), "utf8"),
+  ) as HybridReceipt;
+  expect(receipt.lanes[1]).toMatchObject({
+    family: "openai-codex",
+    status: "failed",
+  });
+  expect(
+    (await calls(input.log))
+      .filter((call) => call.phase === "verifying")
+      .map((call) => call.family),
+  ).toEqual(["workers-ai"]);
+  expect(receipt.findings[0]?.status).toBe("confirmed");
+});
+
+it("leaves a candidate unverified with a reason when no verifier family can rule on it", async () => {
+  const input = await setup();
+  await familyLanes(
+    input,
+    [
+      ["claude-code", {}],
+      ["openai-codex", { PI_HANG: "error" }],
+    ],
+    [
+      ["openai-codex", {}],
+      ["claude-code", {}],
+    ],
+  );
+  const result = run(input);
+  expect(result.status, result.stderr).toBe(0);
+  const receipt = JSON.parse(
+    await readFile(join(input.out, "receipt.json"), "utf8"),
+  ) as HybridReceipt;
+  expect(receipt.status).toBe("partial");
+  expect(receipt.findings[0]).toMatchObject({
+    status: "unverified",
+    unverifiedReason:
+      "no verifier family can rule: reported by claude-code; reviewer failed in openai-codex",
+  });
+  expect(receipt.lanes.some((lane) => lane.role === "verifier")).toBe(false);
+  expect(
+    (await calls(input.log)).filter((call) => call.phase === "verifying"),
+  ).toHaveLength(0);
 });
 
 it("uses a third family when two finder families reported the same candidate", async () => {

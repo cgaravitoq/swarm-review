@@ -61,6 +61,8 @@ Each verification has at most two minutes and never runs past the run deadline, 
 The receipt retains the last 16 KiB of each lane's final text and marks an unparseable report as malformed.
 The lanes file has `reviewers` and `verifiers` arrays; each entry names `family`, `provider`, `model`, `piDir`, `extensions` and `env`.
 Each verifier family may appear once, and a candidate needs a verifier from a family other than every family that reported it.
+A family whose reviewer failed in the run is never chosen as a verifier, and among the rest a family whose reviewer completed is preferred over one whose reviewer was cut, in `lanes.json` order.
+A candidate with no family left to rule on it stays unverified, and its finding's `unverifiedReason` says why.
 
 ### GitHub Action
 

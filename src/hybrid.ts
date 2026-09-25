@@ -423,6 +423,8 @@ export async function runHybrid(argv: string[]) {
     candidateIds?: string[];
   }[] = [];
   const candidateRows: Candidate[][] = reviewers.map(() => []);
+  const reviewerOutcomes: { family: Family; status: LaneResult["status"] }[] =
+    [];
   try {
     await Promise.all(
       reviewers.map(async (lane, index) => {
@@ -446,6 +448,7 @@ export async function runHybrid(argv: string[]) {
           cutReason: "review deadline",
           children,
         });
+        reviewerOutcomes.push({ family: lane.family, status: result.status });
         const parsed =
           result.status === "completed"
             ? parseCandidates(result.finalText, reviewerLaneId(index))
@@ -484,6 +487,17 @@ export async function runHybrid(argv: string[]) {
     status.phase = "verifying";
     await writeStatus();
     const verdicts: Verdict[] = [];
+    const unverifiedReasons = new Map<string, string>();
+    const failedFamilies = new Set(
+      reviewerOutcomes
+        .filter((outcome) => outcome.status === "failed")
+        .map((outcome) => outcome.family),
+    );
+    const cutFamilies = new Set(
+      reviewerOutcomes
+        .filter((outcome) => outcome.status === "cut")
+        .map((outcome) => outcome.family),
+    );
     await Promise.all(
       candidates.map(async (candidate) => {
         const finderFamilies = new Set(
@@ -492,10 +506,28 @@ export async function runHybrid(argv: string[]) {
             return reviewers[index]?.family;
           }),
         );
-        const lane = verifiers.find(
-          (entry) => !finderFamilies.has(entry.family),
+        const eligible = verifiers.filter(
+          (entry) =>
+            !finderFamilies.has(entry.family) &&
+            !failedFamilies.has(entry.family),
         );
-        if (!lane || Date.now() >= deadlineAt) return;
+        const lane =
+          eligible.find((entry) => !cutFamilies.has(entry.family)) ??
+          eligible[0];
+        if (!lane) {
+          unverifiedReasons.set(
+            candidate.id,
+            `no verifier family can rule: reported by ${[...finderFamilies].join(", ")}${failedFamilies.size > 0 ? `; reviewer failed in ${[...failedFamilies].join(", ")}` : ""}`,
+          );
+          return;
+        }
+        if (Date.now() >= deadlineAt) {
+          unverifiedReasons.set(
+            candidate.id,
+            "run deadline passed before verification",
+          );
+          return;
+        }
         const brief = verifierBrief({
           repo: source,
           base,
@@ -535,10 +567,22 @@ export async function runHybrid(argv: string[]) {
           result.status === "completed"
             ? parseVerdicts(result.finalText, [candidate.id])
             : null;
+        const verifierStatus = parsed?.error
+          ? "malformed"
+          : result.status === "completed"
+            ? "completed"
+            : result.status === "cut"
+              ? "cancelled"
+              : "failed";
         if (parsed && !parsed.error) {
           verdicts.push(...parsed.verdicts);
           status.verified += 1;
           await writeStatus();
+        } else {
+          unverifiedReasons.set(
+            candidate.id,
+            `verifier ${lane.family} ${verifierStatus}`,
+          );
         }
         laneRows.push({
           laneId: `verifier-${candidate.id}`,
@@ -546,13 +590,7 @@ export async function runHybrid(argv: string[]) {
           family: lane.family,
           provider: lane.provider,
           model: lane.model,
-          status: parsed?.error
-            ? "malformed"
-            : result.status === "completed"
-              ? "completed"
-              : result.status === "cut"
-                ? "cancelled"
-                : "failed",
+          status: verifierStatus,
           stopReason: result.stopReason,
           turns: result.turns,
           usage: result.usage,
@@ -563,7 +601,16 @@ export async function runHybrid(argv: string[]) {
         });
       }),
     );
-    const adjudicated = applyVerdicts(candidates, verdicts);
+    const verdictsApplied = applyVerdicts(candidates, verdicts);
+    const adjudicated = {
+      ...verdictsApplied,
+      findings: verdictsApplied.findings.map((finding) => {
+        const unverifiedReason = unverifiedReasons.get(finding.id);
+        return finding.status === "unverified" && unverifiedReason
+          ? { ...finding, unverifiedReason }
+          : finding;
+      }),
+    };
     const uncoveredFiles = changedFiles.filter(
       (file) =>
         !assignments.some(
