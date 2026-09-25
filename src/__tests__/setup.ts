@@ -1,25 +1,7 @@
 import childProcess, { type ChildProcess } from "node:child_process";
-import { randomUUID } from "node:crypto";
-import { linkSync, mkdirSync, unlinkSync, writeFileSync } from "node:fs";
 import { syncBuiltinESMExports } from "node:module";
-import { dirname } from "node:path";
 import { setTimeout as sleep } from "node:timers/promises";
-import { fileURLToPath, URL } from "node:url";
 import { afterAll, afterEach } from "vitest";
-
-const engine = fileURLToPath(
-  new URL("../../container/context/swarm.js", import.meta.url),
-);
-const staged = `${engine}.${randomUUID()}`;
-mkdirSync(dirname(engine), { recursive: true });
-writeFileSync(staged, "test engine bundle");
-try {
-  linkSync(staged, engine);
-} catch (error) {
-  if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
-} finally {
-  unlinkSync(staged);
-}
 
 const groups = new Set<number>();
 const prototype = childProcess.ChildProcess.prototype as ChildProcess & {
