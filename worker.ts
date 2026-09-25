@@ -518,7 +518,15 @@ const putReviewJson = (
     httpMetadata: { contentType: "application/json" },
   });
 
-const failedReviewStatus = (review: CloudReview, reason: string) => ({
+type EngineFailure = { exitCode: number | null; stderr: string | null };
+
+const ENGINE_STDERR_TAIL = 4096;
+
+const failedReviewStatus = (
+  review: CloudReview,
+  reason: string,
+  engine: EngineFailure | null,
+) => ({
   phase: "failed",
   reviewers: Object.entries(REVIEW_FAMILIES).map(([family, { model }]) => ({
     family,
@@ -529,6 +537,7 @@ const failedReviewStatus = (review: CloudReview, reason: string) => ({
   verified: 0,
   deadlineAt: review.deadlineAt,
   reason,
+  ...(engine ? { engine } : {}),
 });
 
 async function finishReview(
@@ -536,12 +545,13 @@ async function finishReview(
   review: CloudReview,
   reason: string,
   receipt: unknown,
+  engine: EngineFailure | null = null,
 ) {
   await putReviewJson(
     env,
     review.reviewId,
     "status",
-    failedReviewStatus(review, reason),
+    failedReviewStatus(review, reason, engine),
   );
   await putReviewJson(env, review.reviewId, "receipt", {
     ...(typeof receipt === "object" && receipt !== null
@@ -559,6 +569,7 @@ async function finishReview(
     failure: {
       stage: reason === "deadline" ? "deadline" : "cloud_review",
       message: reason,
+      ...(engine ? { engine } : {}),
     },
   });
 }
@@ -577,6 +588,7 @@ async function runCloudReview(env: ReviewPiEnv, review: CloudReview) {
   const directory = runDir(review.reviewId);
   let reason: string | null = null;
   let receipt: Record<string, unknown> | null = null;
+  let engineFailure: EngineFailure | null = null;
   try {
     reviewRemaining(review);
     if (!env.WORKERS_AI_API_KEY || !env.WORKERS_AI_ACCOUNT_ID) {
@@ -792,7 +804,20 @@ async function runCloudReview(env: ReviewPiEnv, review: CloudReview) {
         setTimeout(wake, Math.min(5_000, reviewRemaining(review))),
       );
     }
-    if (terminalStatus !== "completed") throw new Error("engine_failed");
+    if (terminalStatus !== "completed") {
+      const [exit, logs] = await Promise.allSettled([
+        reviewStep(review, "review engine exit", process.waitForExit()),
+        reviewStep(review, "review engine logs", process.getLogs()),
+      ]);
+      engineFailure = {
+        exitCode: exit.status === "fulfilled" ? exit.value.exitCode : null,
+        stderr:
+          logs.status === "fulfilled"
+            ? logs.value.stderr.slice(-ENGINE_STDERR_TAIL)
+            : null,
+      };
+      throw new Error("engine_failed");
+    }
     const finalStatus = await readArtifact(
       sandbox,
       `${directory}/out/status.json`,
@@ -819,7 +844,7 @@ async function runCloudReview(env: ReviewPiEnv, review: CloudReview) {
     await sandbox.clearProbeSessions().catch(() => undefined);
     const shutdown = await destroySandbox(sandbox);
     if (!shutdown.acknowledged) reason = `destroy_failed: ${shutdown.error}`;
-    if (reason) await finishReview(env, review, reason, receipt);
+    if (reason) await finishReview(env, review, reason, receipt, engineFailure);
   }
 }
 

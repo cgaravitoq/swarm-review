@@ -153,7 +153,12 @@ describe("cloud reviews", () => {
   };
 
   const setup = (
-    failure?: "clone" | "engine" | "fingerprint" | "deadline-engine",
+    failure?:
+      | "clone"
+      | "engine"
+      | "engine-exit"
+      | "fingerprint"
+      | "deadline-engine",
   ) => {
     const files = new Map<string, string>([
       [
@@ -197,6 +202,15 @@ describe("cloud reviews", () => {
       destroy: vi.fn(async () => undefined),
       startProcess: vi.fn(async (_command: string) => {
         if (failure === "engine") throw new Error("engine failed");
+        if (failure === "engine-exit")
+          return {
+            getStatus: vi.fn(async () => "failed"),
+            waitForExit: vi.fn(async () => ({ exitCode: 1 })),
+            getLogs: vi.fn(async () => ({
+              stdout: "",
+              stderr: `${"x".repeat(10_000)}fatal: no merge base\n`,
+            })),
+          };
         if (failure === "deadline-engine") {
           (stored.get("review") as { deadlineAt: string }).deadlineAt =
             new Date(Date.now() - 1).toISOString();
@@ -390,6 +404,27 @@ describe("cloud reviews", () => {
       }
     },
   );
+
+  it("records the engine's exit code and stderr tail when it fails", async () => {
+    const fixture = setup("engine-exit");
+    const response = await post(fixture.reviewEnv);
+    const { reviewId } = (await response.json()) as { reviewId: string };
+    await fixture.job.alarm();
+    const engine = {
+      exitCode: 1,
+      stderr: `${"x".repeat(4096 - "fatal: no merge base\n".length)}fatal: no merge base\n`,
+    };
+    expect(fixture.r2.get(`reviews/${reviewId}/receipt.json`)).toMatchObject({
+      status: "failed",
+      failure: { stage: "cloud_review", message: "engine_failed", engine },
+    });
+    expect(fixture.r2.get(`reviews/${reviewId}/status.json`)).toMatchObject({
+      phase: "failed",
+      reason: "engine_failed",
+      engine,
+    });
+    expect(fixture.sandbox.destroy).toHaveBeenCalledOnce();
+  });
 
   it("cuts an expired review before the engine and records the deadline", async () => {
     const fixture = setup();
