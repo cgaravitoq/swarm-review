@@ -12,7 +12,7 @@ import {
   WORKER_SSE_LINE_CHARS,
 } from "../container/response-seal";
 import { type ModelUsage, usageReader } from "../container/response-usage";
-import { relayRefusalReason } from "./codex-relay";
+import { relayRefusalReason } from "./codex-relay-refusal";
 import { assertCloudRunId } from "./isolation";
 
 export type { ModelUsage };
