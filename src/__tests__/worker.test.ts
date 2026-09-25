@@ -11,7 +11,7 @@ import {
   imageBuildArguments,
   targetCheckout,
 } from "../../scripts/deploy";
-import { probeMany } from "../../scripts/probe";
+import { main } from "../../scripts/probe";
 import { gitCapability } from "../git-proxy";
 import { CONTROL_DIR, MODEL_BROKER, TARGET_UID } from "../isolation";
 import { emptyModelTotals, modelCapability } from "../model-proxy";
@@ -143,7 +143,7 @@ const PROBE_RUN_ID =
   /^probe-[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
 
 describe("operator probe", () => {
-  it("starts a burst concurrently and reports every R2 key", async () => {
+  it("starts a burst concurrently and prints each probe's key or error", async () => {
     const pending: ((response: Response) => void)[] = [];
     const fetchProbe = vi.fn<typeof fetch>(async (_url, init) => {
       expect(init?.method).toBe("POST");
@@ -162,31 +162,47 @@ describe("operator probe", () => {
       return new Promise<Response>((resolve) => pending.push(resolve));
     });
     vi.stubGlobal("fetch", fetchProbe);
-    const resultsPromise = probeMany(
-      "https://review.invalid",
-      "fake-control-secret",
-      "fake-account",
-      "fake-workers-bearer",
-      5,
-    );
-    await vi.waitFor(() => expect(pending).toHaveLength(5));
-    for (let index = 0; index < pending.length; index += 1) {
-      pending[index]?.(
-        new Response(
-          JSON.stringify({
-            key: `probes/probe-${index}.json`,
-            runId: `probe-${index}`,
-            status: "ok",
-          }),
-        ),
-      );
+    const lines: string[] = [];
+    const write = vi
+      .spyOn(process.stdout, "write")
+      .mockImplementation((line) => {
+        lines.push(String(line));
+        return true;
+      });
+    try {
+      const exit = main(["https://review.invalid", "5"], {
+        CONTROL_SECRET: "fake-control-secret",
+        CLOUDFLARE_ACCOUNT_ID: "fake-account",
+        WORKERS_AI_API_KEY: "fake-workers-bearer",
+      });
+      await vi.waitFor(() => expect(pending).toHaveLength(5));
+      for (const [index, resolve] of pending.entries()) {
+        resolve(
+          index === 2
+            ? new Response(
+                JSON.stringify({ error: "r2_put_failed", runId: "probe-2" }),
+                { status: 500 },
+              )
+            : new Response(
+                JSON.stringify({
+                  key: `probes/probe-${index}.json`,
+                  runId: `probe-${index}`,
+                  status: "ok",
+                }),
+              ),
+        );
+      }
+      expect(await exit).toBe(1);
+    } finally {
+      write.mockRestore();
     }
-    const results = await resultsPromise;
-    expect(results).toHaveLength(5);
-    expect(new Set(results.map((result) => result.key)).size).toBe(5);
-    expect(
-      results.every((result) => result.key === `probes/${result.runId}.json`),
-    ).toBe(true);
+    expect(lines).toEqual([
+      "probe-0 probes/probe-0.json ok\n",
+      "probe-1 probes/probe-1.json ok\n",
+      "probe 3 error HTTP 500 r2_put_failed\n",
+      "probe-3 probes/probe-3.json ok\n",
+      "probe-4 probes/probe-4.json ok\n",
+    ]);
   });
 
   const laneModelsJson = readFileSync(
@@ -668,18 +684,21 @@ describe("operator probe", () => {
     expect(fixture.object.put).not.toHaveBeenCalled();
   });
 
-  it("destroys the Sandbox even when R2 rejects the receipt", async () => {
+  it("destroys the Sandbox and names r2_put_failed when R2 rejects the receipt", async () => {
     const fixture = setup();
     fixture.object.put.mockRejectedValueOnce(new Error("R2 failed"));
-    await expect(
-      handler.fetch(
-        authorized("https://review.invalid/probe", {
-          method: "POST",
-          body: JSON.stringify(input()),
-        }),
-        fixture.probeEnv,
-      ),
-    ).rejects.toThrow("R2 failed");
+    const response = await handler.fetch(
+      authorized("https://review.invalid/probe", {
+        method: "POST",
+        body: JSON.stringify(input()),
+      }),
+      fixture.probeEnv,
+    );
+    expect(response.status).toBe(500);
+    expect(await response.json()).toEqual({
+      error: "r2_put_failed",
+      runId: expect.stringMatching(PROBE_RUN_ID),
+    });
     expect(fixture.destroy).toHaveBeenCalledOnce();
     expect(fixture.stored.has("probeSessions")).toBe(false);
   });

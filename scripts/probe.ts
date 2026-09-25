@@ -29,7 +29,7 @@ export async function probeMany(
       ]),
     ),
   );
-  return Promise.all(
+  return Promise.allSettled(
     Array.from({ length: count }, async () => {
       const response = await fetch(new URL("/probe", worker), {
         method: "POST",
@@ -43,7 +43,17 @@ export async function probeMany(
         }),
         redirect: "manual",
       });
-      if (!response.ok) throw new Error(`HTTP ${response.status}`);
+      if (!response.ok) {
+        const failure: unknown = await response.json().catch(() => null);
+        throw new Error(
+          typeof failure === "object" &&
+            failure !== null &&
+            "error" in failure &&
+            typeof failure.error === "string"
+            ? `HTTP ${response.status} ${failure.error}`
+            : `HTTP ${response.status}`,
+        );
+      }
       const result: unknown = await response.json();
       if (
         typeof result !== "object" ||
@@ -63,24 +73,31 @@ export async function probeMany(
   );
 }
 
-if (import.meta.main) {
-  const [origin, rawCount] = process.argv.slice(2);
-  const secret = process.env["CONTROL_SECRET"];
-  const accountId = process.env["CLOUDFLARE_ACCOUNT_ID"];
-  const bearer = process.env["WORKERS_AI_API_KEY"];
+export async function main(
+  argv: readonly string[],
+  env: Readonly<Record<string, string | undefined>>,
+) {
+  const [origin, rawCount] = argv;
+  const secret = env["CONTROL_SECRET"];
+  const accountId = env["CLOUDFLARE_ACCOUNT_ID"];
+  const bearer = env["WORKERS_AI_API_KEY"];
   if (!origin || !secret || !accountId || !bearer) {
     throw new Error(
       "usage: CONTROL_SECRET=... CLOUDFLARE_ACCOUNT_ID=... WORKERS_AI_API_KEY=... bun run scripts/probe.ts <worker-origin> [count]",
     );
   }
   const count = rawCount === undefined ? 1 : Number(rawCount);
-  for (const result of await probeMany(
-    origin,
-    secret,
-    accountId,
-    bearer,
-    count,
-  )) {
-    process.stdout.write(`${result.runId} ${result.key} ${result.status}\n`);
+  const results = await probeMany(origin, secret, accountId, bearer, count);
+  for (const [index, result] of results.entries()) {
+    process.stdout.write(
+      result.status === "fulfilled"
+        ? `${result.value.runId} ${result.value.key} ${result.value.status}\n`
+        : `probe ${index + 1} error ${result.reason instanceof Error ? result.reason.message : String(result.reason)}\n`,
+    );
   }
+  return results.some((result) => result.status === "rejected") ? 1 : 0;
+}
+
+if (import.meta.main) {
+  process.exitCode = await main(process.argv.slice(2), process.env);
 }

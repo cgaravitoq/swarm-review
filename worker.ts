@@ -487,6 +487,7 @@ async function operatorProbe(
     sessionClear: unobserved(),
     shutdown: unobserved(),
   };
+  let stored = true;
   try {
     let start = performance.now();
     try {
@@ -732,10 +733,15 @@ async function operatorProbe(
       httpStatus: null,
       reason: shutdown.acknowledged ? null : "destroy_failed",
     };
-    await env.PROBE_RESULTS.put(key, JSON.stringify(receipt), {
-      httpMetadata: { contentType: "application/json" },
-    });
+    try {
+      await env.PROBE_RESULTS.put(key, JSON.stringify(receipt), {
+        httpMetadata: { contentType: "application/json" },
+      });
+    } catch {
+      stored = false;
+    }
   }
+  if (!stored) return json({ error: "r2_put_failed", runId }, 500);
   return json({
     key,
     runId,
