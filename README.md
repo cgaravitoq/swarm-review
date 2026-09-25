@@ -155,7 +155,8 @@ The authenticated `POST /reviews` route accepts `{repository, pr, head, base, co
 The repository must match the deployed Worker's `TARGET_REPOSITORY`.
 The alarm uses one fresh Sandbox, clones the exact PR head through the read-only Git proxy, and runs the hybrid engine as `review-target` without installing the checkout's dependencies.
 Each reviewer and verifier family gets a separate capped model-proxy session.
-The deadline is eight minutes from admission; a failed or expired review records a failed receipt and destroys its Sandbox.
+The deadline is eight minutes from admission; the engine has a shorter deadline so the Worker can store its partial receipt, including verified findings and cut lanes, before destroying the Sandbox.
+If the engine produces no receipt, a failed or expired review records a failed receipt; failure status retains the last observed reviewer states.
 `GET /reviews/<reviewId>` returns `{status, receipt?}` from `reviews/<reviewId>/status.json` and `reviews/<reviewId>/receipt.json` in the Worker's R2 bucket.
 
 The deployment needs `WORKERS_AI_ACCOUNT_ID` and `WORKERS_AI_API_KEY` as Worker bindings, plus configured `openai-codex` and `claude-code` vault credentials.
