@@ -8,6 +8,31 @@ afterEach(() => {
 const REPOSITORY = "https://github.com/acme/demo.git";
 
 describe("read-only Git proxy", () => {
+  it("refuses a capability minted for another repository before fetching", async () => {
+    const upstream = vi.fn<typeof fetch>(() =>
+      Promise.resolve(new Response("unexpected")),
+    );
+    vi.stubGlobal("fetch", upstream);
+    const runId = "review-one";
+    const capability = await gitCapability(
+      runId,
+      "control-secret",
+      "acme/other",
+    );
+    const url = new URL(
+      `https://review.invalid/git/${capability}/info/refs?service=git-upload-pack`,
+    );
+    const response = await proxyGitFetch(
+      new Request(url, { headers: { "x-review-run": runId } }),
+      url,
+      "control-secret",
+      "installation-token",
+      REPOSITORY,
+    );
+    expect(response.status).toBe(403);
+    expect(upstream).not.toHaveBeenCalled();
+  });
+
   it("rejects receive-pack before making an upstream request", async () => {
     const upstream = vi.fn<typeof fetch>(() =>
       Promise.resolve(new Response("unexpected")),
@@ -15,7 +40,7 @@ describe("read-only Git proxy", () => {
     vi.stubGlobal("fetch", upstream);
     const runId = "push-attempt";
     const secret = "control-secret";
-    const capability = await gitCapability(runId, secret);
+    const capability = await gitCapability(runId, secret, "acme/demo");
     const url = new URL(
       `https://review.invalid/git/${capability}/git-receive-pack`,
     );
@@ -43,7 +68,7 @@ describe("read-only Git proxy", () => {
     vi.stubGlobal("fetch", upstream);
     const runId = "run-1";
     const secret = "control-secret";
-    const capability = await gitCapability(runId, secret);
+    const capability = await gitCapability(runId, secret, "acme/demo");
 
     await proxyGitFetch(
       new Request(
@@ -74,7 +99,7 @@ describe("read-only Git proxy", () => {
     vi.stubGlobal("fetch", upstream);
     const runId = "run-2";
     const secret = "control-secret";
-    const capability = await gitCapability(runId, secret);
+    const capability = await gitCapability(runId, secret, "acme/demo");
     const url = new URL(
       `https://review.invalid/git/${capability}/git-upload-pack`,
     );

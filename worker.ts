@@ -16,6 +16,15 @@ import { createCodexRelayTransport } from "./src/codex-relay";
 import { CredentialVault } from "./src/credential-vault";
 import { gitCapability, proxyGitFetch } from "./src/git-proxy";
 import {
+  allowedRepositories,
+  completeCheck,
+  createCheck,
+  installationToken,
+  type PullRequestEvent,
+  pullRequestEvent,
+  verifyWebhook,
+} from "./src/github-app";
+import {
   assertCloudRunId,
   BRIDGE_COMMAND_MAX_BYTES,
   bridgeCommandFile,
@@ -28,6 +37,7 @@ import {
   parseBridgeCommand,
   parseCloudRunRequest,
   posixQuote,
+  RUN_ID_PATTERN,
   TARGET_UID,
   targetCanaryCommand,
   targetChownCommand,
@@ -88,10 +98,177 @@ type CloudReview = {
   deadlineAt: string;
 };
 
+type AppReview = {
+  event: PullRequestEvent;
+  delivery: string;
+  generation: number;
+  reviewId: string | null;
+  checkRunId: number | null;
+  origin: string;
+  acceptedAt: number;
+  phase: "pending" | "running" | "done";
+};
+
+export class PullRequestReview extends DurableObject<ReviewPiEnv> {
+  async accept(event: PullRequestEvent, delivery: string, origin: string) {
+    if (await this.ctx.storage.get(`delivery:${delivery}`)) return false;
+    await this.ctx.storage.put(`delivery:${delivery}`, true);
+    const current = await this.ctx.storage.get<AppReview>("current");
+    if (current?.checkRunId && current.phase !== "done") {
+      const superseded =
+        (await this.ctx.storage.get<AppReview[]>("superseded")) ?? [];
+      await this.ctx.storage.put("superseded", [...superseded, current]);
+    }
+    const state: AppReview = {
+      event,
+      delivery,
+      generation: (current?.generation ?? 0) + 1,
+      reviewId: null,
+      checkRunId: null,
+      origin,
+      acceptedAt: Date.now(),
+      phase: "pending",
+    };
+    await this.ctx.storage.put("current", state);
+    await this.ctx.storage.setAlarm(Date.now());
+    return true;
+  }
+
+  override async alarm() {
+    const superseded =
+      (await this.ctx.storage.get<AppReview[]>("superseded")) ?? [];
+    if (superseded.length) {
+      const previous = superseded[0]!;
+      try {
+        const token = await installationToken(
+          this.env.GITHUB_APP_ID,
+          this.env.GITHUB_APP_PRIVATE_KEY,
+          previous.event.installationId,
+          previous.event.repository,
+        );
+        await completeCheck(
+          token,
+          previous.event.repository,
+          previous.checkRunId!,
+          "neutral",
+          "A newer pull request event superseded this review.",
+        );
+        await this.ctx.storage.put("superseded", superseded.slice(1));
+      } catch {
+        await this.ctx.storage.setAlarm(Date.now() + 15_000);
+        return;
+      }
+    }
+    const state = await this.ctx.storage.get<AppReview>("current");
+    if (!state || state.phase === "done") return;
+    try {
+      const token = await installationToken(
+        this.env.GITHUB_APP_ID,
+        this.env.GITHUB_APP_PRIVATE_KEY,
+        state.event.installationId,
+        state.event.repository,
+      );
+      if (state.phase === "pending") {
+        state.checkRunId ??= await createCheck(token, state.event);
+        if (
+          (await this.ctx.storage.get<AppReview>("current"))?.generation !==
+          state.generation
+        ) {
+          await completeCheck(
+            token,
+            state.event.repository,
+            state.checkRunId,
+            "neutral",
+            "A newer pull request event superseded this review.",
+          );
+          return;
+        }
+        await this.ctx.storage.put("current", state);
+        const reviewId = assertCloudRunId(`review-${crypto.randomUUID()}`);
+        const review: CloudReview = {
+          reviewId,
+          repository: state.event.repository,
+          pr: state.event.number,
+          head: state.event.head,
+          base: state.event.base,
+          origin: state.origin,
+          deadlineAt: new Date(Date.now() + REVIEW_DEADLINE_MS).toISOString(),
+        };
+        await putReviewJson(this.env, reviewId, "git", {
+          repository: state.event.repository,
+          installationId: state.event.installationId,
+        });
+        await startReview(this.env, review);
+        if (
+          (await this.ctx.storage.get<AppReview>("current"))?.generation !==
+          state.generation
+        )
+          return;
+        state.reviewId = reviewId;
+        state.phase = "running";
+        await this.ctx.storage.put("current", state);
+      }
+      if (state.reviewId && state.checkRunId) {
+        const receipt = await this.env.PROBE_RESULTS.get(
+          reviewKey(state.reviewId, "receipt"),
+        );
+        if (
+          receipt &&
+          (await this.env.REVIEW_JOBS.getByName(state.reviewId).isDone())
+        ) {
+          const value = (await receipt.json()) as {
+            status?: string;
+            findings?: { status?: string }[];
+            failure?: { message?: string };
+          };
+          const success = value.status === "completed";
+          const summary = success
+            ? `Review completed. ${value.findings?.filter((finding) => finding.status === "confirmed").length ?? 0} confirmed finding(s).`
+            : `Review could not complete: ${value.failure?.message ?? "unknown reason"}.`;
+          if (
+            (await this.ctx.storage.get<AppReview>("current"))?.generation !==
+            state.generation
+          )
+            return;
+          await completeCheck(
+            token,
+            state.event.repository,
+            state.checkRunId,
+            success ? "success" : "neutral",
+            summary,
+          );
+          state.phase = "done";
+          await this.ctx.storage.put("current", state);
+          return;
+        }
+        if (Date.now() > state.acceptedAt + REVIEW_DEADLINE_MS + 120_000) {
+          await completeCheck(
+            token,
+            state.event.repository,
+            state.checkRunId,
+            "neutral",
+            "Review did not produce a final receipt before the deadline.",
+          );
+          state.phase = "done";
+          await this.ctx.storage.put("current", state);
+          return;
+        }
+      }
+      await this.ctx.storage.setAlarm(Date.now() + 15_000);
+    } catch {
+      await this.ctx.storage.setAlarm(Date.now() + 15_000);
+    }
+  }
+}
+
 export class ReviewJob extends DurableObject<ReviewPiEnv> {
   async start(review: CloudReview) {
     await this.ctx.storage.put("review", review);
     await this.ctx.storage.setAlarm(Date.now());
+  }
+
+  async isDone() {
+    return (await this.ctx.storage.get<string>("state")) === "done";
   }
 
   override async alarm() {
@@ -289,9 +466,17 @@ type ReviewPiEnv = Record<
   Record<"CODEX_RELAY", DurableObjectNamespace<CodexRelaySandbox>> &
   Record<"PROBE_RESULTS", R2Bucket> &
   Record<"REVIEW_JOBS", DurableObjectNamespace<ReviewJob>> &
-  Record<"CONTROL_SECRET" | "GITHUB_READ_TOKEN", string> & {
+  Record<"PULL_REQUEST_REVIEWS", DurableObjectNamespace<PullRequestReview>> &
+  Record<
+    | "CONTROL_SECRET"
+    | "GITHUB_APP_ID"
+    | "GITHUB_APP_PRIVATE_KEY"
+    | "GITHUB_WEBHOOK_SECRET",
+    string
+  > & {
     /** https clone URL the run's containers fetch through the Git proxy. */
-    TARGET_REPOSITORY?: string;
+    TARGET_REPOSITORIES?: string;
+    GITHUB_READ_TOKEN?: string;
     IMAGE_SOURCE_HASHES?: string;
     WORKERS_AI_API_KEY?: string;
     WORKERS_AI_ACCOUNT_ID?: string;
@@ -520,6 +705,17 @@ const putReviewJson = (
     httpMetadata: { contentType: "application/json" },
   });
 
+async function startReview(env: ReviewPiEnv, review: CloudReview) {
+  await putReviewJson(env, review.reviewId, "status", {
+    phase: "reviewing",
+    reviewers: [],
+    candidates: 0,
+    verified: 0,
+    deadlineAt: review.deadlineAt,
+  });
+  await env.REVIEW_JOBS.getByName(review.reviewId).start(review);
+}
+
 type EngineFailure = { exitCode: number | null; stderr: string | null };
 
 const ENGINE_STDERR_TAIL = 4096;
@@ -643,7 +839,7 @@ async function runCloudReview(env: ReviewPiEnv, review: CloudReview) {
       "review ownership",
       sandbox.exec(targetChownCommand(directory)),
     );
-    const remote = `${review.origin}/git/${await gitCapability(review.reviewId, env.CONTROL_SECRET)}`;
+    const remote = `${review.origin}/git/${await gitCapability(review.reviewId, env.CONTROL_SECRET, review.repository)}`;
     const gitHeader = posixQuote(
       `http.extraHeader=x-review-run: ${review.reviewId}`,
     );
@@ -896,9 +1092,11 @@ async function operatorProbe(
   env: ReviewPiEnv,
   origin: string,
 ) {
-  if (!env.TARGET_REPOSITORY) {
+  if (!env.TARGET_REPOSITORIES) {
     return json({ error: "target_repository_unset" }, 400);
   }
+  if (allowedRepositories(env.TARGET_REPOSITORIES).size !== 1)
+    return json({ error: "repository_ambiguous" }, 400);
   let expectedSources: Record<string, string>;
   let accountId: string;
   let workersBearer: string;
@@ -1001,7 +1199,9 @@ async function operatorProbe(
           "probe ownership",
           sandbox.exec(targetChownCommand(directory)),
         );
-        const remote = `${origin}/git/${await gitCapability(runId, env.CONTROL_SECRET)}`;
+        const repository =
+          [...allowedRepositories(env.TARGET_REPOSITORIES).keys()][0] ?? "";
+        const remote = `${origin}/git/${await gitCapability(runId, env.CONTROL_SECRET, repository)}`;
         const command = `setpriv --reuid=${TARGET_UID} --regid=${TARGET_UID} --clear-groups git -c ${posixQuote(`http.extraHeader=x-review-run: ${runId}`)} clone --depth 1 --no-tags --quiet ${posixQuote(remote)} ${posixQuote(`${directory}/clone`)}`;
         const result = await bounded("probe clone", sandbox.exec(command));
         receipt.clone =
@@ -1237,16 +1437,74 @@ async function operatorProbe(
 export default {
   async fetch(request: Request, env: ReviewPiEnv) {
     const url0 = new URL(request.url);
+    if (url0.pathname === "/github/webhook" && request.method === "POST") {
+      if (!(await verifyWebhook(request, env.GITHUB_WEBHOOK_SECRET)))
+        return json({ error: "unauthorized" }, 401);
+      if (!env.GITHUB_APP_ID || !env.GITHUB_APP_PRIVATE_KEY)
+        return json({ error: "github_app_unconfigured" }, 503);
+      if (request.headers.get("x-github-event") !== "pull_request")
+        return json({ ignored: true });
+      const delivery = request.headers.get("x-github-delivery");
+      if (!delivery || !/^[a-fA-F0-9-]{36}$/.test(delivery))
+        return json({ error: "invalid_delivery" }, 400);
+      let payload: unknown;
+      try {
+        payload = await request.json();
+      } catch {
+        return json({ error: "invalid_webhook" }, 400);
+      }
+      const event = pullRequestEvent(payload);
+      if (!event) return json({ ignored: true });
+      const allowed = allowedRepositories(env.TARGET_REPOSITORIES);
+      if (!allowed.has(event.repository.toLowerCase()))
+        return json({ error: "repository_mismatch" }, 403);
+      const accepted = await env.PULL_REQUEST_REVIEWS.getByName(
+        `${event.repository.toLowerCase()}#${event.number}`,
+      ).accept(event, delivery, url0.origin);
+      return json({ accepted }, 202);
+    }
     if (url0.pathname.startsWith("/git/")) {
-      if (!env.TARGET_REPOSITORY) {
+      const allowed = allowedRepositories(env.TARGET_REPOSITORIES);
+      if (!allowed.size) {
         return json({ error: "target_repository_unset" }, 400);
       }
+      const runId = request.headers.get("x-review-run") ?? "";
+      if (!RUN_ID_PATTERN.test(runId)) return json({ error: "forbidden" }, 403);
+      const metadata = runId.startsWith("review-")
+        ? await env.PROBE_RESULTS.get(reviewKey(runId, "git"))
+        : null;
+      const app = metadata
+        ? ((await metadata.json()) as {
+            repository: string;
+            installationId?: number;
+          })
+        : null;
+      const repository = app
+        ? allowed.get(app.repository.toLowerCase())
+        : allowed.size === 1
+          ? [...allowed.values()][0]
+          : undefined;
+      if (!repository) return json({ error: "repository_mismatch" }, 403);
+      if (
+        url0.pathname.split("/")[2] !==
+        (await gitCapability(runId, env.CONTROL_SECRET, repository))
+      )
+        return json({ error: "forbidden" }, 403);
+      const token = app?.installationId
+        ? await installationToken(
+            env.GITHUB_APP_ID,
+            env.GITHUB_APP_PRIVATE_KEY,
+            app.installationId,
+            app.repository,
+          )
+        : env.GITHUB_READ_TOKEN;
+      if (!token) return json({ error: "git_unconfigured" }, 503);
       return proxyGitFetch(
         request,
         url0,
         env.CONTROL_SECRET,
-        env.GITHUB_READ_TOKEN,
-        env.TARGET_REPOSITORY,
+        token,
+        repository,
       );
     }
 
@@ -1301,7 +1559,7 @@ export default {
       request.method === "POST" &&
       segments.length === 1
     ) {
-      if (!env.TARGET_REPOSITORY)
+      if (!env.TARGET_REPOSITORIES)
         return json({ error: "target_repository_unset" }, 400);
       if (
         !env.WORKERS_AI_API_KEY ||
@@ -1322,13 +1580,11 @@ export default {
         input = parsed as Record<string, unknown>;
         parseExpectedSources(JSON.parse(env.IMAGE_SOURCE_HASHES));
         const repository = input["repository"];
-        const configured = new URL(env.TARGET_REPOSITORY).pathname
-          .replace(/^\//, "")
-          .replace(/\.git$/, "");
+        const configured = allowedRepositories(env.TARGET_REPOSITORIES);
         if (
           typeof repository !== "string" ||
           !/^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/.test(repository) ||
-          repository.toLowerCase() !== configured.toLowerCase()
+          !configured.has(repository.toLowerCase())
         )
           return json({ error: "repository_mismatch" }, 403);
         if (
@@ -1359,14 +1615,10 @@ export default {
         origin: url.origin,
         deadlineAt: new Date(Date.now() + REVIEW_DEADLINE_MS).toISOString(),
       };
-      await putReviewJson(env, reviewId, "status", {
-        phase: "reviewing",
-        reviewers: [],
-        candidates: 0,
-        verified: 0,
-        deadlineAt: review.deadlineAt,
+      await putReviewJson(env, reviewId, "git", {
+        repository: review.repository,
       });
-      await env.REVIEW_JOBS.getByName(reviewId).start(review);
+      await startReview(env, review);
       return json({ reviewId }, 202);
     }
 
@@ -1428,15 +1680,17 @@ export default {
       // A run that does not name the repository its lanes clone cannot be
       // served: every container fetches through this Worker's Git proxy, and
       // there is no upstream to fall back to.
-      if (!env.TARGET_REPOSITORY) {
+      if (!env.TARGET_REPOSITORIES) {
         return json(
           {
             error: "target_repository_unset",
-            detail: "TARGET_REPOSITORY is unset",
+            detail: "TARGET_REPOSITORIES is unset",
           },
           400,
         );
       }
+      if (allowedRepositories(env.TARGET_REPOSITORIES).size !== 1)
+        return json({ error: "repository_ambiguous" }, 400);
       let parsed: ReturnType<typeof parseCloudRunRequest>;
       let expectedSources: Record<string, string>;
       try {
@@ -1463,7 +1717,7 @@ export default {
       const job = {
         ...parsed.job,
         expectedSources,
-        gitRemote: `${url.origin}/git/${await gitCapability(parsed.job.runId, env.CONTROL_SECRET)}`,
+        gitRemote: `${url.origin}/git/${await gitCapability(parsed.job.runId, env.CONTROL_SECRET, [...allowedRepositories(env.TARGET_REPOSITORIES).keys()][0] ?? "")}`,
       };
       const sandbox = getSandbox(env.REVIEW_SANDBOX, job.runId);
       const directory = runDir(job.runId);
