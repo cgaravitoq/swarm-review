@@ -926,21 +926,25 @@ describe("deployed container image", () => {
     expect(tracked.sort()).toEqual(Object.values(IMAGE_SOURCES).sort());
   });
 
-  it("pins what the image installs in the Dockerfile's own bytes", async () => {
-    const dockerfile = await readFile(
-      path.join(packageRoot, "container", "Dockerfile"),
-      "utf8",
-    );
+  it("pins what each image installs in its Dockerfile's own bytes", async () => {
     const manifest = JSON.parse(
       await readFile(path.join(packageRoot, "package.json"), "utf8"),
     ) as { dependencies: Record<string, string> };
+    const base = `FROM docker.io/cloudflare/sandbox:${manifest.dependencies["@cloudflare/sandbox"]}`;
 
-    // A build argument would move pi, bun or the base without moving the
-    // bytes the gate compares.
-    expect(dockerfile).not.toMatch(/^\s*ARG\s/m);
-    expect(dockerfile).toContain(
-      `FROM docker.io/cloudflare/sandbox:${manifest.dependencies["@cloudflare/sandbox"]} AS bun`,
-    );
+    for (const [image, from] of [
+      ["container", `${base} AS bun`],
+      ["relay", base],
+    ] as const) {
+      const dockerfile = await readFile(
+        path.join(packageRoot, image, "Dockerfile"),
+        "utf8",
+      );
+      // A build argument would move pi, bun or the base without moving the
+      // bytes the gate compares.
+      expect(dockerfile).not.toMatch(/^\s*ARG\s/m);
+      expect(dockerfile.split("\n")).toContain(from);
+    }
   });
 
   it("boots the relay image with no interpreter pools beside the relay", async () => {
