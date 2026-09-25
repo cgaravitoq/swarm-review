@@ -445,6 +445,8 @@ export const targetCanaryCommand = (
   directory: string,
   handle: string,
   targetUrl: string,
+  name = "canary",
+  headers: readonly string[] = [],
 ) => {
   if (
     targetUrl === "" ||
@@ -456,7 +458,8 @@ export const targetCanaryCommand = (
   if (handle === "" || /[\r\n]/.test(handle)) {
     throw new Error("broker handle missing");
   }
-  return `setpriv --reuid=${TARGET_UID} --regid=${TARGET_UID} --clear-groups curl -sS --max-time 60 -o ${posixQuote(`${directory}/canary-response.txt`)} -w '%{http_code}' -H ${posixQuote(`authorization: Bearer ${handle}`)} -H ${posixQuote("content-type: application/json")} --data-binary @${posixQuote(`${directory}/canary-request.json`)} ${posixQuote(targetUrl)}`;
+  if (!/^[a-z-]+$/.test(name)) throw new Error("canary name invalid");
+  return `setpriv --reuid=${TARGET_UID} --regid=${TARGET_UID} --clear-groups curl -sS --max-time 60 -o ${posixQuote(`${directory}/${name}-response.txt`)} -w '%{http_code}' -H ${posixQuote(`authorization: Bearer ${handle}`)} -H ${posixQuote("content-type: application/json")} ${headers.map((header) => `-H ${posixQuote(header)}`).join(" ")} --data-binary @${posixQuote(`${directory}/${name}-request.json`)} ${posixQuote(targetUrl)}`;
 };
 
 const asRecord = (value: unknown) =>
@@ -486,6 +489,7 @@ const providerEvents = (body: string) => {
 
 const textOf = (value: unknown): string => {
   if (typeof value === "string") return value;
+  if (Array.isArray(value)) return value.map(textOf).join("");
   const record = asRecord(value);
   if (!record) return "";
   if (typeof record["content"] === "string") return record["content"];
@@ -508,6 +512,9 @@ const eventError = (event: Record<string, unknown>) => {
 
 const eventStop = (event: Record<string, unknown>) => {
   if (event["done"] === true) return "stop";
+  if (event["stop_reason"] === "end_turn") return "stop";
+  const delta = asRecord(event["delta"]);
+  if (delta?.["stop_reason"] === "end_turn") return "stop";
   if (typeof event["stopReason"] === "string") return event["stopReason"];
   if (typeof event["finish_reason"] === "string") return event["finish_reason"];
   if (
@@ -528,6 +535,8 @@ const eventStop = (event: Record<string, unknown>) => {
 
 const eventOutput = (event: Record<string, unknown>) => {
   const parts: string[] = [];
+  if (Array.isArray(event["content"])) parts.push(textOf(event["content"]));
+  parts.push(textOf(event["delta"]));
   if (typeof event["output_text"] === "string")
     parts.push(event["output_text"]);
   if (typeof event["text"] === "string") parts.push(event["text"]);

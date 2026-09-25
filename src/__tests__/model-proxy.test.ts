@@ -302,7 +302,13 @@ describe("model proxy", () => {
     expect(await response.json()).toEqual({
       error: { type: "review_pi_model", reason: "codex_relay_failed" },
     });
-    expect(recorded).toHaveBeenCalledWith(runId, null, true, null);
+    expect(recorded).toHaveBeenCalledWith(
+      runId,
+      null,
+      true,
+      null,
+      "review-pi-handle",
+    );
   });
 
   it("names the relay in every relay failure, vault or carried bearer", async () => {
@@ -327,7 +333,13 @@ describe("model proxy", () => {
         expect(await response.json()).toEqual({
           error: { type: "review_pi_model", reason },
         });
-        expect(recorded).toHaveBeenCalledWith(runId, null, true, null);
+        expect(recorded).toHaveBeenCalledWith(
+          runId,
+          null,
+          true,
+          null,
+          "review-pi-handle",
+        );
       }
     }
   });

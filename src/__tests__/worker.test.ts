@@ -10,6 +10,7 @@ import {
   imageBuildArguments,
   targetCheckout,
 } from "../../scripts/deploy";
+import { probeMany } from "../../scripts/probe";
 import { gitCapability } from "../git-proxy";
 import { CONTROL_DIR, MODEL_BROKER, TARGET_UID } from "../isolation";
 import { emptyModelTotals, modelCapability } from "../model-proxy";
@@ -47,6 +48,7 @@ const env = {
   CODEX_RELAY: {} as DurableObjectNamespace<
     InstanceType<typeof CodexRelaySandbox>
   >,
+  PROBE_RESULTS: {} as R2Bucket,
   CONTROL_SECRET: "control-secret",
   OPENCODE_API_KEY: "model-secret",
   WORKERS_AI_API_KEY: "workers-ai-secret",
@@ -134,6 +136,439 @@ const startBody = (overrides: Record<string, unknown> = {}) =>
 afterEach(() => {
   vi.restoreAllMocks();
   vi.unstubAllGlobals();
+});
+
+describe("operator probe", () => {
+  it("starts a burst concurrently and reports every R2 key", async () => {
+    const pending: ((response: Response) => void)[] = [];
+    const fetchProbe = vi.fn<typeof fetch>(async (_url, init) => {
+      expect(init?.method).toBe("POST");
+      expect(new Headers(init?.headers).get("authorization")).toBe(
+        "Bearer fake-control-secret",
+      );
+      const body = JSON.parse(String(init?.body));
+      expect(body.workersAi).toEqual({
+        accountId: "fake-account",
+        bearer: "fake-workers-bearer",
+      });
+      expect(Object.keys(body.expectedSources)).toEqual(
+        Object.keys(IMAGE_SOURCES),
+      );
+      return new Promise<Response>((resolve) => pending.push(resolve));
+    });
+    vi.stubGlobal("fetch", fetchProbe);
+    const resultsPromise = probeMany(
+      "https://review.invalid",
+      "fake-control-secret",
+      "fake-account",
+      "fake-workers-bearer",
+      5,
+    );
+    await vi.waitFor(() => expect(pending).toHaveLength(5));
+    for (let index = 0; index < pending.length; index += 1) {
+      const requestBody = JSON.parse(
+        String(fetchProbe.mock.calls[index]?.[1]?.body),
+      );
+      pending[index]?.(
+        new Response(
+          JSON.stringify({
+            key: `probes/${requestBody.runId}.json`,
+            status: "ok",
+          }),
+        ),
+      );
+    }
+    const results = await resultsPromise;
+    expect(results).toHaveLength(5);
+    expect(new Set(results.map((result) => result.key)).size).toBe(5);
+    expect(
+      results.every((result) => result.key === `probes/${result.runId}.json`),
+    ).toBe(true);
+  });
+
+  const input = () => ({
+    runId: "probe-test",
+    expectedSources: expectedSources(),
+    workersAi: { accountId: "fake-account", bearer: "fake-workers-bearer" },
+  });
+
+  const setup = (
+    failure?: "cold" | "clone" | "claude" | "relay" | "session",
+  ) => {
+    const files = new Map<string, string>();
+    const stored = new Map<string, unknown>();
+    const storage = {
+      get: async (key: string) => stored.get(key),
+      put: async (key: string, value: unknown) => {
+        stored.set(key, value);
+      },
+      delete: async (key: string) => stored.delete(key),
+    };
+    const sandbox = new ReviewSandbox({} as never, env as never);
+    Object.assign(sandbox, { ctx: { storage } });
+    const destroy = vi.fn(async () => undefined);
+    const putProbeSessions = sandbox.putProbeSessions.bind(sandbox);
+    Object.assign(sandbox, {
+      mkdir: vi.fn(async () => undefined),
+      writeFile: vi.fn(async (path: string, body: string) => {
+        files.set(path, body);
+      }),
+      putProbeSessions: vi.fn(async (sessions: Record<string, unknown>) => {
+        if (failure === "session") throw new Error("session failed");
+        await putProbeSessions(sessions as never);
+      }),
+      destroy,
+    });
+    const vault = {
+      credential: vi.fn(async (provider: string) => ({
+        authorization: `Bearer fake-${provider}-bearer`,
+        ...(provider === "openai-codex"
+          ? { accountId: "fake-codex-account" }
+          : {}),
+      })),
+    };
+    const object = {
+      head: vi.fn(async (_key: string) => null),
+      put: vi.fn(
+        async (_key: string, _body: string, _options?: unknown) => undefined,
+      ),
+    };
+    const relayProcess = {
+      id: "relay",
+      status: "running",
+      command: "/usr/local/bun/bin/bun /opt/relay/server.ts",
+      waitForPort: vi.fn(async () => undefined),
+    };
+    const relay = {
+      listProcesses: vi.fn(async () => [relayProcess]),
+      getProcess: vi.fn(async () => relayProcess),
+      containerFetch: vi.fn(async (url: string, init: RequestInit) => {
+        expect(url).toBe("http://codex-relay/codex/responses");
+        expect(init.method).toBe("POST");
+        expect(new Headers(init.headers).get("authorization")).toBe(
+          "Bearer fake-openai-codex-bearer",
+        );
+        expect(new Headers(init.headers).get("chatgpt-account-id")).toBe(
+          "fake-codex-account",
+        );
+        expect(JSON.parse(await new Response(init.body).text())).toEqual({
+          model: "gpt-5.4",
+          input: [
+            {
+              role: "user",
+              content: [{ type: "input_text", text: "Reply with pong." }],
+            },
+          ],
+          stream: true,
+          store: false,
+        });
+        if (failure === "relay") throw new Error("relay unavailable");
+        return new Response(
+          JSON.stringify({
+            status: "completed",
+            output: [{ content: [{ text: "pong" }] }],
+          }),
+        );
+      }),
+    };
+    const probeEnv = {
+      ...env,
+      PROBE_RESULTS: Object.assign({} as R2Bucket, object),
+      CREDENTIAL_VAULT: Object.assign({} as typeof env.CREDENTIAL_VAULT, {
+        getByName: () => vault,
+      }),
+    };
+    const direct = vi.fn<typeof fetch>(async (url, init) => {
+      const target = String(url);
+      const headers = new Headers(init?.headers);
+      const body = JSON.parse(await new Response(init?.body).text());
+      if (target.includes("api.cloudflare.com")) {
+        expect(target).toBe(
+          "https://api.cloudflare.com/client/v4/accounts/fake-account/ai/v1/chat/completions",
+        );
+        expect(headers.get("authorization")).toBe("Bearer fake-workers-bearer");
+        expect(body).toEqual({
+          model: "@cf/deepseek-ai/deepseek-v4-flash-0731",
+          messages: [{ role: "user", content: "Reply with pong." }],
+          max_tokens: 16,
+        });
+        return new Response(
+          JSON.stringify({
+            choices: [{ message: { content: "pong" }, finish_reason: "stop" }],
+          }),
+        );
+      }
+      expect(target).toBe("https://api.anthropic.com/v1/messages");
+      expect(headers.get("authorization")).toBe(
+        "Bearer fake-claude-code-bearer",
+      );
+      expect(headers.get("anthropic-version")).toBe("2023-06-01");
+      expect(headers.get("anthropic-beta")).toBe(
+        "oauth-2025-04-20,claude-code-20250219",
+      );
+      expect(body).toEqual({
+        model: "claude-opus-5",
+        max_tokens: 16,
+        stream: true,
+        messages: [{ role: "user", content: "Reply with pong." }],
+        system: [
+          {
+            type: "text",
+            text: "You are Claude Code, Anthropic's official CLI for Claude.",
+          },
+        ],
+      });
+      return failure === "claude"
+        ? new Response("upstream failure", { status: 503 })
+        : new Response(
+            JSON.stringify({
+              content: [{ text: "pong" }],
+              stop_reason: "end_turn",
+            }),
+          );
+    });
+    vi.stubGlobal("fetch", direct);
+    const exec = vi.fn(async (command: string) => {
+      if (command.includes("sha256sum")) {
+        if (failure === "cold") throw new Error("cold failed");
+        return { stdout: fingerprintStdout(), exitCode: 0 };
+      }
+      if (command.includes("git -c"))
+        return { stdout: "", exitCode: failure === "clone" ? 1 : 0 };
+      if (command.includes("curl -sS")) {
+        const url = command.match(/'(https:\/\/[^']+\/model\/[^']+)'/)?.[1];
+        const handle = command.match(/authorization: Bearer ([^']+)/)?.[1];
+        const family = command.match(
+          /(workers-ai|openai-codex|claude-code)-response\.txt/,
+        )?.[1];
+        if (!url || !handle || !family) throw new Error("bad model command");
+        if (family === "claude-code")
+          expect(command).toContain(
+            "anthropic-beta: oauth-2025-04-20,claude-code-20250219",
+          );
+        const requestBody = files.get(
+          `/workspace/runs/probe-test/${family}-request.json`,
+        );
+        if (!requestBody) throw new Error("missing request body");
+        const response = await handler.fetch(
+          new Request(url, {
+            method: "POST",
+            headers: {
+              authorization: `Bearer ${handle}`,
+              "content-type": "application/json",
+              ...(family === "claude-code"
+                ? {
+                    "anthropic-version": "2023-06-01",
+                    "anthropic-beta": "oauth-2025-04-20,claude-code-20250219",
+                  }
+                : {}),
+            },
+            body: requestBody,
+          }),
+          probeEnv,
+        );
+        files.set(
+          `/workspace/runs/probe-test/${family}-response.txt`,
+          await response.text(),
+        );
+        return { stdout: String(response.status), exitCode: 0 };
+      }
+      if (command.startsWith("stat -c")) {
+        const path = command.match(/'([^']+)'/)?.[1] ?? "";
+        return {
+          stdout: files.has(path) ? `${files.get(path)?.length}\n` : "-1\n",
+          exitCode: 0,
+        };
+      }
+      if (command.startsWith("head -c")) {
+        const path = command.match(/'([^']+)'/)?.[1] ?? "";
+        return { stdout: files.get(path) ?? "", exitCode: 0 };
+      }
+      return { stdout: "", exitCode: 0 };
+    });
+    Object.assign(sandbox, { exec });
+    getSandbox.mockImplementation((_namespace: unknown, id: string) =>
+      id === "swarm-review-codex-egress" ? relay : sandbox,
+    );
+    return {
+      sandbox,
+      destroy,
+      exec,
+      direct,
+      relay,
+      vault,
+      object,
+      probeEnv,
+      files,
+      stored,
+    };
+  };
+
+  it("runs exactly one request per family through the model proxy and stores a timed R2 receipt", async () => {
+    const fixture = setup();
+    const response = await handler.fetch(
+      authorized("https://review.invalid/probe", {
+        method: "POST",
+        body: JSON.stringify(input()),
+      }),
+      fixture.probeEnv,
+    );
+    expect(response.status).toBe(200);
+    expect(await response.json()).toEqual({
+      key: "probes/probe-test.json",
+      runId: "probe-test",
+      status: "ok",
+    });
+    expect(fixture.direct).toHaveBeenCalledTimes(2);
+    expect(fixture.relay.containerFetch).toHaveBeenCalledOnce();
+    expect(fixture.vault.credential.mock.calls.map((call) => call[0])).toEqual([
+      "openai-codex",
+      "claude-code",
+    ]);
+    expect(
+      fixture.exec.mock.calls.filter((call) => call[0].includes("curl -sS")),
+    ).toHaveLength(3);
+    expect(
+      fixture.exec.mock.calls.find((call) => call[0].includes("git -c"))?.[0],
+    ).toContain("clone --depth 1 --no-tags");
+    expect(fixture.object.put).toHaveBeenCalledOnce();
+    const [key, raw] = fixture.object.put.mock.calls[0] ?? [];
+    expect(key).toBe("probes/probe-test.json");
+    const receipt = JSON.parse(raw ?? "");
+    expect(Object.keys(receipt)).toEqual([
+      "runId",
+      "clock",
+      "startedAt",
+      "coldStart",
+      "clone",
+      "sessionSetup",
+      "models",
+      "sessionClear",
+      "shutdown",
+    ]);
+    expect(receipt.clock).toBe("worker.performance.now");
+    expect(Object.keys(receipt.models)).toEqual([
+      "workers-ai",
+      "openai-codex",
+      "claude-code",
+    ]);
+    expect(fixture.object.put.mock.calls[0]?.[2]).toEqual({
+      httpMetadata: { contentType: "application/json" },
+    });
+    for (const phase of [
+      receipt.coldStart,
+      receipt.clone,
+      receipt.sessionSetup,
+      ...Object.values(receipt.models),
+      receipt.sessionClear,
+      receipt.shutdown,
+    ] as { status: string; durationMs: number }[]) {
+      expect(phase.status).toBe("ok");
+      expect(phase.durationMs).toBeGreaterThan(0);
+    }
+    expect(raw).not.toContain("fake-workers-bearer");
+    expect(raw).not.toContain("fake-openai-codex-bearer");
+    expect(JSON.stringify([...fixture.files.values()])).not.toContain(
+      "fake-workers-bearer",
+    );
+    expect(JSON.stringify(fixture.exec.mock.calls)).not.toContain(
+      "fake-workers-bearer",
+    );
+    expect(fixture.stored.has("probeSessions")).toBe(false);
+    expect(fixture.destroy).toHaveBeenCalledOnce();
+  });
+
+  it.each(["cold", "clone", "claude", "relay", "session"] as const)(
+    "destroys after %s failure and records the failed phase",
+    async (failure) => {
+      const fixture = setup(failure);
+      await handler.fetch(
+        authorized("https://review.invalid/probe", {
+          method: "POST",
+          body: JSON.stringify(input()),
+        }),
+        fixture.probeEnv,
+      );
+      const raw = fixture.object.put.mock.calls[0]?.[1] ?? "";
+      const receipt = JSON.parse(raw);
+      expect(fixture.destroy).toHaveBeenCalledOnce();
+      expect(receipt.shutdown.status).toBe("ok");
+      if (failure === "cold") {
+        expect(receipt.coldStart).toMatchObject({
+          status: "failed",
+          phase: "source_fingerprint",
+        });
+        expect(receipt.clone).toMatchObject({
+          status: "unobserved",
+          durationMs: null,
+        });
+      }
+      if (failure === "clone")
+        expect(receipt.clone).toMatchObject({
+          status: "failed",
+          phase: "git_clone",
+        });
+      if (failure === "claude") {
+        expect(receipt.models["claude-code"]).toMatchObject({
+          status: "failed",
+          phase: "model_request",
+          httpStatus: 503,
+        });
+        expect(receipt.models["workers-ai"].status).toBe("ok");
+        expect(receipt.models["openai-codex"].status).toBe("ok");
+      }
+      if (failure === "relay") {
+        expect(receipt.models["openai-codex"]).toMatchObject({
+          status: "failed",
+          phase: "model_request",
+          httpStatus: 502,
+          reason: "codex_relay_failed",
+        });
+        expect(receipt.models["workers-ai"].status).toBe("ok");
+        expect(receipt.models["claude-code"].status).toBe("ok");
+      }
+      if (failure === "session") {
+        expect(receipt.sessionSetup).toMatchObject({
+          status: "failed",
+          phase: "session_setup",
+        });
+        expect(receipt.models["workers-ai"]).toMatchObject({
+          status: "unobserved",
+          durationMs: null,
+        });
+      }
+    },
+  );
+
+  it("refuses an unauthenticated probe before starting a Sandbox", async () => {
+    const fixture = setup();
+    const response = await handler.fetch(
+      new Request("https://review.invalid/probe", {
+        method: "POST",
+        body: JSON.stringify(input()),
+      }),
+      fixture.probeEnv,
+    );
+    expect(response.status).toBe(401);
+    expect(fixture.exec).not.toHaveBeenCalled();
+    expect(fixture.object.put).not.toHaveBeenCalled();
+  });
+
+  it("destroys the Sandbox even when R2 rejects the receipt", async () => {
+    const fixture = setup();
+    fixture.object.put.mockRejectedValueOnce(new Error("R2 failed"));
+    await expect(
+      handler.fetch(
+        authorized("https://review.invalid/probe", {
+          method: "POST",
+          body: JSON.stringify(input()),
+        }),
+        fixture.probeEnv,
+      ),
+    ).rejects.toThrow("R2 failed");
+    expect(fixture.destroy).toHaveBeenCalledOnce();
+    expect(fixture.stored.has("probeSessions")).toBe(false);
+  });
 });
 
 const sandboxForStart = () => {

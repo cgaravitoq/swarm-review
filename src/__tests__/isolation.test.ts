@@ -283,6 +283,18 @@ describe("control API containment probe", () => {
 });
 
 describe("provider canary interpretation", () => {
+  it("accepts an Anthropic Messages stream only after text and end_turn", () => {
+    const body = [
+      'data: {"type":"content_block_delta","delta":{"type":"text_delta","text":"pong"}}',
+      'data: {"type":"message_delta","delta":{"stop_reason":"end_turn"}}',
+    ].join("\n");
+    expect(interpretProviderCanary(200, body)).toMatchObject({
+      completed: true,
+      stopReason: "stop",
+      output: "pong",
+    });
+  });
+
   it("rejects a 200 SSE body that ends in a provider error", () => {
     const body = [
       'data: {"choices":[{"delta":{"content":"hi"}}]}',

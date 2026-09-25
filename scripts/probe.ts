@@ -1,0 +1,87 @@
+import { createHash, randomUUID } from "node:crypto";
+import { readFile } from "node:fs/promises";
+import { dirname, join } from "node:path";
+import { fileURLToPath } from "node:url";
+import { IMAGE_SOURCES } from "../src/protocol";
+
+const packageRoot = join(dirname(fileURLToPath(import.meta.url)), "..");
+
+export async function probeMany(
+  origin: string,
+  secret: string,
+  accountId: string,
+  bearer: string,
+  count: number,
+) {
+  if (!Number.isInteger(count) || count < 1 || count > 30) {
+    throw new Error("probe count must be between 1 and 30");
+  }
+  const worker = new URL(origin);
+  if (worker.protocol !== "https:")
+    throw new Error("worker origin must use HTTPS");
+  const expectedSources = Object.fromEntries(
+    await Promise.all(
+      Object.entries(IMAGE_SOURCES).map(async ([target, source]) => [
+        target,
+        createHash("sha256")
+          .update(await readFile(join(packageRoot, "container", source)))
+          .digest("hex"),
+      ]),
+    ),
+  );
+  return Promise.all(
+    Array.from({ length: count }, async () => {
+      const runId = `probe-${randomUUID()}`;
+      const response = await fetch(new URL("/probe", worker), {
+        method: "POST",
+        headers: {
+          authorization: `Bearer ${secret}`,
+          "content-type": "application/json",
+        },
+        body: JSON.stringify({
+          runId,
+          expectedSources,
+          workersAi: { accountId, bearer },
+        }),
+        redirect: "manual",
+      });
+      if (!response.ok)
+        throw new Error(`probe ${runId}: HTTP ${response.status}`);
+      const result: unknown = await response.json();
+      if (
+        typeof result !== "object" ||
+        result === null ||
+        !("key" in result) ||
+        typeof result.key !== "string"
+      )
+        throw new Error(`probe ${runId}: missing R2 key`);
+      return {
+        runId,
+        key: result.key,
+        status: "status" in result ? result.status : null,
+      };
+    }),
+  );
+}
+
+if (import.meta.main) {
+  const [origin, rawCount] = process.argv.slice(2);
+  const secret = process.env["CONTROL_SECRET"];
+  const accountId = process.env["CLOUDFLARE_ACCOUNT_ID"];
+  const bearer = process.env["WORKERS_AI_API_KEY"];
+  if (!origin || !secret || !accountId || !bearer) {
+    throw new Error(
+      "usage: CONTROL_SECRET=... CLOUDFLARE_ACCOUNT_ID=... WORKERS_AI_API_KEY=... bun run scripts/probe.ts <worker-origin> [count]",
+    );
+  }
+  const count = rawCount === undefined ? 1 : Number(rawCount);
+  for (const result of await probeMany(
+    origin,
+    secret,
+    accountId,
+    bearer,
+    count,
+  )) {
+    process.stdout.write(`${result.runId} ${result.key} ${result.status}\n`);
+  }
+}
