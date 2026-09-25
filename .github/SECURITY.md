@@ -27,4 +27,4 @@ A model that reaches a wrong conclusion is the thing the eval harness measures, 
 The repository under review is untrusted, and the review runs its install and its check commands on purpose.
 A report that amount of trust being granted is not a finding; a report that a lane can reach past it is.
 
-`TARGET_REPOSITORY` is unset by default, and a Worker deployed without it refuses every run rather than falling back to some other repository.
+`TARGET_REPOSITORIES` is unset by default, and a Worker deployed without it refuses every run rather than falling back to some other repository.

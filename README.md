@@ -171,12 +171,17 @@ The GitHub App sends signed `pull_request` and `check_run` webhooks to `POST /gi
 The Worker accepts `opened`, `reopened`, and `ready_for_review` for non-draft PRs authored by an owner, member, or collaborator in the allowlist.
 One Durable Object per PR deduplicates delivery IDs, starts the same cloud review after the webhook response, and publishes an advisory `swarm-review` check on the PR head.
 The review runs against the merge base of the PR's base and head, so its receipt is published as one PR review with inline comments on the lines the three-dot diff touches.
+The review's brief is `.swarm-review/brief.md` read at the PR's base commit, never its head, so a pull request cannot rewrite the instructions its own review follows.
+Without that file the review runs on the default brief; a brief over 64 000 characters or one that cannot be read also falls back, and the check says so.
+While the review runs, the check shows its phase and each reviewer's family, model and state, updated when one of them changes.
 The object records a publish intent before the POST, and every retry looks for the review's marker on the PR first, so a review is posted once.
 A head that moved on top of the reviewed commit still gets the review at that commit; a commit force-pushed away gets none.
 The check completes with `success` when the review is published, or `neutral` with the reason; it never fails the PR.
+A failed or partial review's check names each lane with its family, model, status, stop reason and error.
 A push (`synchronize`) starts no review: the new head gets a `neutral` check with a Review button, and a run already in flight finishes on its own SHA.
 Review and Re-run on that check start a new generation if its commit is still the head of an open PR, and the newer generation stops the older one's cloud review and keeps it from publishing.
-A 403, 404, or 422 from GitHub ends that generation's retries with the reason recorded and does not block later generations.
+A 403, 404, or 422 from GitHub ends that generation's retries, completes its check with the reason, and does not block later generations.
+A rate-limited 403 or 429 is retried after the reset GitHub names instead.
 Set `GITHUB_APP_ID`, `GITHUB_APP_PRIVATE_KEY` (PKCS#8 PEM), and `GITHUB_WEBHOOK_SECRET` as Worker secrets before installing the App.
 The App installation token is restricted to the event's repository and replaces the read token for that review's git proxy requests.
 
