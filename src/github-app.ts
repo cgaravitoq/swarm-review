@@ -402,3 +402,24 @@ export async function readBrief(
     return unused("could not be read");
   }
 }
+
+export async function updateCheck(
+  token: string,
+  repository: string,
+  checkRunId: number,
+  summary: string,
+): Promise<void> {
+  const response = await fetch(
+    `${api}/repos/${repository}/check-runs/${checkRunId}`,
+    {
+      method: "PATCH",
+      headers: headers(token),
+      body: JSON.stringify({
+        status: "in_progress",
+        output: { title: "Swarm review in progress", summary },
+      }),
+    },
+  );
+  if (!response.ok)
+    throw new GitHubRequestError(`update_check_${response.status}`, response);
+}

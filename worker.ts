@@ -27,6 +27,7 @@ import {
   type PullRequestEvent,
   pullRequestEvent,
   readBrief,
+  updateCheck,
   verifyWebhook,
 } from "./src/github-app";
 import {
@@ -128,8 +129,16 @@ type AppReview = {
   acceptedAt: number;
   phase: "pending" | "running" | "publishing" | "done";
   outcome: string | null;
-  briefNote?: string | null;
+  briefNote: string | null;
+  progress: string | null;
 };
+
+const plain = (value: unknown) =>
+  `\`${String(value ?? "none")
+    .replace(/\s+/g, " ")
+    .slice(0, 160)
+    .replaceAll("`", "'")
+    .replaceAll("<", "‹")}\``;
 
 const SUPERSEDED_SUMMARY = "A newer pull request event superseded this review.";
 
@@ -164,6 +173,8 @@ export class PullRequestReview extends DurableObject<ReviewPiEnv> {
       acceptedAt: Date.now(),
       phase: "pending",
       outcome: null,
+      briefNote: null,
+      progress: null,
     };
     await this.ctx.storage.put("current", state);
     await this.ctx.storage.setAlarm(Date.now());
@@ -325,8 +336,10 @@ export class PullRequestReview extends DurableObject<ReviewPiEnv> {
           !receiptObject ||
           !(await this.env.REVIEW_JOBS.getByName(state.reviewId!).isDone())
         ) {
-          if (Date.now() <= state.acceptedAt + REVIEW_DEADLINE_MS + 120_000)
+          if (Date.now() <= state.acceptedAt + REVIEW_DEADLINE_MS + 120_000) {
+            await this.reportProgress(token, state);
             return true;
+          }
           await this.finish(
             token,
             state,
@@ -385,6 +398,38 @@ export class PullRequestReview extends DurableObject<ReviewPiEnv> {
       }
       return false;
     }
+  }
+
+  private async reportProgress(token: string, state: AppReview) {
+    const status = await (
+      await this.env.PROBE_RESULTS.get(reviewKey(state.reviewId!, "status"))
+    )
+      ?.json<Record<string, unknown> | null>()
+      .catch(() => null);
+    if (typeof status !== "object" || status === null) return;
+    const reviewers = Array.isArray(status["reviewers"])
+      ? (status["reviewers"] as (Record<string, unknown> | null)[])
+      : [];
+    const progress = [
+      `Phase: ${plain(status["phase"])}.`,
+      ...reviewers.map(
+        (reviewer) =>
+          `- ${plain(reviewer?.["family"])} ${plain(reviewer?.["model"])}: ${plain(reviewer?.["state"])}`,
+      ),
+    ].join("\n");
+    if (progress === state.progress) return;
+    try {
+      await updateCheck(
+        token,
+        state.event.repository,
+        state.checkRunId!,
+        state.briefNote ? `${progress}\n\n${state.briefNote}` : progress,
+      );
+    } catch {
+      return;
+    }
+    state.progress = progress;
+    await this.save(state);
   }
 
   private async publish(

@@ -202,11 +202,21 @@ const github = (
       ),
     checks: () =>
       calls
-        .filter((call) => call.method === "PATCH")
+        .filter(
+          (call) =>
+            call.method === "PATCH" &&
+            (call.body as { status: string }).status === "completed",
+        )
         .map((call) => ({
           url: call.url,
           ...(call.body as { conclusion: string; output: object }),
         })),
+    progress: () =>
+      calls.filter(
+        (call) =>
+          call.method === "PATCH" &&
+          (call.body as { status: string }).status === "in_progress",
+      ),
   };
 };
 
@@ -419,7 +429,18 @@ describe("GitHub App webhook", () => {
       "Bearer installation-token",
     );
     expect(calls[3]).toMatchObject({ method: "GET", url: BRIEF_AT_BASE });
-    expect(calls).toHaveLength(4);
+    expect(calls[4]).toMatchObject({
+      method: "PATCH",
+      url: `${API}/check-runs/99`,
+      body: {
+        status: "in_progress",
+        output: {
+          title: "Swarm review in progress",
+          summary: "Phase: `reviewing`.",
+        },
+      },
+    });
+    expect(calls).toHaveLength(5);
     expect(job.start.mock.calls[0]![0]).not.toHaveProperty("context");
     expect(state).toMatchObject({ briefNote: null });
   });
@@ -524,6 +545,87 @@ describe("GitHub App webhook", () => {
       });
     },
   );
+
+  it("updates the running check once per phase or reviewer change", async () => {
+    const { pr, r2, stored, storage, started } = fixture();
+    const gh = github();
+    const reviewId = await started();
+    const progress = () =>
+      gh.progress().map((call) => {
+        expect(call.url).toBe(`${API}/check-runs/99`);
+        expect(call.headers.get("authorization")).toBe(
+          "Bearer installation-token",
+        );
+        return call.body;
+      });
+    const running = (summary: string) => ({
+      status: "in_progress",
+      output: { title: "Swarm review in progress", summary },
+    });
+    expect(progress()).toEqual([running("Phase: `reviewing`.")]);
+    await pr.alarm();
+    expect(progress()).toHaveLength(1);
+    const status = {
+      phase: "reviewing",
+      reviewers: [
+        {
+          family: "workers-ai",
+          model: "@cf/deepseek-ai/deepseek-v4-flash-0731",
+          state: "completed",
+        },
+        { family: "claude-code", model: "claude-opus-5-5", state: "running" },
+      ],
+      candidates: 0,
+      verified: 0,
+    };
+    r2.set(`reviews/${reviewId}/status.json`, status);
+    await pr.alarm();
+    r2.set(`reviews/${reviewId}/status.json`, { ...status, candidates: 3 });
+    await pr.alarm();
+    const reviewers =
+      "- `workers-ai` `@cf/deepseek-ai/deepseek-v4-flash-0731`: `completed`\n- `claude-code` `claude-opus-5-5`: `running`";
+    expect(progress()).toEqual([
+      running("Phase: `reviewing`."),
+      running(`Phase: \`reviewing\`.\n${reviewers}`),
+    ]);
+    r2.set(`reviews/${reviewId}/status.json`, {
+      ...status,
+      phase: "verifying",
+    });
+    storage.setAlarm.mockClear();
+    await pr.alarm();
+    await pr.alarm();
+    expect(progress().slice(2)).toEqual([
+      running(`Phase: \`verifying\`.\n${reviewers}`),
+    ]);
+    expect(stored.get("current")).toMatchObject({ phase: "running" });
+    expect(gh.checks()).toEqual([]);
+  });
+
+  it("keeps the review running when a progress update fails and retries it", async () => {
+    const { pr, stored, storage, started } = fixture();
+    let failures = 1;
+    const gh = github({
+      routes: {
+        [`PATCH ${API}/check-runs/99`]: () =>
+          failures-- > 0
+            ? new Response("Bad Gateway", { status: 502 })
+            : undefined,
+      },
+    });
+    await started();
+    expect(stored.get("current")).toMatchObject({
+      phase: "running",
+      progress: null,
+    });
+    expect(storage.setAlarm).toHaveBeenCalledTimes(2);
+    await pr.alarm();
+    expect(gh.progress()).toHaveLength(2);
+    expect(stored.get("current")).toMatchObject({
+      phase: "running",
+      progress: "Phase: `reviewing`.",
+    });
+  });
 
   it("binds a git capability to its allowed repository", async () => {
     const { env, r2 } = fixture();
