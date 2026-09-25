@@ -1439,6 +1439,8 @@ export default {
     if (url0.pathname === "/github/webhook" && request.method === "POST") {
       if (!(await verifyWebhook(request, env.GITHUB_WEBHOOK_SECRET)))
         return json({ error: "unauthorized" }, 401);
+      if (!env.GITHUB_APP_ID || !env.GITHUB_APP_PRIVATE_KEY)
+        return json({ error: "github_app_unconfigured" }, 503);
       if (request.headers.get("x-github-event") !== "pull_request")
         return json({ ignored: true });
       const delivery = request.headers.get("x-github-delivery");

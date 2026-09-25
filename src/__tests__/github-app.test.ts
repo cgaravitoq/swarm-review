@@ -165,6 +165,23 @@ describe("GitHub App webhook", () => {
     expect(storage.put).not.toHaveBeenCalled();
   });
 
+  it.each(["GITHUB_APP_ID", "GITHUB_APP_PRIVATE_KEY"])(
+    "refuses a signed event while %s is unset",
+    async (name) => {
+      const { env, storage } = fixture();
+      const response = await worker.fetch(
+        await signed(JSON.stringify(event())),
+        {
+          ...env,
+          [name]: undefined,
+        } as never,
+      );
+      expect(response.status).toBe(503);
+      expect(storage.put).not.toHaveBeenCalled();
+      expect(storage.setAlarm).not.toHaveBeenCalled();
+    },
+  );
+
   it("deduplicates redelivery, starts one review after response, and completes its check from the receipt", async () => {
     const { env, pr, stored, r2, job } = fixture();
     const calls: { url: string; init: RequestInit }[] = [];
