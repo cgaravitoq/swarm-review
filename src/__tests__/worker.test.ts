@@ -205,6 +205,39 @@ describe("operator probe", () => {
     ]);
   });
 
+  it("exits 1 when the Worker answers a probe with a status other than ok", async () => {
+    const write = vi
+      .spyOn(process.stdout, "write")
+      .mockImplementation(() => true);
+    const run = (statuses: string[]) => {
+      let call = 0;
+      vi.stubGlobal(
+        "fetch",
+        vi.fn<typeof fetch>(async () => {
+          const index = call++;
+          return new Response(
+            JSON.stringify({
+              key: `probes/probe-${index}.json`,
+              runId: `probe-${index}`,
+              status: statuses[index],
+            }),
+          );
+        }),
+      );
+      return main(["https://review.invalid", String(statuses.length)], {
+        CONTROL_SECRET: "fake-control-secret",
+        CLOUDFLARE_ACCOUNT_ID: "fake-account",
+        WORKERS_AI_API_KEY: "fake-workers-bearer",
+      });
+    };
+    try {
+      expect(await run(["ok", "ok"])).toBe(0);
+      expect(await run(["ok", "failed"])).toBe(1);
+    } finally {
+      write.mockRestore();
+    }
+  });
+
   const laneModelsJson = readFileSync(
     path.join(import.meta.dirname, "../../container/models.json"),
     "utf8",

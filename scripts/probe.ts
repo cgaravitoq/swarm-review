@@ -95,7 +95,11 @@ export async function main(
         : `probe ${index + 1} error ${result.reason instanceof Error ? result.reason.message : String(result.reason)}\n`,
     );
   }
-  return results.some((result) => result.status === "rejected") ? 1 : 0;
+  return results.every(
+    (result) => result.status === "fulfilled" && result.value.status === "ok",
+  )
+    ? 0
+    : 1;
 }
 
 if (import.meta.main) {

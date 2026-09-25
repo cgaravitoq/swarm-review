@@ -140,7 +140,7 @@ bun run scripts/probe.ts "$WORKER_ORIGIN" 5
 bunx wrangler r2 object get "swarm-review-probes/probes/<runId>.json" --remote --pipe
 ```
 
-The script starts all probes in a burst concurrently, prints one line per probe with its run id and R2 key or its error, and exits 1 when any probe failed.
+The script starts all probes in a burst concurrently, prints one line per probe with its run id, R2 key and status or its error, and exits 1 when any probe errored or reported a status other than `ok`.
 The bucket must exist before deployment; this repository only declares its binding.
 The local tests prove request routing, isolation and receipt shape with fakes; real provider responses, cold start timings and R2 persistence require a deployed probe.
 
