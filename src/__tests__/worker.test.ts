@@ -26,13 +26,21 @@ vi.mock("@cloudflare/sandbox", () => ({
   Sandbox: class {},
   getSandbox,
 }));
+vi.mock("cloudflare:workers", () => ({ DurableObject: class {} }));
 
-const { default: handler, ReviewSandbox } = await import("../../worker");
+const {
+  default: handler,
+  ReviewSandbox,
+  CredentialVaultObject,
+} = await import("../../worker");
 
 /** The bindings this suite gives the Worker, with the sandbox SDK mocked out. */
 const env = {
   REVIEW_SANDBOX: {} as DurableObjectNamespace<
     InstanceType<typeof ReviewSandbox>
+  >,
+  CREDENTIAL_VAULT: {} as DurableObjectNamespace<
+    InstanceType<typeof CredentialVaultObject>
   >,
   CONTROL_SECRET: "control-secret",
   OPENCODE_API_KEY: "model-secret",
@@ -201,6 +209,103 @@ const sandboxForProbeStart = (probe: {
 };
 
 describe("worker-proxy credential isolation", () => {
+  it("guards operator routes and returns status without a credential", async () => {
+    const log = vi.spyOn(console, "log").mockImplementation(() => undefined);
+    const error = vi
+      .spyOn(console, "error")
+      .mockImplementation(() => undefined);
+    const vault = {
+      seed: vi.fn(async () => undefined),
+      status: vi.fn(async () => [
+        {
+          provider: "claude-code",
+          expiry: null,
+          lastRefresh: "2026-09-25T00:00:00.000Z",
+        },
+      ]),
+    };
+    const operatorEnv = {
+      ...env,
+      CREDENTIAL_VAULT: Object.assign({} as typeof env.CREDENTIAL_VAULT, {
+        getByName: () => vault,
+      }),
+    };
+    const unauthorized = await handler.fetch(
+      new Request("https://review.invalid/credentials"),
+      operatorEnv,
+    );
+    expect(unauthorized.status).toBe(401);
+    expect(vault.status).not.toHaveBeenCalled();
+    const refusedSeed = await handler.fetch(
+      new Request("https://review.invalid/credentials/claude-code", {
+        method: "PUT",
+        body: JSON.stringify({ token: "fake-claude-token" }),
+      }),
+      operatorEnv,
+    );
+    expect(refusedSeed.status).toBe(401);
+    expect(vault.seed).not.toHaveBeenCalled();
+    const seeded = await handler.fetch(
+      authorized("https://review.invalid/credentials/claude-code", {
+        method: "PUT",
+        body: JSON.stringify({ token: "fake-claude-token" }),
+      }),
+      operatorEnv,
+    );
+    expect(seeded.status).toBe(200);
+    const listed = await handler.fetch(
+      authorized("https://review.invalid/credentials"),
+      operatorEnv,
+    );
+    expect(listed.status).toBe(200);
+    expect(await listed.text()).not.toContain("fake-claude-token");
+    expect(await seeded.text()).not.toContain("fake-claude-token");
+    expect(JSON.stringify([log.mock.calls, error.mock.calls])).not.toContain(
+      "fake-claude-token",
+    );
+  });
+
+  it("starts a vault-backed run without putting a bearer in its session", async () => {
+    const { write } = sandboxForStart();
+    const sandbox = getSandbox();
+    const operatorEnv = {
+      ...env,
+      CREDENTIAL_VAULT: Object.assign({} as typeof env.CREDENTIAL_VAULT, {
+        getByName: () => ({
+          status: async () => [
+            {
+              provider: "claude-code",
+              expiry: null,
+              lastRefresh: "2026-09-25T00:00:00.000Z",
+            },
+          ],
+        }),
+      }),
+    };
+    const response = await handler.fetch(
+      authorized("https://review.invalid/runs", {
+        method: "POST",
+        body: startBody({
+          job: { ...job, provider: "claude-code" },
+          broker: {
+            ...broker,
+            upstreamBaseUrl: "https://api.anthropic.com",
+            upstreamAuthorization: undefined,
+          },
+        }),
+      }),
+      operatorEnv,
+    );
+    expect(response.status).toBe(200);
+    expect(sandbox.putModelSession).toHaveBeenCalledWith(
+      expect.objectContaining({ credentialProvider: "claude-code" }),
+    );
+    expect(sandbox.putModelSession.mock.calls[0]?.[0]).not.toHaveProperty(
+      "upstreamAuthorization",
+    );
+    expect(JSON.stringify(write.mock.calls)).not.toContain("model-secret");
+  });
+
   it("keeps the bearer in the DO session and starts the review as 1102", async () => {
     const { startProcess, write } = sandboxForStart();
 

@@ -59,6 +59,7 @@ These are the things a change must not quietly break.
 **The model credential never reaches the target.** `review-target` (uid 1102) runs the checkout, the install, the project's checks and every tool they spawn.
 `review-control` (uid 1101) holds the credential and runs the broker.
 A lane gets a per-run handle over loopback, never the bearer, and the bearer must not appear in the target's environment, files or argv.
+For cloud runs without a caller bearer, `CREDENTIAL_VAULT` holds the Worker's subscription credentials and supplies them to the model proxy per attempt.
 
 **The container cannot write to a repository.** `git-proxy.ts` forwards `git-upload-pack` and the ref advertisement, and nothing else.
 A push has no path through it even with the capability in hand.

@@ -59,7 +59,8 @@ export type ModelTotals = {
 export type ModelSession = {
   handle: string;
   upstreamBaseUrl: string;
-  upstreamAuthorization: string;
+  upstreamAuthorization?: string;
+  credentialProvider?: string;
   upstreamAccountId?: string;
   caps: ModelCaps;
   totals: ModelTotals;
@@ -273,6 +274,10 @@ export async function proxyModelFetch(
     retryable: boolean,
     seal: string | null,
   ) => Promise<void>,
+  vaultCredential?: (
+    provider: string,
+    rejectedAccessToken?: string,
+  ) => Promise<{ authorization: string; accountId?: string }>,
 ): Promise<Response> {
   const segments = url.pathname.split("/").filter(Boolean);
   const runIdRaw = segments[1];
@@ -318,25 +323,58 @@ export async function proxyModelFetch(
   const consumed = await consume(runId);
   if (!consumed.ok) return jsonError(429, consumed.reason);
   const headers = new Headers(request.headers);
-  headers.set("authorization", consumed.session.upstreamAuthorization);
   headers.delete("host");
   // The gateway reads this header in preference to `authorization`, so leaving
   // the target's handle on it would send the upstream a credential that is not
   // one.
   headers.delete("cf-aig-authorization");
   headers.delete("content-length");
-  if (consumed.session.upstreamAccountId) {
-    headers.set("chatgpt-account-id", consumed.session.upstreamAccountId);
-  }
-  const upstream = await fetch(target, {
-    method,
-    headers,
-    body,
-    redirect: "manual",
-  } as RequestInit).catch(async (error: unknown) => {
+  const provider = consumed.session.credentialProvider;
+  let upstream: Response;
+  try {
+    let credential = provider
+      ? await vaultCredential?.(provider)
+      : {
+          authorization: consumed.session.upstreamAuthorization ?? "",
+          accountId: consumed.session.upstreamAccountId,
+        };
+    if (!credential) throw new Error("credential_unconfigured");
+    const forward = (authorization: string, accountId?: string) => {
+      headers.set("authorization", authorization);
+      if (accountId) headers.set("chatgpt-account-id", accountId);
+      return fetch(target, {
+        method,
+        headers,
+        body,
+        redirect: "manual",
+      } as RequestInit);
+    };
+    upstream = await forward(credential.authorization, credential.accountId);
+    if (provider === "openai-codex" && upstream.status === 401) {
+      await upstream.body?.cancel();
+      credential = await vaultCredential?.(
+        provider,
+        credential.authorization.slice("Bearer ".length),
+      );
+      if (!credential) throw new Error("credential_unconfigured");
+      upstream = await forward(credential.authorization, credential.accountId);
+    }
+  } catch (error) {
     await recordAttempt(runId, null, true, null);
+    if (provider) {
+      const reason =
+        error instanceof Error && error.message.startsWith("credential_")
+          ? error.message
+          : "credential_failed";
+      return jsonError(502, reason);
+    }
     throw error;
-  });
+  }
+  if (provider && upstream.status === 401) {
+    await upstream.body?.cancel();
+    await recordAttempt(runId, null, false, null);
+    return jsonError(502, "credential_upstream_unauthorized");
+  }
   const retryable = retryableFailure(upstream.status);
   const responseHeaders = new Headers(upstream.headers);
   responseHeaders.delete("content-encoding");

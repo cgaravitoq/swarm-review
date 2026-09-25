@@ -59,6 +59,96 @@ const proxyTarget = async (runId: string, secret = "control-secret") => {
 };
 
 describe("model proxy", () => {
+  it("refreshes and retries a vault-backed 401 once without exposing tokens", async () => {
+    const runId = "vault-run";
+    const url = await proxyTarget(runId);
+    const upstream = vi.fn<typeof fetch>(async (_input, init) => {
+      const authorization = new Headers(init?.headers).get("authorization");
+      return authorization === "Bearer fake-old"
+        ? new Response("rejected", { status: 401 })
+        : new Response("complete", { status: 200 });
+    });
+    vi.stubGlobal("fetch", upstream);
+    const credential = vi.fn(async (_provider: string, rejected?: string) =>
+      rejected
+        ? { authorization: "Bearer fake-new", accountId: "fake-account" }
+        : { authorization: "Bearer fake-old", accountId: "fake-account" },
+    );
+    const recorded = vi.fn(async () => undefined);
+    const response = await proxyModelFetch(
+      new Request(url, {
+        method: "POST",
+        headers: { authorization: "Bearer review-pi-handle" },
+        body: "{}",
+      }),
+      url,
+      "control-secret",
+      sessionOpener(),
+      async () => ({
+        ok: true as const,
+        session: {
+          handle: "review-pi-handle",
+          upstreamBaseUrl: "https://chatgpt.com/backend-api",
+          credentialProvider: "openai-codex",
+          caps: capsFor(),
+          totals: emptyModelTotals(),
+        },
+      }),
+      recorded,
+      credential,
+    );
+    expect(response.status).toBe(200);
+    const result = await response.text();
+    expect(result).toBe("complete");
+    expect(credential).toHaveBeenCalledTimes(2);
+    expect(credential).toHaveBeenLastCalledWith("openai-codex", "fake-old");
+    expect(upstream).toHaveBeenCalledTimes(2);
+    expect(
+      new Headers(upstream.mock.calls[1]?.[1]?.headers).get(
+        "chatgpt-account-id",
+      ),
+    ).toBe("fake-account");
+    expect(result).not.toContain("fake-new");
+  });
+
+  it("stops after one vault-backed 401 retry", async () => {
+    const runId = "vault-denied";
+    const url = await proxyTarget(runId);
+    const upstream = vi.fn<typeof fetch>(
+      async () => new Response("fake-secret", { status: 401 }),
+    );
+    vi.stubGlobal("fetch", upstream);
+    const credential = vi.fn(async () => ({
+      authorization: "Bearer fake-secret",
+    }));
+    const response = await proxyModelFetch(
+      new Request(url, {
+        method: "POST",
+        headers: { authorization: "Bearer review-pi-handle" },
+        body: "{}",
+      }),
+      url,
+      "control-secret",
+      sessionOpener(),
+      async () => ({
+        ok: true as const,
+        session: {
+          handle: "review-pi-handle",
+          upstreamBaseUrl: "https://chatgpt.com/backend-api",
+          credentialProvider: "openai-codex",
+          caps: capsFor(),
+          totals: emptyModelTotals(),
+        },
+      }),
+      async () => undefined,
+      credential,
+    );
+    expect(upstream).toHaveBeenCalledTimes(2);
+    expect(credential).toHaveBeenCalledTimes(2);
+    expect(response.status).toBe(502);
+    expect(await response.text()).not.toContain("fake-secret");
+  });
+
   it("rejects a capability that does not match the run", async () => {
     const upstream = vi.fn<typeof fetch>(() =>
       Promise.resolve(new Response("unexpected")),

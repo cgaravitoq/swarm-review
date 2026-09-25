@@ -166,6 +166,22 @@ describe("cloud run request", () => {
     ).toThrow(/totalTimeoutSeconds/);
   });
 
+  it.each([
+    ["openai-codex", "https://chatgpt.com/backend-api"],
+    ["claude-code", "https://api.anthropic.com"],
+  ])(
+    "leaves a %s run that carries a bearer off the vault",
+    (provider, upstreamBaseUrl) => {
+      const parsed = parseCloudRunRequest({
+        job: { ...job, provider },
+        broker: { ...broker, upstreamBaseUrl },
+        modelsJson: "{}",
+      });
+      expect(parsed.credentialProvider).toBeUndefined();
+      expect(parsed.broker.upstreamAuthorization).toBe("Bearer model-secret");
+    },
+  );
+
   it("keeps the bearer out of the sanitized job", () => {
     const parsed = parseCloudRunRequest({
       job,

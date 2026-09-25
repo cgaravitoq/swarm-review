@@ -101,6 +101,19 @@ bun run deploy --target /path/to/checkout --var TARGET_REPOSITORY:https://github
 
 `--target` is read locally, to bake the target's lockfile into the image; every other flag goes to `wrangler deploy`.
 
+The Worker can hold its own `openai-codex` and `claude-code` subscription credentials in the `CREDENTIAL_VAULT` Durable Object.
+After deployment, an operator exports `WORKER_ORIGIN` and `CONTROL_SECRET` (`export CONTROL_SECRET=...`) so the script's environment carries them, authenticates a separate `CODEX_HOME` with `codex login`, then sends its `auth.json` directly to the Worker through stdin:
+
+```sh
+bun run scripts/seed-credential.ts "$WORKER_ORIGIN" openai-codex < "$CODEX_HOME/auth.json"
+```
+
+For Claude, obtain a token with `claude setup-token` and provide the token text on stdin to the same script with `claude-code` as the provider.
+The script sends credentials only in the authenticated HTTPS request body and prints only the provider and storage result.
+`GET /credentials` with `Authorization: Bearer <CONTROL_SECRET>` returns configured providers, expiry and last refresh without token values.
+Runs that omit `broker.upstreamAuthorization` use the matching vault credential on each model attempt; runs carrying it retain their existing behavior.
+Codex refreshes before expiry and after an upstream 401, with the rotated pair stored before the next request.
+
 ## Commands
 
 | Command | What it runs |
@@ -122,7 +135,8 @@ The reviewed repository is untrusted input, and it runs real commands.
 It forwards `git-upload-pack` and nothing else, so there is no write path even with the capability in hand, and the GitHub credential stays in the Worker.
 
 Inside the image there are two identities.
-`review-control` holds the model credential and runs the broker; `review-target` runs the checkout, the install, the project's checks, and every tool they spawn.
+For local lanes, `review-control` holds the model credential and runs the broker; for cloud lanes, the run's Durable Object or the Worker's credential vault holds it.
+`review-target` runs the checkout, the install, the project's checks, and every tool they spawn.
 The credential is never in the target's environment, its files, or its process table.
 Lanes talk to the model through a loopback broker and hold a per-run handle rather than the bearer.
 
