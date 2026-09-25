@@ -611,7 +611,9 @@ async function runCloudReview(env: ReviewPiEnv, review: CloudReview) {
       `http.extraHeader=x-review-run: ${review.reviewId}`,
     );
     const clone = `${directory}/clone`;
-    const cloneCommand = `${asTarget} git -c ${gitHeader} clone --depth 1 --no-tags --quiet ${posixQuote(remote)} ${posixQuote(clone)} && cd ${posixQuote(clone)} && ${asTarget} git -c ${gitHeader} fetch --depth 1 origin ${posixQuote(`pull/${review.pr}/head`)} && ${asTarget} git checkout --quiet --detach ${posixQuote(review.head)} && test "$(${asTarget} git rev-parse HEAD)" = ${posixQuote(review.head)} && ${asTarget} git -c ${gitHeader} fetch --depth 1 origin ${posixQuote(review.base)}`;
+    const pullRef = posixQuote(`pull/${review.pr}/head`);
+    const base = posixQuote(review.base);
+    const cloneCommand = `${asTarget} git -c ${gitHeader} clone --depth 1 --no-tags --quiet ${posixQuote(remote)} ${posixQuote(clone)} && cd ${posixQuote(clone)} && ${asTarget} git -c ${gitHeader} fetch --depth 1 origin ${pullRef} && ${asTarget} git checkout --quiet --detach ${posixQuote(review.head)} && test "$(${asTarget} git rev-parse HEAD)" = ${posixQuote(review.head)} && ${asTarget} git -c ${gitHeader} fetch --depth 1 origin ${base} && { while ! ${asTarget} git merge-base --is-ancestor ${base} HEAD; do test "$(${asTarget} git rev-parse --is-shallow-repository)" = true || exit 1; ${asTarget} git -c ${gitHeader} fetch --deepen=64 origin ${pullRef} || exit 1; done; }`;
     const cloned = await reviewStep(
       review,
       "review clone",
