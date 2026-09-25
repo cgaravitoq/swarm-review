@@ -1,4 +1,4 @@
-import { spawnSync } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
 import { existsSync } from "node:fs";
 import {
   cp,
@@ -12,6 +12,7 @@ import {
 } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
+import { setTimeout as sleep } from "node:timers/promises";
 import { fileURLToPath } from "node:url";
 import { afterEach, describe, expect, it } from "vitest";
 
@@ -84,5 +85,39 @@ describe("the engine placeholder in the image build context", () => {
     expect(result.status, result.stdout + result.stderr).toBe(0);
     expect(result.stdout).toContain("2 passed");
     expect(await readFile(engine, "utf8")).toBe("// the real engine bundle\n");
+  });
+
+  it("clears a placeholder an interrupted run left behind", async () => {
+    const root = await stageSuite();
+    const engine = join(root, "container/context/swarm.js");
+    await mkdir(dirname(engine));
+    await writeFile(engine, "test engine bundle");
+    const result = runSuite(root, "test engine bundle");
+    expect(result.status, result.stdout + result.stderr).toBe(0);
+    expect(existsSync(engine)).toBe(false);
+  });
+
+  it("removes the placeholder when the run is interrupted", async () => {
+    const root = await stageSuite();
+    const started = join(root, "started");
+    await writeFile(
+      join(root, "src/__tests__/hang.test.ts"),
+      `import { writeFileSync } from "node:fs";
+import { it } from "vitest";
+it("hangs", async () => {
+  writeFileSync(${JSON.stringify(started)}, "");
+  await new Promise(() => {});
+});
+`,
+    );
+    const suite = spawn(join(root, "node_modules/.bin/vitest"), ["run"], {
+      cwd: root,
+      env: { ...process.env, EXPECTED_ENGINE: "test engine bundle" },
+    });
+    const exited = new Promise((resolve) => suite.once("exit", resolve));
+    while (!existsSync(started)) await sleep(50);
+    suite.kill("SIGINT");
+    await exited;
+    expect(existsSync(join(root, "container/context/swarm.js"))).toBe(false);
   });
 });
