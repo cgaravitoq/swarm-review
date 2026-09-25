@@ -119,6 +119,18 @@ The relay image adds only Bun and its server to the Sandbox runtime, and the rev
 The relay uses direct HTTPS because intercepted HTTPS returns a Worker-side 403 from `chatgpt.com`.
 `allowedHosts` filters intercepted HTTP here, but does not restrict direct HTTPS in the current Containers SDK; the fixed URL in relay code is the enforced outbound destination for relay requests.
 
+## Cloud review
+
+The authenticated `POST /reviews` route accepts `{repository, pr, head, base, context?}` and returns `202 {reviewId}` after recording the initial status in R2 and scheduling a Durable Object alarm.
+The repository must match the deployed Worker's `TARGET_REPOSITORY`.
+The alarm uses one fresh Sandbox, clones the exact PR head through the read-only Git proxy, and runs the hybrid engine as `review-target` without installing the checkout's dependencies.
+Each reviewer and verifier family gets a separate capped model-proxy session.
+The deadline is eight minutes from admission; a failed or expired review records a failed receipt and destroys its Sandbox.
+`GET /reviews/<reviewId>` returns `{status, receipt?}` from `reviews/<reviewId>/status.json` and `reviews/<reviewId>/receipt.json` in the Worker's R2 bucket.
+
+The deployment needs `WORKERS_AI_ACCOUNT_ID` and `WORKERS_AI_API_KEY` as Worker bindings, plus configured `openai-codex` and `claude-code` vault credentials.
+The deploy script bundles `src/swarm.ts` into the generated image context and supplies `IMAGE_SOURCE_HASHES` to the Worker, so the image fingerprint gate checks the engine before any model request.
+
 ## Operator probe
 
 The authenticated `POST /probe` route starts one fresh review Sandbox, measures its first image fingerprint command, clones the configured repository with `--depth 1` through the read-only git proxy, and runs Pi once per model family as the target user.
