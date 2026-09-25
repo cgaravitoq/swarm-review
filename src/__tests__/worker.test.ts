@@ -625,6 +625,35 @@ describe("operator probe", () => {
     );
   });
 
+  it("records a phase that fails before any I/O as unobserved, not measured", async () => {
+    const fixture = setup("cold");
+    const now = vi.spyOn(performance, "now").mockReturnValue(1000);
+    try {
+      await handler.fetch(
+        authorized("https://review.invalid/probe", {
+          method: "POST",
+          body: JSON.stringify(input()),
+        }),
+        fixture.probeEnv,
+      );
+    } finally {
+      now.mockRestore();
+    }
+    const receipt = JSON.parse(fixture.object.put.mock.calls[0]?.[1] ?? "");
+    expect(receipt.coldStart).toEqual({
+      status: "failed",
+      durationMs: null,
+      durationReason: "no_clock_delta",
+      phase: "source_fingerprint",
+      httpStatus: null,
+      reason: "sandbox_exec_failed",
+    });
+    expect(receipt.clone).toMatchObject({
+      durationMs: null,
+      durationReason: "not_started",
+    });
+  });
+
   it("refuses an unauthenticated probe before starting a Sandbox", async () => {
     const fixture = setup();
     const response = await handler.fetch(

@@ -332,6 +332,7 @@ const isolation = {
 type ProbePhase = {
   status: "ok" | "failed" | "unobserved";
   durationMs: number | null;
+  durationReason: string | null;
   phase: string | null;
   httpStatus: number | null;
   reason: string | null;
@@ -340,13 +341,20 @@ type ProbePhase = {
 const unobserved = (): ProbePhase => ({
   status: "unobserved",
   durationMs: null,
+  durationReason: "not_started",
   phase: null,
   httpStatus: null,
   reason: "not_started",
 });
 
-const elapsed = (start: number) =>
-  Math.max(0.001, Math.round((performance.now() - start) * 1000) / 1000);
+// A Worker's clock only advances across I/O, so a phase that ends before any
+// has no duration to observe.
+const elapsed = (start: number) => {
+  const durationMs = Math.round((performance.now() - start) * 1000) / 1000;
+  return durationMs > 0
+    ? { durationMs, durationReason: null }
+    : { durationMs: null, durationReason: "no_clock_delta" };
+};
 
 // Pi sends a lane's whole request, tools and system prompt included, so the
 // probe spends a lane's caps. Two requests cover Pi's openai-codex transport,
@@ -493,14 +501,14 @@ async function operatorProbe(
       receipt.coldStart = mismatch
         ? {
             status: "failed",
-            durationMs: elapsed(start),
+            ...elapsed(start),
             phase: "source_fingerprint",
             httpStatus: null,
             reason: `source_mismatch:${mismatch.file}`,
           }
         : {
             status: "ok",
-            durationMs: elapsed(start),
+            ...elapsed(start),
             phase: "source_fingerprint",
             httpStatus: null,
             reason: null,
@@ -508,7 +516,7 @@ async function operatorProbe(
     } catch {
       receipt.coldStart = {
         status: "failed",
-        durationMs: elapsed(start),
+        ...elapsed(start),
         phase: "source_fingerprint",
         httpStatus: null,
         reason: "sandbox_exec_failed",
@@ -532,14 +540,14 @@ async function operatorProbe(
           result.exitCode === 0
             ? {
                 status: "ok",
-                durationMs: elapsed(start),
+                ...elapsed(start),
                 phase: "git_clone",
                 httpStatus: null,
                 reason: null,
               }
             : {
                 status: "failed",
-                durationMs: elapsed(start),
+                ...elapsed(start),
                 phase: "git_clone",
                 httpStatus: null,
                 reason: "nonzero_exit",
@@ -547,7 +555,7 @@ async function operatorProbe(
       } catch {
         receipt.clone = {
           status: "failed",
-          durationMs: elapsed(start),
+          ...elapsed(start),
           phase: "git_clone",
           httpStatus: null,
           reason: "sandbox_exec_failed",
@@ -591,7 +599,7 @@ async function operatorProbe(
         await bounded("probe sessions", sandbox.putProbeSessions(sessions));
         receipt.sessionSetup = {
           status: "ok",
-          durationMs: elapsed(start),
+          ...elapsed(start),
           phase: "session_setup",
           httpStatus: null,
           reason: null,
@@ -631,7 +639,7 @@ async function operatorProbe(
             if (pi.exitCode !== 0) {
               models[family] = {
                 status: "failed",
-                durationMs: elapsed(start),
+                ...elapsed(start),
                 phase,
                 httpStatus: null,
                 reason:
@@ -650,7 +658,7 @@ async function operatorProbe(
             if (summary.exitCode !== 0 || !outcome) {
               models[family] = {
                 status: "failed",
-                durationMs: elapsed(start),
+                ...elapsed(start),
                 phase,
                 httpStatus: null,
                 reason: "invalid_event_stream",
@@ -667,7 +675,7 @@ async function operatorProbe(
                     : "empty_result";
             models[family] = {
               status: reason ? "failed" : "ok",
-              durationMs: elapsed(start),
+              ...elapsed(start),
               phase:
                 reason === "model_error"
                   ? "model_request"
@@ -678,7 +686,7 @@ async function operatorProbe(
           } catch {
             models[family] = {
               status: "failed",
-              durationMs: elapsed(start),
+              ...elapsed(start),
               phase,
               httpStatus: null,
               reason: "probe_step_failed",
@@ -688,7 +696,7 @@ async function operatorProbe(
       } catch {
         receipt.sessionSetup = {
           status: "failed",
-          durationMs: elapsed(start),
+          ...elapsed(start),
           phase: "session_setup",
           httpStatus: null,
           reason: "session_setup_failed",
@@ -701,7 +709,7 @@ async function operatorProbe(
       await bounded("probe session clear", sandbox.clearProbeSessions());
       receipt.sessionClear = {
         status: "ok",
-        durationMs: elapsed(start),
+        ...elapsed(start),
         phase: "session_clear",
         httpStatus: null,
         reason: null,
@@ -709,7 +717,7 @@ async function operatorProbe(
     } catch {
       receipt.sessionClear = {
         status: "failed",
-        durationMs: elapsed(start),
+        ...elapsed(start),
         phase: "session_clear",
         httpStatus: null,
         reason: "clear_failed",
@@ -719,7 +727,7 @@ async function operatorProbe(
     const shutdown = await destroySandbox(sandbox);
     receipt.shutdown = {
       status: shutdown.acknowledged ? "ok" : "failed",
-      durationMs: elapsed(start),
+      ...elapsed(start),
       phase: "sandbox_destroy",
       httpStatus: null,
       reason: shutdown.acknowledged ? null : "destroy_failed",

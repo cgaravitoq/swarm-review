@@ -125,7 +125,7 @@ Each family gets the image's own `models.json` pointed at `/model/` with that fa
 A family passes when Pi exits 0 and its last turn stops with text, the reading a lane's stream gets.
 The Worker stores `probes/<runId>.json` in the `PROBE_RESULTS` R2 bucket and returns only its key and overall status.
 Each phase records a status, failure phase, HTTP status when observed, and milliseconds from the Worker's monotonic `performance.now()` clock.
-A skipped phase has `durationMs: null`.
+A skipped phase has `durationMs: null` with `durationReason: "not_started"`, and a phase the clock did not advance across, such as one that failed before any I/O, has `durationMs: null` with `durationReason: "no_clock_delta"`.
 The receipt does not contain request bodies, provider output, handles or credentials.
 The Sandbox is destroyed after the probe, including failed phases.
 
