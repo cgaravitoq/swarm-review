@@ -43,6 +43,7 @@ import {
   modelCapability,
   modelProxyBaseUrl,
   modelsJsonForProxy,
+  openaiCodexBrokerHandle,
   proxyModelFetch,
   publicModelUsage,
   reserveAttempt,
@@ -57,6 +58,7 @@ import {
   sourceFingerprintCommand,
   sourceMismatchDetail,
 } from "./src/protocol";
+import { SESSION_CAPS } from "./src/provider-budget";
 
 const MODEL_SESSION_KEY = "modelSession";
 const PROBE_SESSIONS_KEY = "probeSessions";
@@ -346,12 +348,72 @@ const unobserved = (): ProbePhase => ({
 const elapsed = (start: number) =>
   Math.max(0.001, Math.round((performance.now() - start) * 1000) / 1000);
 
-const probeCaps = {
-  maxRequests: 1,
-  maxRetriesPerRequest: 0,
-  maxCumulativeInputTokens: 100_000,
-  maxCumulativeOutputTokens: 100_000,
-  maxRequestBytes: 16_384,
+// Pi sends a lane's whole request, tools and system prompt included, so the
+// probe spends a lane's caps. Two requests cover Pi's openai-codex transport,
+// which tries a WebSocket before it falls back to a streamed POST.
+const probeCaps = { ...SESSION_CAPS.t1b, maxRequests: 2 };
+
+const PI_PROBE_FAMILIES = {
+  "workers-ai": {
+    provider: "cloudflare-workers-ai",
+    model: "@cf/deepseek-ai/deepseek-v4-flash-0731",
+  },
+  "openai-codex": { provider: "openai-codex", model: "gpt-5.6-sol" },
+  "claude-code": { provider: "claude-code", model: "claude-opus-5" },
+} as const;
+
+const PI_PROBE_SECONDS = 100;
+const PI_MODELS_PATH = "/opt/review/pi-config/models.json";
+const CLAUDE_CODE_EXTENSION = "/opt/review/extensions/claude-code-provider.js";
+
+const asTarget = `setpriv --reuid=${TARGET_UID} --regid=${TARGET_UID} --clear-groups`;
+
+const piProbeCommand = (
+  directory: string,
+  family: keyof typeof PI_PROBE_FAMILIES,
+  accountId: string,
+) => {
+  const { provider, model } = PI_PROBE_FAMILIES[family];
+  const account =
+    family === "workers-ai"
+      ? `CLOUDFLARE_ACCOUNT_ID=${posixQuote(accountId)} `
+      : "";
+  const extension =
+    family === "claude-code" ? ` -e ${posixQuote(CLAUDE_CODE_EXTENSION)}` : "";
+  return `cd ${posixQuote(directory)} && ${asTarget} env HOME=/home/review-target PI_OFFLINE=1 PI_SKIP_VERSION_CHECK=1 ${account}PI_CODING_AGENT_DIR=${posixQuote(directory)} timeout -k 5 ${PI_PROBE_SECONDS} pi --provider ${posixQuote(provider)} --model ${posixQuote(model)} --thinking high --mode json --print --no-session --no-extensions --no-skills --no-prompt-templates --approve${extension} -- ${posixQuote("Reply with exactly pong and nothing else.")} < /dev/null > events.jsonl 2> pi.stderr`;
+};
+
+// The same reading `validate_review_events` gives a lane's stream, plus the
+// HTTP status Pi puts at the head of a provider error message.
+const PI_SUMMARY = `([.[] | select(.type == "turn_end")] | last | .message) as $m
+| {stopReason: ($m.stopReason // null),
+   httpStatus: (($m.errorMessage // "") | (capture("^(?<code>[1-5][0-9][0-9])\\\\b").code | tonumber)? // null),
+   hasFinal: (([.[] | select(.type == "agent_end")] | last | (.messages // [])
+     | map(select(.role == "assistant")) | last | (.content // [])
+     | map(select(.type == "text") | .text) | join("\\n") | test("\\\\S")) // false)}`;
+
+const piSummaryCommand = (directory: string) =>
+  `${asTarget} jq -sc ${posixQuote(PI_SUMMARY)} ${posixQuote(`${directory}/events.jsonl`)}`;
+
+const parsePiSummary = (stdout: string) => {
+  try {
+    const value: unknown = JSON.parse(stdout);
+    if (typeof value !== "object" || value === null) return null;
+    const summary = value as Record<string, unknown>;
+    return {
+      stopReason:
+        typeof summary["stopReason"] === "string"
+          ? summary["stopReason"]
+          : null,
+      httpStatus:
+        typeof summary["httpStatus"] === "number"
+          ? summary["httpStatus"]
+          : null,
+      hasFinal: summary["hasFinal"] === true,
+    };
+  } catch {
+    return null;
+  }
 };
 
 async function operatorProbe(
@@ -494,9 +556,11 @@ async function operatorProbe(
 
       const capability = await modelCapability(runId, env.CONTROL_SECRET);
       const base = modelProxyBaseUrl(origin, runId, capability);
-      const handles = Object.fromEntries(
-        families.map((family) => [family, crypto.randomUUID()]),
-      ) as Record<Family, string>;
+      const handles = {
+        "workers-ai": `review-pi-${crypto.randomUUID()}`,
+        "openai-codex": openaiCodexBrokerHandle(crypto.randomUUID()),
+        "claude-code": `review-pi-${crypto.randomUUID()}`,
+      } satisfies Record<Family, string>;
       const sessions = {
         [handles["workers-ai"]]: {
           handle: handles["workers-ai"],
@@ -522,6 +586,8 @@ async function operatorProbe(
       } satisfies Record<string, ModelSession>;
       start = performance.now();
       try {
+        const laneModels = await readArtifact(sandbox, PI_MODELS_PATH);
+        if (!laneModels.exists || laneModels.truncated) throw new Error();
         await bounded("probe sessions", sandbox.putProbeSessions(sessions));
         receipt.sessionSetup = {
           status: "ok",
@@ -531,141 +597,82 @@ async function operatorProbe(
           reason: null,
         };
         for (const family of families) {
-          const name = family;
-          const path =
-            family === "openai-codex"
-              ? "/codex/responses"
-              : family === "claude-code"
-                ? "/v1/messages"
-                : "/chat/completions";
-          const body =
-            family === "openai-codex"
-              ? {
-                  model: "gpt-5.4",
-                  input: [
-                    {
-                      role: "user",
-                      content: [
-                        { type: "input_text", text: "Reply with pong." },
-                      ],
-                    },
-                  ],
-                  stream: true,
-                  store: false,
-                }
-              : family === "claude-code"
-                ? {
-                    model: "claude-opus-5",
-                    max_tokens: 16,
-                    stream: true,
-                    messages: [{ role: "user", content: "Reply with pong." }],
-                    system: [
-                      {
-                        type: "text",
-                        text: "You are Claude Code, Anthropic's official CLI for Claude.",
-                      },
-                    ],
-                  }
-                : {
-                    model: "@cf/deepseek-ai/deepseek-v4-flash-0731",
-                    messages: [{ role: "user", content: "Reply with pong." }],
-                    max_tokens: 16,
-                  };
-          const headers =
-            family === "claude-code"
-              ? [
-                  "anthropic-version: 2023-06-01",
-                  "anthropic-beta: oauth-2025-04-20,claude-code-20250219",
-                ]
-              : [];
+          const { provider } = PI_PROBE_FAMILIES[family];
+          const piDirectory = `${directory}/pi-${family}`;
           start = performance.now();
-          let phase = "request_write";
+          let phase = "config_write";
           try {
             await bounded(
-              "probe request",
-              sandbox.writeFile(
-                `${directory}/${name}-request.json`,
-                JSON.stringify(body),
-              ),
+              "probe pi directory",
+              sandbox.mkdir(piDirectory, { recursive: true }),
             );
             await bounded(
-              "probe request ownership",
-              sandbox.exec(targetChownCommand(directory)),
-            );
-            phase = "model_request";
-            const completion = await bounded(
-              "probe model",
-              sandbox.exec(
-                targetCanaryCommand(
-                  directory,
+              "probe models",
+              sandbox.writeFile(
+                `${piDirectory}/models.json`,
+                modelsJsonForProxy(
+                  laneModels.content,
+                  provider,
                   handles[family],
-                  `${base}${path}`,
-                  name,
-                  headers,
+                  base,
                 ),
               ),
             );
-            const httpStatus = Number.parseInt(completion.stdout.trim(), 10);
-            if (
-              completion.exitCode !== 0 ||
-              !Number.isInteger(httpStatus) ||
-              httpStatus === 0
-            ) {
+            await bounded(
+              "probe pi ownership",
+              sandbox.exec(targetChownCommand(piDirectory)),
+            );
+            phase = "model_request";
+            const pi = await bounded(
+              "probe pi",
+              sandbox.exec(piProbeCommand(piDirectory, family, accountId)),
+              (PI_PROBE_SECONDS + 15) * 1000,
+            );
+            if (pi.exitCode !== 0) {
               models[family] = {
                 status: "failed",
                 durationMs: elapsed(start),
                 phase,
-                httpStatus:
-                  Number.isInteger(httpStatus) && httpStatus > 0
-                    ? httpStatus
-                    : null,
-                reason: "curl_failed",
+                httpStatus: null,
+                reason:
+                  pi.exitCode === 124 || pi.exitCode === 137
+                    ? "pi_timeout"
+                    : "pi_exit",
               };
               continue;
             }
             phase = "response_read";
-            const artifact = await readArtifact(
-              sandbox,
-              `${directory}/${name}-response.txt`,
+            const summary = await bounded(
+              "probe pi summary",
+              sandbox.exec(piSummaryCommand(piDirectory)),
             );
-            if (!artifact.exists || !("content" in artifact)) {
+            const outcome = parsePiSummary(summary.stdout);
+            if (summary.exitCode !== 0 || !outcome) {
               models[family] = {
                 status: "failed",
                 durationMs: elapsed(start),
                 phase,
-                httpStatus: Number.isInteger(httpStatus) ? httpStatus : null,
-                reason: "response_unobserved",
+                httpStatus: null,
+                reason: "invalid_event_stream",
               };
               continue;
             }
-            if (artifact.truncated || artifact.bytes > CANARY_MAX_BYTES) {
-              models[family] = {
-                status: "failed",
-                durationMs: elapsed(start),
-                phase,
-                httpStatus,
-                reason: "response_truncated",
-              };
-              continue;
-            }
-            phase = "response_interpret";
-            const interpreted = interpretProviderCanary(
-              httpStatus,
-              artifact.content,
-            );
-            let reason = interpreted.completed ? null : interpreted.reason;
-            if (
-              httpStatus === 502 &&
-              artifact.content ===
-                '{"error":{"type":"review_pi_model","reason":"codex_relay_failed"}}'
-            ) {
-              reason = "codex_relay_failed";
-            }
+            const reason =
+              outcome.stopReason === "error" || outcome.stopReason === "aborted"
+                ? "model_error"
+                : outcome.stopReason !== "stop"
+                  ? "incomplete_result"
+                  : outcome.hasFinal
+                    ? null
+                    : "empty_result";
             models[family] = {
-              status: interpreted.completed ? "ok" : "failed",
+              status: reason ? "failed" : "ok",
               durationMs: elapsed(start),
-              phase: httpStatus >= 400 ? "model_request" : phase,
-              httpStatus: Number.isInteger(httpStatus) ? httpStatus : null,
+              phase:
+                reason === "model_error"
+                  ? "model_request"
+                  : "response_interpret",
+              httpStatus: outcome.httpStatus,
               reason,
             };
           } catch {

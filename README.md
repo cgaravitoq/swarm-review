@@ -120,7 +120,9 @@ The relay uses direct HTTPS because intercepted HTTPS returns a Worker-side 403 
 
 ## Operator probe
 
-The authenticated `POST /probe` route starts one fresh review Sandbox, measures its first image fingerprint command, clones the configured repository with `--depth 1` through the read-only git proxy, and sends one request per model family through `/model/`.
+The authenticated `POST /probe` route starts one fresh review Sandbox, measures its first image fingerprint command, clones the configured repository with `--depth 1` through the read-only git proxy, and runs Pi once per model family as the target user.
+Each family gets the image's own `models.json` pointed at `/model/` with that family's handle, exactly as a cloud lane is configured, so each request is the one a lane's Pi sends: `cloudflare-workers-ai` with `@cf/deepseek-ai/deepseek-v4-flash-0731`, `openai-codex` with `gpt-5.6-sol`, and `claude-code` with `claude-opus-5` through the lanes' Claude Code extension.
+A family passes when Pi exits 0 and its last turn stops with text, the reading a lane's stream gets.
 The Worker stores `probes/<runId>.json` in the `PROBE_RESULTS` R2 bucket and returns only its key and overall status.
 Each phase records a status, failure phase, HTTP status when observed, and milliseconds from the Worker's monotonic `performance.now()` clock.
 A skipped phase has `durationMs: null`.

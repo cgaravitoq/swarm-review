@@ -1,5 +1,6 @@
 import { spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
+import { readFileSync } from "node:fs";
 import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
@@ -188,16 +189,51 @@ describe("operator probe", () => {
     ).toBe(true);
   });
 
+  const laneModelsJson = readFileSync(
+    path.join(import.meta.dirname, "../../container/models.json"),
+    "utf8",
+  );
+
+  const PI_PATHS = new Map([
+    ["workers-ai", "/chat/completions"],
+    ["openai-codex", "/codex/responses"],
+    ["claude-code", "/v1/messages"],
+  ]);
+
+  // Pi's --mode json events as a lane reads them: the last turn_end carries
+  // the stop reason and, on failure, the provider's error message.
+  const piEvents = (errorMessage: string | null) =>
+    [
+      {
+        type: "turn_end",
+        message: errorMessage
+          ? { role: "assistant", stopReason: "error", errorMessage }
+          : { role: "assistant", stopReason: "stop" },
+      },
+      {
+        type: "agent_end",
+        messages: [
+          {
+            role: "assistant",
+            content: errorMessage ? [] : [{ type: "text", text: "pong" }],
+          },
+        ],
+      },
+    ]
+      .map((event) => JSON.stringify(event))
+      .join("\n");
+
   const input = () => ({
     expectedSources: expectedSources(),
     workersAi: { accountId: "fake-account", bearer: "fake-workers-bearer" },
   });
 
   const setup = (
-    failure?: "cold" | "clone" | "claude" | "relay" | "session",
+    failure?: "cold" | "clone" | "claude" | "relay" | "session" | "pi-exit",
   ) => {
-    let runId = "";
-    const files = new Map<string, string>();
+    const files = new Map<string, string>([
+      ["/opt/review/pi-config/models.json", laneModelsJson],
+    ]);
     const stored = new Map<string, unknown>();
     const storage = {
       get: async (key: string) => stored.get(key),
@@ -254,15 +290,8 @@ describe("operator probe", () => {
           "fake-codex-account",
         );
         expect(JSON.parse(await new Response(init.body).text())).toEqual({
-          model: "gpt-5.4",
-          input: [
-            {
-              role: "user",
-              content: [{ type: "input_text", text: "Reply with pong." }],
-            },
-          ],
-          stream: true,
-          store: false,
+          model: "gpt-5.6-sol",
+          family: "openai-codex",
         });
         if (failure === "relay") throw new Error("relay unavailable");
         return new Response(
@@ -291,43 +320,18 @@ describe("operator probe", () => {
         expect(headers.get("authorization")).toBe("Bearer fake-workers-bearer");
         expect(body).toEqual({
           model: "@cf/deepseek-ai/deepseek-v4-flash-0731",
-          messages: [{ role: "user", content: "Reply with pong." }],
-          max_tokens: 16,
+          family: "workers-ai",
         });
-        return new Response(
-          JSON.stringify({
-            choices: [{ message: { content: "pong" }, finish_reason: "stop" }],
-          }),
-        );
+        return new Response("{}");
       }
       expect(target).toBe("https://api.anthropic.com/v1/messages");
       expect(headers.get("authorization")).toBe(
         "Bearer fake-claude-code-bearer",
       );
-      expect(headers.get("anthropic-version")).toBe("2023-06-01");
-      expect(headers.get("anthropic-beta")).toBe(
-        "oauth-2025-04-20,claude-code-20250219",
-      );
-      expect(body).toEqual({
-        model: "claude-opus-5",
-        max_tokens: 16,
-        stream: true,
-        messages: [{ role: "user", content: "Reply with pong." }],
-        system: [
-          {
-            type: "text",
-            text: "You are Claude Code, Anthropic's official CLI for Claude.",
-          },
-        ],
-      });
+      expect(body).toEqual({ model: "claude-opus-5", family: "claude-code" });
       return failure === "claude"
         ? new Response("upstream failure", { status: 503 })
-        : new Response(
-            JSON.stringify({
-              content: [{ text: "pong" }],
-              stop_reason: "end_turn",
-            }),
-          );
+        : new Response("{}");
     });
     vi.stubGlobal("fetch", direct);
     const exec = vi.fn(async (command: string) => {
@@ -337,43 +341,54 @@ describe("operator probe", () => {
       }
       if (command.includes("git -c"))
         return { stdout: "", exitCode: failure === "clone" ? 1 : 0 };
-      if (command.includes("curl -sS")) {
-        const url = command.match(/'(https:\/\/[^']+\/model\/[^']+)'/)?.[1];
-        const handle = command.match(/authorization: Bearer ([^']+)/)?.[1];
-        const family = command.match(
-          /(workers-ai|openai-codex|claude-code)-response\.txt/,
-        )?.[1];
-        if (!url || !handle || !family) throw new Error("bad model command");
-        if (family === "claude-code")
-          expect(command).toContain(
-            "anthropic-beta: oauth-2025-04-20,claude-code-20250219",
-          );
-        const requestBody = files.get(
-          `/workspace/runs/${runId}/${family}-request.json`,
-        );
-        if (!requestBody) throw new Error("missing request body");
+      if (command.includes(" pi --provider ")) {
+        const directory =
+          command.match(/PI_CODING_AGENT_DIR='([^']+)'/)?.[1] ?? "";
+        const provider = command.match(/--provider '([^']+)'/)?.[1] ?? "";
+        const model = command.match(/--model '([^']+)'/)?.[1] ?? "";
+        const family = directory.slice(directory.lastIndexOf("/pi-") + 4);
+        if (failure === "pi-exit" && family === "workers-ai")
+          return { stdout: "", exitCode: 7 };
+        const configured = JSON.parse(
+          files.get(`${directory}/models.json`) ?? "{}",
+        ).providers[provider];
         const response = await handler.fetch(
-          new Request(url, {
+          new Request(`${configured.baseUrl}${PI_PATHS.get(family)}`, {
             method: "POST",
             headers: {
-              authorization: `Bearer ${handle}`,
+              authorization: `Bearer ${configured.apiKey}`,
               "content-type": "application/json",
-              ...(family === "claude-code"
-                ? {
-                    "anthropic-version": "2023-06-01",
-                    "anthropic-beta": "oauth-2025-04-20,claude-code-20250219",
-                  }
-                : {}),
             },
-            body: requestBody,
+            body: JSON.stringify({ model, family }),
           }),
           probeEnv,
         );
+        const text = await response.text();
         files.set(
-          `/workspace/runs/${runId}/${family}-response.txt`,
-          await response.text(),
+          `${directory}/events.jsonl`,
+          piEvents(
+            response.ok
+              ? null
+              : family === "openai-codex"
+                ? text
+                : `${response.status}: ${text}`,
+          ),
         );
-        return { stdout: String(response.status), exitCode: 0 };
+        return { stdout: "", exitCode: 0 };
+      }
+      if (command.includes(" jq -sc ")) {
+        const path = command.match(/'([^']+\/events\.jsonl)'/)?.[1] ?? "";
+        const summary = spawnSync(
+          "sh",
+          [
+            "-c",
+            command
+              .replace(/^setpriv .*? --clear-groups /, "")
+              .replace(` '${path}'`, ""),
+          ],
+          { input: files.get(path) ?? "", encoding: "utf8" },
+        );
+        return { stdout: summary.stdout, exitCode: summary.status ?? 1 };
       }
       if (command.startsWith("stat -c")) {
         const path = command.match(/'([^']+)'/)?.[1] ?? "";
@@ -390,11 +405,9 @@ describe("operator probe", () => {
     });
     Object.assign(sandbox, { exec });
     getSandbox.mockClear();
-    getSandbox.mockImplementation((_namespace: unknown, id: string) => {
-      if (id === "swarm-review-codex-egress") return relay;
-      runId = id;
-      return sandbox;
-    });
+    getSandbox.mockImplementation((_namespace: unknown, id: string) =>
+      id === "swarm-review-codex-egress" ? relay : sandbox,
+    );
     return {
       sandbox,
       destroy,
@@ -431,9 +444,53 @@ describe("operator probe", () => {
       "openai-codex",
       "claude-code",
     ]);
+    const piCommands = fixture.exec.mock.calls
+      .map((call) => call[0])
+      .filter((command) => command.includes(" pi --provider "));
+    const capability = await modelCapability(body.runId, env.CONTROL_SECRET);
+    const lane = JSON.parse(laneModelsJson).providers;
+    const handles: string[] = [];
+    for (const [index, [family, provider, model]] of (
+      [
+        [
+          "workers-ai",
+          "cloudflare-workers-ai",
+          "@cf/deepseek-ai/deepseek-v4-flash-0731",
+        ],
+        ["openai-codex", "openai-codex", "gpt-5.6-sol"],
+        ["claude-code", "claude-code", "claude-opus-5"],
+      ] as const
+    ).entries()) {
+      const directory = `/workspace/runs/${body.runId}/pi-${family}`;
+      const account =
+        family === "workers-ai" ? "CLOUDFLARE_ACCOUNT_ID='fake-account' " : "";
+      const extension =
+        family === "claude-code"
+          ? " -e '/opt/review/extensions/claude-code-provider.js'"
+          : "";
+      expect(piCommands[index]).toBe(
+        `cd '${directory}' && setpriv --reuid=${TARGET_UID} --regid=${TARGET_UID} --clear-groups env HOME=/home/review-target PI_OFFLINE=1 PI_SKIP_VERSION_CHECK=1 ${account}PI_CODING_AGENT_DIR='${directory}' timeout -k 5 100 pi --provider '${provider}' --model '${model}' --thinking high --mode json --print --no-session --no-extensions --no-skills --no-prompt-templates --approve${extension} -- 'Reply with exactly pong and nothing else.' < /dev/null > events.jsonl 2> pi.stderr`,
+      );
+      const models = JSON.parse(
+        fixture.files.get(`${directory}/models.json`) ?? "",
+      );
+      const apiKey = models.providers[provider].apiKey;
+      expect(models.providers[provider]).toEqual({
+        ...lane[provider],
+        apiKey,
+        baseUrl: `https://review.invalid/model/${body.runId}/${capability}`,
+      });
+      handles.push(apiKey);
+    }
+    expect(piCommands).toHaveLength(3);
+    expect(handles[0]).toMatch(/^review-pi-[0-9a-f-]{36}$/);
+    expect(handles[1]?.split(".")).toHaveLength(3);
     expect(
-      fixture.exec.mock.calls.filter((call) => call[0].includes("curl -sS")),
-    ).toHaveLength(3);
+      JSON.parse(atob(handles[1]?.split(".")[1] ?? ""))[
+        "https://api.openai.com/auth"
+      ],
+    ).toEqual({ chatgpt_account_id: "review-pi" });
+    expect(handles[2]).toMatch(/^review-pi-[0-9a-f-]{36}$/);
     expect(
       fixture.exec.mock.calls.find((call) => call[0].includes("git -c"))?.[0],
     ).toContain("clone --depth 1 --no-tags");
@@ -519,6 +576,7 @@ describe("operator probe", () => {
           status: "failed",
           phase: "model_request",
           httpStatus: 503,
+          reason: "model_error",
         });
         expect(receipt.models["workers-ai"].status).toBe("ok");
         expect(receipt.models["openai-codex"].status).toBe("ok");
@@ -527,8 +585,8 @@ describe("operator probe", () => {
         expect(receipt.models["openai-codex"]).toMatchObject({
           status: "failed",
           phase: "model_request",
-          httpStatus: 502,
-          reason: "codex_relay_failed",
+          httpStatus: null,
+          reason: "model_error",
         });
         expect(receipt.models["workers-ai"].status).toBe("ok");
         expect(receipt.models["claude-code"].status).toBe("ok");
