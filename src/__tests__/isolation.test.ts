@@ -283,14 +283,14 @@ describe("control API containment probe", () => {
 });
 
 describe("provider canary interpretation", () => {
-  it("accepts an Anthropic Messages stream only after text and end_turn", () => {
+  it("reads a Responses stream's text once, from its done event", () => {
     const body = [
-      'data: {"type":"content_block_delta","delta":{"type":"text_delta","text":"pong"}}',
-      'data: {"type":"message_delta","delta":{"stop_reason":"end_turn"}}',
+      'data: {"type":"response.output_text.delta","delta":"pong"}',
+      'data: {"type":"response.output_text.done","text":"pong"}',
+      'data: {"type":"response.completed","response":{"status":"completed"}}',
     ].join("\n");
     expect(interpretProviderCanary(200, body)).toMatchObject({
       completed: true,
-      stopReason: "stop",
       output: "pong",
     });
   });
