@@ -59,6 +59,7 @@ Reviewers get the first 60% of the window; the runner requests each reviewer's r
 The verifiers start as soon as every reviewer has ended and keep the rest of the window.
 Each verification has at most two minutes and never runs past the run deadline, leaving a slow candidate unverified when its verifier runs out of time.
 The receipt retains the last 16 KiB of each lane's final text and marks an unparseable report as malformed.
+A lane cut mid-turn also keeps `streamed`: the last 16 KiB of the text its last turn had streamed and the length of its streamed thinking, marked partial and never parsed as a report.
 The lanes file has `reviewers` and `verifiers` arrays; each entry names `family`, `provider`, `model`, `piDir`, `extensions` and `env`.
 Each verifier family may appear once, and a candidate needs a verifier from a family other than every family that reported it.
 A family whose reviewer failed in the run is never chosen as a verifier, and among the rest a family whose reviewer completed is preferred over one whose reviewer was cut, in `lanes.json` order.

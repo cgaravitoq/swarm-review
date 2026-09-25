@@ -39,6 +39,7 @@ type LaneResult = {
   turns: number;
   usage: { input: number; output: number; totalTokens: number } | null;
   finalText: string;
+  streamed: { text: string; thinkingChars: number };
   error: string | null;
 };
 
@@ -94,6 +95,17 @@ const finalTextTail = (value: string) => {
   return bytes.subarray(start).toString();
 };
 
+const streamedEvidence = (result: LaneResult) =>
+  result.status === "cut"
+    ? {
+        streamed: {
+          partial: true as const,
+          text: finalTextTail(result.streamed.text),
+          thinkingChars: result.streamed.thinkingChars,
+        },
+      }
+    : {};
+
 function runPi(input: {
   lane: Lane;
   source: string;
@@ -136,6 +148,7 @@ function runPi(input: {
     let stopReason: string | null = null;
     let usage: LaneResult["usage"] = null;
     let finalText = "";
+    const streamed = { text: "", thinkingChars: 0 };
     let piError: string | null = null;
     let cut: string | null = null;
     let complete = false;
@@ -181,6 +194,7 @@ function runPi(input: {
         turns,
         usage,
         finalText,
+        streamed,
         error:
           status === "failed"
             ? piError || stderr.trim() || `pi exited ${code}`
@@ -207,6 +221,15 @@ function runPi(input: {
         return;
       }
       if (!event) return;
+      if (event["type"] === "message_update") {
+        const update = record(event["assistantMessageEvent"]);
+        const delta = update?.["delta"];
+        if (typeof delta === "string") {
+          if (update?.["type"] === "text_delta") streamed.text += delta;
+          if (update?.["type"] === "thinking_delta")
+            streamed.thinkingChars += delta.length;
+        }
+      }
       if (event["type"] === "turn_end") {
         turns += 1;
         const message = record(event["message"]);
@@ -236,8 +259,13 @@ function runPi(input: {
         if (!reportTurn && turns >= turnCap && stopReason === "toolUse")
           requestReport();
       }
-      if (event["type"] === "turn_start" && reportTurn && turns > turnCap)
-        kill("turn cap");
+      if (event["type"] === "turn_start") {
+        if (reportTurn && turns > turnCap) kill("turn cap");
+        else {
+          streamed.text = "";
+          streamed.thinkingChars = 0;
+        }
+      }
       if (event["type"] === "agent_end") {
         const messages = event["messages"];
         if (Array.isArray(messages)) {
@@ -276,12 +304,13 @@ function runPi(input: {
         },
       );
       input.children.add(child);
+      child.stdout?.setEncoding("utf8");
       child.stdin?.on("error", (error) => {
         stderr += error.message;
       });
       child.stdin?.end(prompt);
-      child.stdout?.on("data", (chunk: Buffer) => {
-        stdout += chunk.toString();
+      child.stdout?.on("data", (chunk: string) => {
+        stdout += chunk;
         let newline = stdout.indexOf("\n");
         while (newline >= 0) {
           consume(stdout.slice(0, newline));
@@ -417,6 +446,7 @@ export async function runHybrid(argv: string[]) {
     turns: number;
     usage: LaneResult["usage"];
     finalText: string;
+    streamed?: { partial: true; text: string; thinkingChars: number };
     blockerReason?: string | null;
     contractError?: string | null;
     error?: string | null;
@@ -474,6 +504,7 @@ export async function runHybrid(argv: string[]) {
           turns: result.turns,
           usage: result.usage,
           finalText: finalTextTail(result.finalText),
+          ...streamedEvidence(result),
           blockerReason: parsed?.blockerReason ?? null,
           contractError: parsed?.error ?? null,
           error: result.error,
@@ -595,6 +626,7 @@ export async function runHybrid(argv: string[]) {
           turns: result.turns,
           usage: result.usage,
           finalText: finalTextTail(result.finalText),
+          ...streamedEvidence(result),
           candidateIds: [candidate.id],
           contractError: parsed?.error ?? null,
           error: result.error,

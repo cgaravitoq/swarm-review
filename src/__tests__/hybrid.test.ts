@@ -77,6 +77,18 @@ if ((process.env.PI_HANG === "cap" || process.env.PI_HANG === "time") && !report
   event({type:"turn_start"});
   event({type:"turn_end",message:{stopReason:"error",errorMessage:"400 status code (no body)",usage:{input:0,output:0,totalTokens:0}}});
   event({type:"agent_end",messages:[{role:"assistant",content:[],stopReason:"error",errorMessage:"400 status code (no body)"}]});
+} else if (process.env.PI_HANG === "midturn") {
+  const fence = String.fromCharCode(96).repeat(3);
+  const report = fence + "json\\n" + JSON.stringify({status:"complete",blockerReason:"",findings:[{severity:"P1",file:"a.ts",line:1,mechanism:"value changes",evidence:"diff",affectedBehavior:"caller sees 2"}]}) + "\\n" + fence;
+  const usage = {input:1,output:1,totalTokens:2};
+  event({type:"turn_start"});
+  event({type:"message_update",usage,assistantMessageEvent:{type:"thinking_start",contentIndex:0}});
+  event({type:"message_update",usage,assistantMessageEvent:{type:"thinking_delta",contentIndex:0,delta:"weighing "}});
+  event({type:"message_update",usage,assistantMessageEvent:{type:"thinking_delta",contentIndex:0,delta:"the change"}});
+  event({type:"message_update",usage,assistantMessageEvent:{type:"text_start",contentIndex:1}});
+  for (const delta of ["🧪".repeat(5000), report])
+    event({type:"message_update",usage,assistantMessageEvent:{type:"text_delta",contentIndex:1,delta}});
+  setInterval(() => {}, 1000);
 } else if (process.env.PI_HANG === "deadline" || (process.env.PI_HANG === "stall" && !reportTurn)) {
   setInterval(() => {}, 1000);
 } else {
@@ -369,6 +381,40 @@ it("leaves a candidate unverified with a reason when no verifier family can rule
   expect(
     (await calls(input.log)).filter((call) => call.phase === "verifying"),
   ).toHaveLength(0);
+});
+
+it("keeps what a lane cut mid-turn had streamed as partial evidence and never parses it", async () => {
+  const input = await setup();
+  const config = JSON.parse(await readFile(input.lanes, "utf8"));
+  config.reviewers[0].env.PI_HANG = "midturn";
+  await writeFile(input.lanes, JSON.stringify(config));
+  const result = run(input, 3);
+  expect(result.status, result.stderr).toBe(0);
+  const receipt = JSON.parse(
+    await readFile(join(input.out, "receipt.json"), "utf8"),
+  ) as HybridReceipt & {
+    lanes: {
+      streamed?: { partial: boolean; text: string; thinkingChars: number };
+    }[];
+  };
+  const lane = receipt.lanes[0]!;
+  expect(lane).toMatchObject({
+    status: "cancelled",
+    stopReason: "review deadline",
+    finalText: "",
+    contractError: null,
+  });
+  expect(lane.streamed).toMatchObject({
+    partial: true,
+    thinkingChars: "weighing the change".length,
+  });
+  expect(Buffer.byteLength(lane.streamed!.text)).toBeLessThanOrEqual(16 * 1024);
+  expect(lane.streamed!.text).not.toContain("\uFFFD");
+  expect(lane.streamed!.text).toContain('"status":"complete"');
+  expect(lane.streamed!.text.startsWith("🧪")).toBe(true);
+  expect(receipt.candidates).toHaveLength(0);
+  expect(receipt.findings).toHaveLength(0);
+  expect(receipt.status).toBe("partial");
 });
 
 it("uses a third family when two finder families reported the same candidate", async () => {
