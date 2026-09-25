@@ -1020,13 +1020,14 @@ const runFailure = async (
 /**
  * What the action recorded for the review it is about to run.
  *
- * The notes travel beside the receipt rather than as flags, so publish reads
- * the same run's own record whatever the review step did with them.
+ * The notes travel beside the receipt's directory rather than as flags, so
+ * publish reads the same run's own record whatever the review step did with
+ * them.
  */
 export type RunNotes = { fork: boolean; packedRunner?: string };
 
 export async function readRunNotes(artifactRoot: string): Promise<RunNotes> {
-  const raw = await readFile(join(artifactRoot, "run.json"), "utf8").catch(
+  const raw = await readFile(`${artifactRoot}.run.json`, "utf8").catch(
     () => null,
   );
   if (raw === null) return { fork: false };

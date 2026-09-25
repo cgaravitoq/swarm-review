@@ -863,8 +863,9 @@ describe("run notes", () => {
   const notesFor = async (raw: string | null) => {
     const directory = await mkdtemp(join(tmpdir(), "review-pi-notes-"));
     directories.push(directory);
-    if (raw !== null) await writeFile(join(directory, "run.json"), raw);
-    return readRunNotes(directory);
+    const artifactRoot = join(directory, "swarm-1");
+    if (raw !== null) await writeFile(`${artifactRoot}.run.json`, raw);
+    return readRunNotes(artifactRoot);
   };
 
   it("reads the fork and the runner the action recorded", async () => {
@@ -1101,7 +1102,7 @@ describe("a run that publishes no review", () => {
     const suiteDir = await artifactDirectory();
     const receiptPath = join(suiteDir, "swarm-receipt.json");
     await writeFile(receiptPath, JSON.stringify(swarm));
-    await writeFile(join(suiteDir, "run.json"), JSON.stringify(notes));
+    await writeFile(`${suiteDir}.run.json`, JSON.stringify(notes));
     for (const phase of phases) {
       await mkdir(join(suiteDir, phase.runId), { recursive: true });
       await writeFile(
