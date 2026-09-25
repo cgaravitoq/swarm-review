@@ -130,7 +130,7 @@ The receipt does not contain request bodies, provider output, handles or credent
 The Sandbox is destroyed after the probe, including failed phases.
 
 The operator supplies a Workers AI bearer and account ID; the Worker uses its credential vault for openai-codex and claude-code.
-Set `WORKER_ORIGIN`, `CONTROL_SECRET`, `CLOUDFLARE_ACCOUNT_ID`, and `WORKERS_AI_API_KEY` in the shell environment, then run:
+Export `WORKER_ORIGIN`, `CONTROL_SECRET`, `CLOUDFLARE_ACCOUNT_ID`, and `WORKERS_AI_API_KEY`, because the script reads them from its environment, then run:
 
 ```sh
 bun run scripts/probe.ts "$WORKER_ORIGIN" 1
@@ -138,7 +138,7 @@ bun run scripts/probe.ts "$WORKER_ORIGIN" 5
 bunx wrangler r2 object get "swarm-review-probes/probes/<runId>.json" --remote --pipe
 ```
 
-The script starts all probes in a burst concurrently and prints every R2 key.
+The script starts all probes in a burst concurrently, prints one line per probe with its run id and R2 key or its error, and exits 1 when any probe failed.
 The bucket must exist before deployment; this repository only declares its binding.
 The local tests prove request routing, isolation and receipt shape with fakes; real provider responses, cold start timings and R2 persistence require a deployed probe.
 
