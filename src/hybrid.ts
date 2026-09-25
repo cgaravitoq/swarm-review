@@ -108,8 +108,6 @@ function runPi(input: {
       "--tools",
       tools,
       ...input.lane.extensions.flatMap((extension) => ["-e", extension]),
-      "--",
-      input.prompt,
     ];
     const env = {
       PATH: process.env["PATH"] ?? "",
@@ -123,9 +121,15 @@ function runPi(input: {
       cwd: input.source,
       env,
       detached: true,
-      stdio: ["ignore", "pipe", "pipe"],
+      stdio: ["pipe", "pipe", "pipe"],
     });
     input.children.add(child);
+    // A context pack outgrows the 128 KiB Linux allows one argument, so the
+    // prompt goes through stdin, which Pi's print mode reads as the message.
+    child.stdin?.on("error", (error) => {
+      stderr += error.message;
+    });
+    child.stdin?.end(input.prompt);
     let stdout = "";
     let stderr = "";
     let turns = 0;

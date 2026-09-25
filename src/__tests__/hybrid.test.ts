@@ -58,11 +58,11 @@ async function setup(verifierFamily = "openai-codex") {
   const fake = `#!/usr/bin/env bun
 import { appendFileSync, readFileSync } from "node:fs";
 const args = process.argv.slice(2);
-const prompt = args.at(-1);
+const prompt = readFileSync(0, "utf8");
 const verifying = prompt.includes('"candidates"');
 const env = Object.keys(process.env).sort();
 const phase = JSON.parse(readFileSync(process.env.PI_OUT + "/status.json", "utf8")).phase;
-appendFileSync(process.env.PI_LOG, JSON.stringify({args, env, phase, family: process.env.PI_FAMILY}) + "\\n");
+appendFileSync(process.env.PI_LOG, JSON.stringify({args, env, phase, family: process.env.PI_FAMILY, promptChars: prompt.length}) + "\\n");
 const event = (data) => process.stdout.write(JSON.stringify(data) + "\\n");
 if (process.env.PI_HANG === "cap") {
   setInterval(() => {
@@ -196,6 +196,44 @@ it("runs read-only cross-family lanes with a scrubbed environment and a publisha
   expect(
     JSON.parse(await readFile(join(input.out, "status.json"), "utf8")).phase,
   ).toBe("done");
+});
+
+it("hands Pi a context pack larger than one argument can carry", async () => {
+  const input = await setup();
+  const git = (...args: string[]) =>
+    execFileSync("git", ["-C", input.source, ...args], { encoding: "utf8" });
+  await writeFile(
+    join(input.source, "a.ts"),
+    `export const value = 2;\n${"// padding line\n".repeat(100_000)}`,
+  );
+  git("add", "a.ts");
+  git(
+    "-c",
+    "user.name=Test",
+    "-c",
+    "user.email=test@invalid",
+    "commit",
+    "-qm",
+    "large head",
+  );
+  const head = git("rev-parse", "HEAD").trim();
+  const config = JSON.parse(await readFile(input.lanes, "utf8"));
+  config.reviewers[0].model = "@cf/deepseek-ai/deepseek-v4-flash-0731";
+  await writeFile(input.lanes, JSON.stringify(config));
+  const result = run({ ...input, head });
+  expect(result.status, result.stderr).toBe(0);
+  const [reviewer] = (await readFile(input.log, "utf8"))
+    .trim()
+    .split("\n")
+    .map((line) => JSON.parse(line) as { args: string[]; promptChars: number });
+  expect(reviewer?.promptChars).toBeGreaterThan(1_600_000);
+  expect(
+    Math.max(...(reviewer?.args ?? []).map((arg) => arg.length)),
+  ).toBeLessThan(131_072);
+  const receipt = JSON.parse(
+    await readFile(join(input.out, "receipt.json"), "utf8"),
+  ) as HybridReceipt;
+  expect(receipt.lanes[0]?.status).toBe("completed");
 });
 
 it("leaves a candidate unverified when every verifier is from the finder family", async () => {
