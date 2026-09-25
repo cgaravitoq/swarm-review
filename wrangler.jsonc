@@ -16,12 +16,14 @@
   "durable_objects": {
     "bindings": [
       { "name": "REVIEW_SANDBOX", "class_name": "ReviewSandbox" },
-      { "name": "CREDENTIAL_VAULT", "class_name": "CredentialVaultObject" }
+      { "name": "CREDENTIAL_VAULT", "class_name": "CredentialVaultObject" },
+      { "name": "CODEX_RELAY", "class_name": "CodexRelaySandbox" }
     ]
   },
   "migrations": [
     { "tag": "v1", "new_sqlite_classes": ["ReviewSandbox"] },
-    { "tag": "v2", "new_sqlite_classes": ["CredentialVaultObject"] }
+    { "tag": "v2", "new_sqlite_classes": ["CredentialVaultObject"] },
+    { "tag": "v3", "new_sqlite_classes": ["CodexRelaySandbox"] }
   ],
   "containers": [
     {
@@ -42,6 +44,13 @@
       // verifiers each, which is what an eval wave runs in parallel. The
       // account allows 1500 vCPU; this is 120.
       "max_instances": 30
+    },
+    {
+      "class_name": "CodexRelaySandbox",
+      "image": "./relay/Dockerfile",
+      "image_build_context": "relay",
+      "instance_type": "lite",
+      "max_instances": 1
     }
   ]
 }

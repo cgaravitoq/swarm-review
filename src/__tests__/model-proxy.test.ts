@@ -1,9 +1,17 @@
 import { createHash } from "node:crypto";
 import { afterEach, describe, expect, it, vi } from "vitest";
+
 import {
   RESPONSE_TAIL_CHARS,
   WORKER_SSE_LINE_CHARS,
 } from "../../container/response-seal";
+import { createCodexRelayHandler } from "../../relay/server";
+import {
+  CODEX_RELAY_ID,
+  CODEX_RELAY_PORT,
+  CODEX_UPSTREAM,
+  createCodexRelayTransport,
+} from "../codex-relay";
 import {
   emptyModelTotals,
   type ModelCaps,
@@ -59,6 +67,205 @@ const proxyTarget = async (runId: string, secret = "control-secret") => {
 };
 
 describe("model proxy", () => {
+  it("routes Codex through the relay with the exact request and refreshes a 401", async () => {
+    const runId = "relay-run";
+    const capability = await modelCapability(runId, "control-secret");
+    const url = new URL(
+      `https://review.invalid/model/${runId}/${capability}/codex/responses`,
+    );
+    const upstream = vi.fn<typeof fetch>(async (input, init) => {
+      expect(String(input)).toBe(CODEX_UPSTREAM);
+      expect(init?.method).toBe("POST");
+      expect(new Headers(init?.headers).get("chatgpt-account-id")).toBe(
+        "fake-account",
+      );
+      expect(await new Response(init?.body).text()).toBe('{"input":"hello"}');
+      return new Headers(init?.headers).get("authorization") ===
+        "Bearer fake-old"
+        ? new Response("denied", { status: 401 })
+        : new Response("done", { status: 200 });
+    });
+    const handler = createCodexRelayHandler(upstream);
+    const containerFetch = vi.fn(async (input: string, init: RequestInit) =>
+      handler(new Request(input, init)),
+    );
+    const process = {
+      id: "relay-process",
+      status: "running",
+      command: "/usr/local/bun/bin/bun /opt/relay/server.ts",
+      waitForPort: vi.fn(async () => undefined),
+    };
+    const sandbox = {
+      listProcesses: vi.fn(async () => []),
+      getProcess: vi.fn(async () => process),
+      startProcess: vi.fn(async () => process),
+      containerFetch,
+    };
+    const factory = vi.fn(() => sandbox);
+    const relay = createCodexRelayTransport(
+      {} as Parameters<typeof createCodexRelayTransport>[0],
+      factory,
+    );
+    const direct = vi.fn<typeof fetch>();
+    vi.stubGlobal("fetch", direct);
+    const credential = vi.fn(async (_provider: string, rejected?: string) => ({
+      authorization: rejected ? "Bearer fake-new" : "Bearer fake-old",
+      accountId: "fake-account",
+    }));
+    const recorded = vi.fn(async () => undefined);
+    const response = await proxyModelFetch(
+      new Request(url, {
+        method: "POST",
+        headers: { authorization: "Bearer review-pi-handle" },
+        body: '{"input":"hello"}',
+      }),
+      url,
+      "control-secret",
+      async () => ({
+        handle: "review-pi-handle",
+        caps: capsFor(),
+        upstreamBaseUrl: "https://chatgpt.com/backend-api",
+      }),
+      async () => ({
+        ok: true as const,
+        session: {
+          handle: "review-pi-handle",
+          upstreamBaseUrl: "https://chatgpt.com/backend-api",
+          credentialProvider: "openai-codex",
+          caps: capsFor(),
+          totals: emptyModelTotals(),
+        },
+      }),
+      recorded,
+      credential,
+      relay,
+    );
+    expect(response.status).toBe(200);
+    expect(await response.text()).toBe("done");
+    expect(upstream).toHaveBeenCalledTimes(2);
+    expect(credential).toHaveBeenLastCalledWith("openai-codex", "fake-old");
+    expect(factory).toHaveBeenCalledWith({}, CODEX_RELAY_ID);
+    expect(sandbox.startProcess).toHaveBeenCalledTimes(2);
+    expect(process.waitForPort).toHaveBeenCalledWith(CODEX_RELAY_PORT, {
+      mode: "tcp",
+    });
+    expect(containerFetch.mock.calls[0]?.[0]).toBe(
+      "http://codex-relay/codex/responses",
+    );
+    expect(direct).not.toHaveBeenCalled();
+    expect(recorded).toHaveBeenCalledTimes(1);
+  });
+
+  it("leaves other upstreams on the direct fetch path", async () => {
+    const url = await proxyTarget("direct-run");
+    const direct = vi.fn<typeof fetch>(async () => new Response("direct"));
+    const relay = vi.fn<typeof fetch>();
+    vi.stubGlobal("fetch", direct);
+    const response = await proxyModelFetch(
+      new Request(url, {
+        method: "POST",
+        headers: { authorization: "Bearer review-pi-handle" },
+        body: "{}",
+      }),
+      url,
+      "control-secret",
+      sessionOpener(),
+      sessionConsumer(),
+      async () => undefined,
+      undefined,
+      relay,
+    );
+    expect(await response.text()).toBe("direct");
+    expect(direct).toHaveBeenCalledTimes(1);
+    expect(String(direct.mock.calls[0]?.[0])).toBe(
+      "https://api.x.ai/v1/chat/completions",
+    );
+    expect(relay).not.toHaveBeenCalled();
+  });
+
+  it("refuses every other relay method, path and caller-selected target", async () => {
+    const upstream = vi.fn<typeof fetch>();
+    const handler = createCodexRelayHandler(upstream);
+    for (const request of [
+      new Request("http://relay/codex/responses", { method: "GET" }),
+      new Request("http://relay/other", { method: "POST" }),
+      new Request("http://relay/codex/responses?target=evil", {
+        method: "POST",
+      }),
+      new Request("http://relay/codex/responses", {
+        method: "POST",
+        headers: { "x-orb-upstream-url": "https://evil.invalid" },
+      }),
+    ]) {
+      expect((await handler(request)).status).toBe(404);
+    }
+    expect(upstream).not.toHaveBeenCalled();
+  });
+
+  it("refuses another upstream before opening the relay sandbox", async () => {
+    const factory = vi.fn(() => {
+      throw new Error("unexpected relay sandbox");
+    });
+    const relay = createCodexRelayTransport(
+      {} as Parameters<typeof createCodexRelayTransport>[0],
+      factory,
+    );
+    expect(
+      (
+        await relay("https://evil.invalid/backend-api/codex/responses", {
+          method: "POST",
+        })
+      ).status,
+    ).toBe(404);
+    expect(
+      (await relay("https://chatgpt.com/backend-api/other", { method: "POST" }))
+        .status,
+    ).toBe(404);
+    expect(factory).not.toHaveBeenCalled();
+  });
+
+  it("streams the relay response before the upstream stream ends", async () => {
+    let controller: ReadableStreamDefaultController<Uint8Array> | undefined;
+    const body = new ReadableStream<Uint8Array>({
+      start(value) {
+        controller = value;
+      },
+    });
+    const upstream = vi.fn<typeof fetch>(async (_input, init) => {
+      expect(new Headers(init?.headers).get("authorization")).toBe(
+        "Bearer fake-token",
+      );
+      return new Response(body, {
+        headers: { "content-type": "text/event-stream" },
+      });
+    });
+    const log = vi.spyOn(console, "log").mockImplementation(() => undefined);
+    const error = vi
+      .spyOn(console, "error")
+      .mockImplementation(() => undefined);
+    const response = await createCodexRelayHandler(upstream)(
+      new Request("http://relay/codex/responses", {
+        method: "POST",
+        headers: { authorization: "Bearer fake-token" },
+        body: "{}",
+      }),
+    );
+    const reader = response.body?.getReader();
+    expect(reader).toBeDefined();
+    controller?.enqueue(new TextEncoder().encode("first"));
+    expect(new TextDecoder().decode((await reader?.read())?.value)).toBe(
+      "first",
+    );
+    controller?.enqueue(new TextEncoder().encode("second"));
+    controller?.close();
+    expect(new TextDecoder().decode((await reader?.read())?.value)).toBe(
+      "second",
+    );
+    expect(log).not.toHaveBeenCalled();
+    expect(error).not.toHaveBeenCalled();
+    log.mockRestore();
+    error.mockRestore();
+  });
   it("refreshes and retries a vault-backed 401 once without exposing tokens", async () => {
     const runId = "vault-run";
     const url = await proxyTarget(runId);

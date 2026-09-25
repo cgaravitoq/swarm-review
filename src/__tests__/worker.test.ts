@@ -24,6 +24,7 @@ const getSandbox = vi.hoisted(() => vi.fn());
 
 vi.mock("@cloudflare/sandbox", () => ({
   Sandbox: class {},
+  ContainerProxy: class {},
   getSandbox,
 }));
 vi.mock("cloudflare:workers", () => ({ DurableObject: class {} }));
@@ -32,6 +33,7 @@ const {
   default: handler,
   ReviewSandbox,
   CredentialVaultObject,
+  CodexRelaySandbox,
 } = await import("../../worker");
 
 /** The bindings this suite gives the Worker, with the sandbox SDK mocked out. */
@@ -41,6 +43,9 @@ const env = {
   >,
   CREDENTIAL_VAULT: {} as DurableObjectNamespace<
     InstanceType<typeof CredentialVaultObject>
+  >,
+  CODEX_RELAY: {} as DurableObjectNamespace<
+    InstanceType<typeof CodexRelaySandbox>
   >,
   CONTROL_SECRET: "control-secret",
   OPENCODE_API_KEY: "model-secret",
@@ -209,6 +214,16 @@ const sandboxForProbeStart = (probe: {
 };
 
 describe("worker-proxy credential isolation", () => {
+  it("keeps the relay separate from review sandbox egress settings", () => {
+    const relay = new CodexRelaySandbox({} as never, env as never);
+    expect(relay.enableInternet).toBe(true);
+    expect(relay.allowedHosts).toEqual(["chatgpt.com"]);
+    expect(relay.interceptHttps).toBe(false);
+    expect(new ReviewSandbox({} as never, env as never)).not.toHaveProperty(
+      "allowedHosts",
+    );
+  });
+
   it("guards operator routes and returns status without a credential", async () => {
     const log = vi.spyOn(console, "log").mockImplementation(() => undefined);
     const error = vi
