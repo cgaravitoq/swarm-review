@@ -158,7 +158,8 @@ describe("cloud reviews", () => {
       | "engine"
       | "engine-exit"
       | "fingerprint"
-      | "deadline-engine",
+      | "deadline-engine"
+      | "deadline-receipt",
   ) => {
     const files = new Map<string, string>([
       [
@@ -212,8 +213,17 @@ describe("cloud reviews", () => {
             })),
           };
         if (failure === "deadline-engine") {
-          (stored.get("review") as { deadlineAt: string }).deadlineAt =
-            new Date(Date.now() - 1).toISOString();
+          const review = stored.get("review") as {
+            reviewId: string;
+            deadlineAt: string;
+          };
+          r2.set(`reviews/${review.reviewId}/status.json`, {
+            phase: "reviewing",
+            reviewers: [{ family: "workers-ai", state: "completed" }],
+            candidates: 2,
+            verified: 1,
+          });
+          review.deadlineAt = new Date(Date.now() - 1).toISOString();
           return { getStatus: vi.fn(async () => "running") };
         }
         const directory =
@@ -234,8 +244,9 @@ describe("cloud reviews", () => {
           `${directory}/out/receipt.json`,
           JSON.stringify({
             swarmId: "test",
-            status: "completed",
-            findings: [],
+            status: failure === "deadline-receipt" ? "partial" : "completed",
+            findings:
+              failure === "deadline-receipt" ? [{ id: "verified-1" }] : [],
           }),
         );
         return { getStatus: vi.fn(async () => "completed") };
@@ -440,6 +451,16 @@ describe("cloud reviews", () => {
     });
   });
 
+  it("does not start an engine without time to read its receipt and destroy the Sandbox", async () => {
+    const fixture = setup();
+    await post(fixture.reviewEnv);
+    const review = fixture.stored.get("review") as { deadlineAt: string };
+    review.deadlineAt = new Date(Date.now() + 80_000).toISOString();
+    await fixture.job.alarm();
+    expect(fixture.sandbox.startProcess).not.toHaveBeenCalled();
+    expect(fixture.sandbox.destroy).toHaveBeenCalledOnce();
+  });
+
   it("cuts a running engine at the deadline and destroys its Sandbox", async () => {
     const fixture = setup("deadline-engine");
     const response = await post(fixture.reviewEnv);
@@ -449,6 +470,71 @@ describe("cloud reviews", () => {
     expect(fixture.sandbox.destroy).toHaveBeenCalledOnce();
     expect(fixture.r2.get(`reviews/${reviewId}/receipt.json`)).toMatchObject({
       failure: { stage: "deadline" },
+    });
+    expect(fixture.r2.get(`reviews/${reviewId}/status.json`)).toMatchObject({
+      phase: "failed",
+      reviewers: [{ family: "workers-ai", state: "completed" }],
+      candidates: 2,
+      verified: 1,
+    });
+  });
+
+  it("gives the engine time to write a deadline receipt and stores its findings unchanged", async () => {
+    const fixture = setup("deadline-receipt");
+    const response = await post(fixture.reviewEnv);
+    const { reviewId } = (await response.json()) as { reviewId: string };
+    await fixture.job.alarm();
+    const command = fixture.sandbox.startProcess.mock.calls[0]?.[0] as string;
+    const timeout = Number(command.match(/'--total-timeout' '(\d+)'/)?.[1]);
+    const deadlineAt = Date.parse(
+      (fixture.stored.get("review") as { deadlineAt: string }).deadlineAt,
+    );
+    expect(deadlineAt - Date.now() - timeout * 1000).toBeGreaterThanOrEqual(
+      85_000,
+    );
+    expect(fixture.r2.get(`reviews/${reviewId}/receipt.json`)).toEqual({
+      swarmId: "test",
+      status: "partial",
+      findings: [{ id: "verified-1" }],
+    });
+  });
+
+  it("retries storing the engine receipt unchanged after an R2 write fails", async () => {
+    const fixture = setup("deadline-receipt");
+    const response = await post(fixture.reviewEnv);
+    const { reviewId } = (await response.json()) as { reviewId: string };
+    const originalPut = fixture.object.put.getMockImplementation();
+    let failed = false;
+    fixture.object.put.mockImplementation(async (key, value) => {
+      if (key === `reviews/${reviewId}/receipt.json` && !failed) {
+        failed = true;
+        throw new Error("r2 write failed");
+      }
+      await originalPut?.(key, value);
+    });
+    await fixture.job.alarm();
+    expect(failed).toBe(true);
+    expect(fixture.r2.get(`reviews/${reviewId}/receipt.json`)).toEqual({
+      swarmId: "test",
+      status: "partial",
+      findings: [{ id: "verified-1" }],
+    });
+  });
+
+  it("keeps the stored engine receipt when cleanup fails", async () => {
+    const fixture = setup("deadline-receipt");
+    const response = await post(fixture.reviewEnv);
+    const { reviewId } = (await response.json()) as { reviewId: string };
+    fixture.sandbox.destroy.mockRejectedValueOnce(new Error("destroy failed"));
+    await fixture.job.alarm();
+    expect(fixture.r2.get(`reviews/${reviewId}/receipt.json`)).toEqual({
+      swarmId: "test",
+      status: "partial",
+      findings: [{ id: "verified-1" }],
+    });
+    expect(fixture.r2.get(`reviews/${reviewId}/status.json`)).toMatchObject({
+      phase: "failed",
+      reason: "destroy_failed: destroy failed",
     });
   });
 
@@ -557,6 +643,22 @@ describe("cloud reviews", () => {
       status: "completed",
     });
     expect(fixture.stored.get("state")).toBe("done");
+  });
+
+  it("a retried alarm keeps a stored engine receipt when destroy fails", async () => {
+    const fixture = setup();
+    const response = await post(fixture.reviewEnv);
+    const { reviewId } = (await response.json()) as { reviewId: string };
+    fixture.stored.set("state", "running");
+    const receipt = { status: "partial", findings: [{ id: "verified-1" }] };
+    fixture.r2.set(`reviews/${reviewId}/receipt.json`, receipt);
+    fixture.sandbox.destroy.mockRejectedValueOnce(new Error("destroy failed"));
+    await fixture.job.alarm();
+    expect(fixture.r2.get(`reviews/${reviewId}/receipt.json`)).toEqual(receipt);
+    expect(fixture.r2.get(`reviews/${reviewId}/status.json`)).toMatchObject({
+      phase: "failed",
+      reason: "destroy_failed",
+    });
   });
 });
 
