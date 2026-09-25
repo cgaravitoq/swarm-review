@@ -1933,16 +1933,31 @@ describe("cloud model session accounting", () => {
       "fetch",
       vi.fn<typeof fetch>(() =>
         Promise.resolve(
-          new Response(new ReadableStream({ start() {} }), {
-            status: 200,
-            headers: { "content-type": "text/event-stream" },
-          }),
+          new Response(
+            new ReadableStream<Uint8Array>({
+              start(controller) {
+                controller.enqueue(
+                  new TextEncoder().encode(
+                    'data: {"choices":[{"delta":{"content":"partial answer"}}]}\n\n',
+                  ),
+                );
+              },
+            }),
+            {
+              status: 200,
+              headers: { "content-type": "text/event-stream" },
+            },
+          ),
         ),
       ),
     );
 
     const response = await postModel("abandoned-run");
-    await response.body?.cancel();
+    const reader = response.body?.getReader();
+    expect(new TextDecoder().decode((await reader?.read())?.value)).toContain(
+      "partial answer",
+    );
+    await reader?.cancel();
 
     expect(await sandbox.modelUsage()).toMatchObject({
       totals: {

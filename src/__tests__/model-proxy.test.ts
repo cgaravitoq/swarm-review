@@ -77,7 +77,7 @@ describe("model proxy", () => {
       start(controller) {
         controller.enqueue(
           new TextEncoder().encode(
-            'data: {"type":"response.completed","response":{"usage":{"input_tokens":4,"output_tokens":2}}}\n\n',
+            'data: {"type":"response.output_text.delta","output_index":0,"delta":"pong"}\n\ndata: {"type":"response.completed","response":{"usage":{"input_tokens":4,"output_tokens":2}}}\n\n',
           ),
         );
       },
