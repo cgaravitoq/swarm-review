@@ -278,6 +278,7 @@ export async function proxyModelFetch(
     provider: string,
     rejectedAccessToken?: string,
   ) => Promise<{ authorization: string; accountId?: string }>,
+  relayFetch?: typeof fetch,
 ): Promise<Response> {
   const segments = url.pathname.split("/").filter(Boolean);
   const runIdRaw = segments[1];
@@ -342,7 +343,10 @@ export async function proxyModelFetch(
     const forward = (authorization: string, accountId?: string) => {
       headers.set("authorization", authorization);
       if (accountId) headers.set("chatgpt-account-id", accountId);
-      return fetch(target, {
+      const forwardFetch =
+        target.origin === "https://chatgpt.com" ? relayFetch : fetch;
+      if (!forwardFetch) throw new Error("codex_relay_unconfigured");
+      return forwardFetch(target, {
         method,
         headers,
         body,
@@ -361,6 +365,9 @@ export async function proxyModelFetch(
     }
   } catch (error) {
     await recordAttempt(runId, null, true, null);
+    if (error instanceof Error && error.message.startsWith("codex_relay_")) {
+      return jsonError(502, error.message);
+    }
     if (provider) {
       const reason =
         error instanceof Error && error.message.startsWith("credential_")

@@ -24,6 +24,7 @@ const getSandbox = vi.hoisted(() => vi.fn());
 
 vi.mock("@cloudflare/sandbox", () => ({
   Sandbox: class {},
+  ContainerProxy: class {},
   getSandbox,
 }));
 vi.mock("cloudflare:workers", () => ({ DurableObject: class {} }));
@@ -32,6 +33,7 @@ const {
   default: handler,
   ReviewSandbox,
   CredentialVaultObject,
+  CodexRelaySandbox,
 } = await import("../../worker");
 
 /** The bindings this suite gives the Worker, with the sandbox SDK mocked out. */
@@ -41,6 +43,9 @@ const env = {
   >,
   CREDENTIAL_VAULT: {} as DurableObjectNamespace<
     InstanceType<typeof CredentialVaultObject>
+  >,
+  CODEX_RELAY: {} as DurableObjectNamespace<
+    InstanceType<typeof CodexRelaySandbox>
   >,
   CONTROL_SECRET: "control-secret",
   OPENCODE_API_KEY: "model-secret",
@@ -209,6 +214,16 @@ const sandboxForProbeStart = (probe: {
 };
 
 describe("worker-proxy credential isolation", () => {
+  it("keeps the relay separate from review sandbox egress settings", () => {
+    const relay = new CodexRelaySandbox({} as never, env as never);
+    expect(relay.enableInternet).toBe(true);
+    expect(relay.allowedHosts).toEqual(["chatgpt.com"]);
+    expect(relay.interceptHttps).toBe(false);
+    expect(new ReviewSandbox({} as never, env as never)).not.toHaveProperty(
+      "allowedHosts",
+    );
+  });
+
   it("guards operator routes and returns status without a credential", async () => {
     const log = vi.spyOn(console, "log").mockImplementation(() => undefined);
     const error = vi
@@ -911,21 +926,35 @@ describe("deployed container image", () => {
     expect(tracked.sort()).toEqual(Object.values(IMAGE_SOURCES).sort());
   });
 
-  it("pins what the image installs in the Dockerfile's own bytes", async () => {
-    const dockerfile = await readFile(
-      path.join(packageRoot, "container", "Dockerfile"),
-      "utf8",
-    );
+  it("pins what each image installs in its Dockerfile's own bytes", async () => {
     const manifest = JSON.parse(
       await readFile(path.join(packageRoot, "package.json"), "utf8"),
     ) as { dependencies: Record<string, string> };
+    const base = `FROM docker.io/cloudflare/sandbox:${manifest.dependencies["@cloudflare/sandbox"]}`;
 
-    // A build argument would move pi, bun or the base without moving the
-    // bytes the gate compares.
-    expect(dockerfile).not.toMatch(/^\s*ARG\s/m);
-    expect(dockerfile).toContain(
-      `FROM docker.io/cloudflare/sandbox:${manifest.dependencies["@cloudflare/sandbox"]} AS bun`,
+    for (const [image, from] of [
+      ["container", `${base} AS bun`],
+      ["relay", base],
+    ] as const) {
+      const dockerfile = await readFile(
+        path.join(packageRoot, image, "Dockerfile"),
+        "utf8",
+      );
+      // A build argument would move pi, bun or the base without moving the
+      // bytes the gate compares.
+      expect(dockerfile).not.toMatch(/^\s*ARG\s/m);
+      expect(dockerfile.split("\n")).toContain(from);
+    }
+  });
+
+  it("boots the relay image with no interpreter pools beside the relay", async () => {
+    const dockerfile = await readFile(
+      path.join(packageRoot, "relay", "Dockerfile"),
+      "utf8",
     );
+    for (const pool of ["JAVASCRIPT", "TYPESCRIPT", "PYTHON"]) {
+      expect(dockerfile).toMatch(new RegExp(`\\b${pool}_POOL_MIN_SIZE=0\\b`));
+    }
   });
 
   it("keeps the generated bake context out of git", () => {

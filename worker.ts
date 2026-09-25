@@ -9,6 +9,10 @@
 
 import { DurableObject } from "cloudflare:workers";
 import { getSandbox, Sandbox } from "@cloudflare/sandbox";
+
+export { ContainerProxy } from "@cloudflare/sandbox";
+
+import { createCodexRelayTransport } from "./src/codex-relay";
 import { CredentialVault } from "./src/credential-vault";
 import { gitCapability, proxyGitFetch } from "./src/git-proxy";
 import {
@@ -164,11 +168,18 @@ export class ReviewSandbox extends Sandbox<ReviewPiEnv> {
   }
 }
 
+export class CodexRelaySandbox extends Sandbox<ReviewPiEnv> {
+  override enableInternet = true;
+  override allowedHosts = ["chatgpt.com"];
+  override interceptHttps = false;
+}
+
 type ReviewPiEnv = Record<
   "REVIEW_SANDBOX",
   DurableObjectNamespace<ReviewSandbox>
 > &
   Record<"CREDENTIAL_VAULT", DurableObjectNamespace<CredentialVaultObject>> &
+  Record<"CODEX_RELAY", DurableObjectNamespace<CodexRelaySandbox>> &
   Record<"CONTROL_SECRET" | "GITHUB_READ_TOKEN", string> & {
     /** https clone URL the run's containers fetch through the Git proxy. */
     TARGET_REPOSITORY?: string;
@@ -326,6 +337,7 @@ export default {
             provider,
             rejectedAccessToken,
           ),
+        createCodexRelayTransport(env.CODEX_RELAY),
       );
     }
 

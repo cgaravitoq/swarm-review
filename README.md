@@ -113,6 +113,10 @@ The script sends credentials only in the authenticated HTTPS request body and pr
 `GET /credentials` with `Authorization: Bearer <CONTROL_SECRET>` returns configured providers, expiry and last refresh without token values.
 Runs that omit `broker.upstreamAuthorization` use the matching vault credential on each model attempt; runs carrying it retain their existing behavior.
 Codex refreshes before expiry and after an upstream 401, with the rotated pair stored before the next request.
+The Worker sends `chatgpt.com` model requests through a separate relay sandbox that accepts only `POST /codex/responses` and forwards to a fixed `https://chatgpt.com/backend-api/codex/responses` URL.
+The relay image adds only Bun and its server to the Sandbox runtime, and the review container has no binding to it.
+The relay uses direct HTTPS because intercepted HTTPS returns a Worker-side 403 from `chatgpt.com`.
+`allowedHosts` filters intercepted HTTP here, but does not restrict direct HTTPS in the current Containers SDK; the fixed URL in relay code is the enforced outbound destination for relay requests.
 
 ## Commands
 
