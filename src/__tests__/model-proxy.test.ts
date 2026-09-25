@@ -76,9 +76,6 @@ describe("model proxy", () => {
     const upstream = vi.fn<typeof fetch>(async (input, init) => {
       expect(String(input)).toBe(CODEX_UPSTREAM);
       expect(init?.method).toBe("POST");
-      expect(new Headers(init?.headers).get("chatgpt-account-id")).toBe(
-        "fake-account",
-      );
       expect(await new Response(init?.body).text()).toBe('{"input":"hello"}');
       return new Headers(init?.headers).get("authorization") ===
         "Bearer fake-old"
@@ -86,9 +83,11 @@ describe("model proxy", () => {
         : new Response("done", { status: 200 });
     });
     const handler = createCodexRelayHandler(upstream);
-    const containerFetch = vi.fn(async (input: string, init: RequestInit) =>
-      handler(new Request(input, init)),
-    );
+    const containerFetch = vi.fn(async (input: string, init: RequestInit) => {
+      const headers = new Headers(init.headers);
+      headers.set("cf-relay-hop", "runtime-added");
+      return handler(new Request(input, { ...init, headers }));
+    });
     const process = {
       id: "relay-process",
       status: "running",
@@ -116,7 +115,20 @@ describe("model proxy", () => {
     const response = await proxyModelFetch(
       new Request(url, {
         method: "POST",
-        headers: { authorization: "Bearer review-pi-handle" },
+        headers: {
+          authorization: "Bearer review-pi-handle",
+          "chatgpt-account-id": "review-pi",
+          "content-type": "application/json",
+          accept: "text/event-stream",
+          "openai-beta": "responses=experimental",
+          originator: "pi",
+          "session-id": "fake-session",
+          "user-agent": "pi-test",
+          "cf-connecting-ip": "192.0.2.1",
+          "cf-visitor": '{"scheme":"https"}',
+          "cf-worker": "review.invalid",
+          "cf-ew-via": "15",
+        },
         body: '{"input":"hello"}',
       }),
       url,
@@ -143,6 +155,18 @@ describe("model proxy", () => {
     expect(response.status).toBe(200);
     expect(await response.text()).toBe("done");
     expect(upstream).toHaveBeenCalledTimes(2);
+    for (const [index, call] of upstream.mock.calls.entries()) {
+      expect(Object.fromEntries(new Headers(call[1]?.headers))).toEqual({
+        accept: "text/event-stream",
+        authorization: index === 0 ? "Bearer fake-old" : "Bearer fake-new",
+        "chatgpt-account-id": "fake-account",
+        "content-type": "application/json",
+        "openai-beta": "responses=experimental",
+        originator: "pi",
+        "session-id": "fake-session",
+        "user-agent": "pi-test",
+      });
+    }
     expect(credential).toHaveBeenLastCalledWith("openai-codex", "fake-old");
     expect(factory).toHaveBeenCalledWith({}, CODEX_RELAY_ID);
     expect(sandbox.startProcess).toHaveBeenCalledTimes(2);
@@ -400,7 +424,10 @@ describe("model proxy", () => {
     const response = await proxyModelFetch(
       new Request(url, {
         method: "POST",
-        headers: { authorization: "Bearer review-pi-handle" },
+        headers: {
+          authorization: "Bearer review-pi-handle",
+          "cf-worker": "review.invalid",
+        },
         body: "{}",
       }),
       url,
@@ -416,6 +443,9 @@ describe("model proxy", () => {
     expect(String(direct.mock.calls[0]?.[0])).toBe(
       "https://api.x.ai/v1/chat/completions",
     );
+    expect(
+      new Headers(direct.mock.calls[0]?.[1]?.headers).get("cf-worker"),
+    ).toBe("review.invalid");
     expect(relay).not.toHaveBeenCalled();
   });
 
