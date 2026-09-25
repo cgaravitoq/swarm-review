@@ -943,6 +943,16 @@ describe("deployed container image", () => {
     );
   });
 
+  it("boots the relay image with no interpreter pools beside the relay", async () => {
+    const dockerfile = await readFile(
+      path.join(packageRoot, "relay", "Dockerfile"),
+      "utf8",
+    );
+    for (const pool of ["JAVASCRIPT", "TYPESCRIPT", "PYTHON"]) {
+      expect(dockerfile).toMatch(new RegExp(`\\b${pool}_POOL_MIN_SIZE=0\\b`));
+    }
+  });
+
   it("keeps the generated bake context out of git", () => {
     const ignored = spawnSync("git", ["check-ignore", "container/context"], {
       cwd: packageRoot,

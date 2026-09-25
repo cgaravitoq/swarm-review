@@ -1,5 +1,9 @@
 FROM docker.io/cloudflare/sandbox:0.12.9
 
+ENV JAVASCRIPT_POOL_MIN_SIZE=0 \
+    TYPESCRIPT_POOL_MIN_SIZE=0 \
+    PYTHON_POOL_MIN_SIZE=0
+
 ENV BUN_INSTALL=/usr/local/bun
 RUN curl -fsSL https://bun.sh/install | bash -s "bun-v1.4.0" \
   && /usr/local/bun/bin/bun --version | grep -qx "1.4.0"
