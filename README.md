@@ -162,10 +162,16 @@ If the engine produces no receipt, a failed or expired review records a failed r
 The deployment needs `WORKERS_AI_ACCOUNT_ID` and `WORKERS_AI_API_KEY` as Worker bindings, plus configured `openai-codex` and `claude-code` vault credentials.
 The deploy script bundles `src/swarm.ts` into the generated image context and supplies `IMAGE_SOURCE_HASHES` to the Worker, so the image fingerprint gate checks the engine before any model request.
 
-The GitHub App sends signed `pull_request` webhooks to `POST /github/webhook`.
+The GitHub App sends signed `pull_request` and `check_run` webhooks to `POST /github/webhook`.
 The Worker accepts `opened`, `reopened`, and `ready_for_review` for non-draft PRs authored by an owner, member, or collaborator in the allowlist.
 One Durable Object per PR deduplicates delivery IDs, starts the same cloud review after the webhook response, and publishes an advisory `swarm-review` check on the PR head.
-It completes with `success` and a finding count when the review finishes, or `neutral` with the failure reason.
+The review runs against the merge base of the PR's base and head, so its receipt is published as one PR review with inline comments on the lines the three-dot diff touches.
+The object records a publish intent before the POST, and every retry looks for the review's marker on the PR first, so a review is posted once.
+A head that moved on top of the reviewed commit still gets the review at that commit; a commit force-pushed away gets none.
+The check completes with `success` when the review is published, or `neutral` with the reason; it never fails the PR.
+A push (`synchronize`) starts no review: the new head gets a `neutral` check with a Review button, and a run already in flight finishes on its own SHA.
+Review and Re-run on that check start a new generation if its commit is still the head of an open PR, and the newer generation stops the older one's cloud review and keeps it from publishing.
+A 403, 404, or 422 from GitHub ends that generation's retries with the reason recorded and does not block later generations.
 Set `GITHUB_APP_ID`, `GITHUB_APP_PRIVATE_KEY` (PKCS#8 PEM), and `GITHUB_WEBHOOK_SECRET` as Worker secrets before installing the App.
 The App installation token is restricted to the event's repository and replaces the read token for that review's git proxy requests.
 
