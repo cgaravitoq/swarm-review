@@ -48,8 +48,8 @@ FROM bun
 
 ENV PI_CODING_AGENT_DIR=/opt/review/pi-config
 
-RUN npm install -g "@earendil-works/pi-coding-agent@0.87.1" \
-  && pi --version | grep -qx "0.87.1"
+RUN npm install -g "@earendil-works/pi-coding-agent@0.85.1" \
+  && pi --version | grep -qx "0.85.1"
 
 # The review prompt asks for `rg`; the base image has no ripgrep, so every
 # search silently degraded to repeated grep/find sweeps of the whole monorepo.
