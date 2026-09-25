@@ -37,6 +37,7 @@ const {
   default: handler,
   ReviewSandbox,
   ReviewJob,
+  PullRequestReview,
   CredentialVaultObject,
   CodexRelaySandbox,
 } = await import("../../worker");
@@ -47,6 +48,9 @@ const env = {
     InstanceType<typeof ReviewSandbox>
   >,
   REVIEW_JOBS: {} as DurableObjectNamespace<InstanceType<typeof ReviewJob>>,
+  PULL_REQUEST_REVIEWS: {} as DurableObjectNamespace<
+    InstanceType<typeof PullRequestReview>
+  >,
   CREDENTIAL_VAULT: {} as DurableObjectNamespace<
     InstanceType<typeof CredentialVaultObject>
   >,
@@ -59,7 +63,10 @@ const env = {
   WORKERS_AI_API_KEY: "workers-ai-secret",
   WORKERS_AI_ACCOUNT_ID: "account-id",
   GITHUB_READ_TOKEN: "github-token",
-  TARGET_REPOSITORY: "https://github.com/acme/demo.git",
+  TARGET_REPOSITORIES: "https://github.com/acme/demo.git",
+  GITHUB_APP_ID: "123",
+  GITHUB_APP_PRIVATE_KEY: "fake-key",
+  GITHUB_WEBHOOK_SECRET: "fake-webhook-secret",
 };
 
 /**
@@ -69,7 +76,7 @@ const env = {
  * an absent optional property, and unsetting it is the whole point of the case,
  * so each caller casts at the boundary it is testing.
  */
-const envWithoutTarget = { ...env, TARGET_REPOSITORY: undefined };
+const envWithoutTarget = { ...env, TARGET_REPOSITORIES: undefined };
 
 const sha40 = "a".repeat(40);
 const sha64 = "b".repeat(64);
@@ -1607,7 +1614,11 @@ describe("worker-proxy credential isolation", () => {
     );
     vi.stubGlobal("fetch", upstream);
     const runId = "run-1";
-    const capability = await gitCapability(runId, "control-secret");
+    const capability = await gitCapability(
+      runId,
+      "control-secret",
+      "acme/demo",
+    );
 
     const response = await handler.fetch(
       new Request(
@@ -2215,9 +2226,12 @@ describe("deployed container image", () => {
         "--target",
         "/checkouts/demo",
         "--var",
-        "TARGET_REPOSITORY:https://github.com/acme/demo.git",
+        "TARGET_REPOSITORIES:https://github.com/acme/demo.git",
       ]),
-    ).toEqual(["--var", "TARGET_REPOSITORY:https://github.com/acme/demo.git"]);
+    ).toEqual([
+      "--var",
+      "TARGET_REPOSITORIES:https://github.com/acme/demo.git",
+    ]);
     expect(deployArguments(["--var", "X:1"])).toEqual(["--var", "X:1"]);
     expect(deployArguments([])).toEqual([]);
     expect(

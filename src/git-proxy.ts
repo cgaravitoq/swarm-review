@@ -7,13 +7,13 @@
  * container talks to this proxy instead.
  *
  * Two things keep it read-only. The repository is the Worker's own
- * `TARGET_REPOSITORY`, so no other repository is reachable. And git's HTTP
+ * allowlist entry selected for the run, so no other repository is reachable. And git's HTTP
  * protocol has exactly one write endpoint - `git-receive-pack` - which is not
  * in the allowed set: only the `git-upload-pack` advertisement and its POST are
  * forwarded. A push has no path through here even with the capability in hand.
  *
- * The capability is derived from the control secret and the run id, so it is
- * unguessable, specific to one run, and never has to be stored.
+ * The capability is derived from the control secret, run id and repository,
+ * so it is specific to one run and repository and never has to be stored.
  */
 
 const ALLOWED = new Set(["info/refs", "git-upload-pack"]);
@@ -23,10 +23,18 @@ const hex = (buffer: ArrayBuffer) =>
     .map((byte) => byte.toString(16).padStart(2, "0"))
     .join("");
 
-export async function gitCapability(runId: string, secret: string) {
+export async function gitCapability(
+  runId: string,
+  secret: string,
+  repository: string,
+) {
+  const name = repository
+    .replace(/^https:\/\/github\.com\//, "")
+    .replace(/\.git$/, "")
+    .toLowerCase();
   const digest = await crypto.subtle.digest(
     "SHA-256",
-    new TextEncoder().encode(`${secret}:git:${runId}`),
+    new TextEncoder().encode(`${secret}:git:${runId}:${name}`),
   );
   return hex(digest);
 }
@@ -51,7 +59,7 @@ export async function proxyGitFetch(
   }
 
   const runId = request.headers.get("x-review-run") ?? "";
-  if (capability !== (await gitCapability(runId, secret))) {
+  if (capability !== (await gitCapability(runId, secret, repository))) {
     return new Response("forbidden", { status: 403 });
   }
 
