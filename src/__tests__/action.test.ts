@@ -45,7 +45,7 @@ async function arrange(headRepo: string, pullSucceeds: boolean) {
   );
   await writeFile(
     join(bin, "bun"),
-    '#!/bin/sh\nprintf "bun %s\\n" "$*" >> "$ACTION_LOG"\nif [ "$1" = "$ACTION_ROOT/src/swarm.ts" ]; then printf "%s\\0" "$@" > "$ACTION_ARGS"; out=; id=; previous=; for arg; do case "$previous" in --out) out=$arg;; --swarm-id) id=$arg;; esac; previous=$arg; done; [ -f "$out/$id.run.json" ] || { echo "run notes missing" >&2; exit 1; }; mkdir -p "$out" && mkdir "$out/$id" || exit 1; [ "$ACTION_FAIL" = partial ] && printf "{}" > "$out/$id/swarm-receipt.json" && exit 1; [ "$ACTION_FAIL" = swarm ] && exit 1; fi\nif [ "$1" = build ]; then for outfile; do :; done; [ -f "$outfile" ] || { mkdir -p "$(dirname "$outfile")" && printf bundle > "$outfile"; }; fi\nif [ "$2" = "$ACTION_ROOT/scripts/deploy.ts" ] && [ "$ACTION_FAIL" = deploy ]; then printf "exec /bin/sh: exec format error\\ndocker build exited with code 1\\n" >&2; exit 1; fi\nexit 0\n',
+    '#!/bin/sh\nprintf "bun %s\\n" "$*" >> "$ACTION_LOG"\nif [ "$1" = "$ACTION_ROOT/src/swarm.ts" ]; then printf "%s\\0" "$@" > "$ACTION_ARGS"; out=; id=; previous=; for arg; do case "$previous" in --out) out=$arg;; --swarm-id) id=$arg;; esac; previous=$arg; done; [ -f "$out/$id.run.json" ] || { echo "run notes missing" >&2; exit 1; }; mkdir -p "$out" && mkdir "$out/$id" || exit 1; [ "$ACTION_FAIL" = partial ] && printf "{}" > "$out/$id/swarm-receipt.json" && exit 1; [ "$ACTION_FAIL" = swarm ] && exit 1; fi\nif [ "$1" = build ] && [ "$ACTION_FAIL" = bundle ]; then echo "error: Could not resolve ./missing" >&2; exit 1; fi\nif [ "$1" = build ]; then for outfile; do :; done; [ -f "$outfile" ] || { mkdir -p "$(dirname "$outfile")" && printf bundle > "$outfile"; }; fi\nif [ "$2" = "$ACTION_ROOT/scripts/deploy.ts" ] && [ "$ACTION_FAIL" = deploy ]; then printf "exec /bin/sh: exec format error\\ndocker build exited with code 1\\n" >&2; exit 1; fi\nexit 0\n',
   );
   for (const name of ["gh", "docker", "bun"]) {
     await chmod(join(bin, name), 0o755);
@@ -416,6 +416,20 @@ describe("composite action driver", () => {
     expect(await fixture.failure()).toEqual({
       stage: "registry login",
       message: "docker login exited with code 2",
+    });
+  });
+
+  it("records a failed engine bundle under its own stage before any pull", async () => {
+    const fixture = await arrange("acme/demo", true);
+    await expect(
+      main({ ...fixture.env, INPUT_MODE: "sandbox", ACTION_FAIL: "bundle" }),
+    ).rejects.toThrow("error: Could not resolve ./missing");
+    const log = await fixture.log();
+    expect(log.some((line) => line.startsWith("bun build "))).toBe(true);
+    expect(log.some((line) => line.startsWith("docker pull "))).toBe(false);
+    expect(await fixture.failure()).toEqual({
+      stage: "engine bundle",
+      message: "error: Could not resolve ./missing",
     });
   });
 
