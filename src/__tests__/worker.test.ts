@@ -417,65 +417,87 @@ describe("cloud reviews", () => {
     });
   });
 
-  it("deepens a shallow PR clone until the hybrid engine can diff its base", async () => {
-    const root = await mkdtemp(path.join(tmpdir(), "review-ancestry-"));
-    try {
-      const upstream = path.join(root, "upstream.git");
-      const source = path.join(root, "source");
-      const checkout = path.join(root, "checkout");
-      const git = (...args: string[]) => {
-        const result = spawnSync("git", args, { encoding: "utf8" });
-        expect(result.status, result.stderr).toBe(0);
-        return result.stdout.trim();
-      };
-      git("init", "--bare", "-q", upstream);
-      git("init", "-q", "-b", "main", source);
-      git("-C", source, "config", "user.name", "Test");
-      git("-C", source, "config", "user.email", "test@invalid");
-      await writeFile(path.join(source, "file.txt"), "base\n");
-      git("-C", source, "add", "file.txt");
-      git("-C", source, "commit", "-qm", "base");
-      const base = git("-C", source, "rev-parse", "HEAD");
-      git("-C", source, "remote", "add", "origin", upstream);
-      git("-C", source, "push", "-q", "origin", "main");
-      git("-C", upstream, "symbolic-ref", "HEAD", "refs/heads/main");
-      await writeFile(path.join(source, "file.txt"), "base\nhead\n");
-      git("-C", source, "commit", "-qam", "head");
-      const head = git("-C", source, "rev-parse", "HEAD");
-      git("-C", source, "push", "-q", "origin", "HEAD:refs/pull/17/head");
+  it.each(["an ancestor", "a moved"] as const)(
+    "deepens a shallow PR clone until the hybrid engine can diff %s base",
+    async (kind) => {
+      const root = await mkdtemp(path.join(tmpdir(), "review-ancestry-"));
+      try {
+        const upstream = path.join(root, "upstream.git");
+        const source = path.join(root, "source");
+        const checkout = path.join(root, "checkout");
+        const git = (...args: string[]) => {
+          const result = spawnSync("git", args, { encoding: "utf8" });
+          expect(result.status, result.stderr).toBe(0);
+          return result.stdout.trim();
+        };
+        git("init", "--bare", "-q", upstream);
+        git("init", "-q", "-b", "main", source);
+        git("-C", source, "config", "user.name", "Test");
+        git("-C", source, "config", "user.email", "test@invalid");
+        await writeFile(path.join(source, "file.txt"), "base\n");
+        git("-C", source, "add", "file.txt");
+        git("-C", source, "commit", "-qm", "base");
+        const fork = git("-C", source, "rev-parse", "HEAD");
+        git("-C", source, "remote", "add", "origin", upstream);
+        git("-C", source, "push", "-q", "origin", "main");
+        git("-C", upstream, "symbolic-ref", "HEAD", "refs/heads/main");
+        await writeFile(path.join(source, "file.txt"), "base\nhead\n");
+        git("-C", source, "commit", "-qam", "head");
+        const head = git("-C", source, "rev-parse", "HEAD");
+        git("-C", source, "push", "-q", "origin", "HEAD:refs/pull/17/head");
+        const base =
+          kind === "an ancestor"
+            ? fork
+            : (() => {
+                git("-C", source, "checkout", "-q", "-b", "moved", fork);
+                git(
+                  "-C",
+                  source,
+                  "commit",
+                  "-q",
+                  "--allow-empty",
+                  "-m",
+                  "moved",
+                );
+                git("-C", source, "push", "-q", "origin", "moved:main");
+                return git("-C", source, "rev-parse", "HEAD");
+              })();
 
-      const fixture = setup();
-      const response = await post(fixture.reviewEnv, {
-        ...requestBody,
-        head,
-        base,
-      });
-      const { reviewId } = (await response.json()) as { reviewId: string };
-      await fixture.job.alarm();
-      const cloneCommand = fixture.sandbox.exec.mock.calls
-        .map(([command]) => command)
-        .find((command) => command.includes(" clone --depth 1"));
-      expect(cloneCommand).toContain("merge-base --is-ancestor");
-      expect(cloneCommand).toContain("fetch --deepen=64");
-      const command = (cloneCommand ?? "")
-        .replaceAll(
-          `setpriv --reuid=${TARGET_UID} --regid=${TARGET_UID} --clear-groups `,
-          "",
-        )
-        .replace(
-          /https:\/\/review\.invalid\/git\/[^']+/,
-          pathToFileURL(upstream).href,
-        )
-        .replaceAll(`${runDir(reviewId)}/clone`, checkout);
-      const cloned = spawnSync("sh", ["-c", command], { encoding: "utf8" });
-      expect(cloned.status, cloned.stderr).toBe(0);
-      expect(
-        git("-C", checkout, "diff", "--name-only", `${base}...${head}`),
-      ).toBe("file.txt");
-    } finally {
-      await rm(root, { recursive: true, force: true });
-    }
-  });
+        const fixture = setup();
+        const response = await post(fixture.reviewEnv, {
+          ...requestBody,
+          head,
+          base,
+        });
+        const { reviewId } = (await response.json()) as { reviewId: string };
+        await fixture.job.alarm();
+        const cloneCommand = fixture.sandbox.exec.mock.calls
+          .map(([command]) => command)
+          .find((command) => command.includes(" clone --depth 1"));
+        expect(cloneCommand).toContain("fetch --deepen=64");
+        const command = (cloneCommand ?? "")
+          .replaceAll(
+            `setpriv --reuid=${TARGET_UID} --regid=${TARGET_UID} --clear-groups `,
+            "",
+          )
+          .replace(
+            /https:\/\/review\.invalid\/git\/[^']+/,
+            pathToFileURL(upstream).href,
+          )
+          .replaceAll(`${runDir(reviewId)}/clone`, checkout);
+        const cloned = spawnSync("sh", ["-c", command], {
+          encoding: "utf8",
+          timeout: 20_000,
+        });
+        expect(cloned.status, cloned.stderr).toBe(0);
+        expect(
+          git("-C", checkout, "diff", "--name-only", `${base}...${head}`),
+        ).toBe("file.txt");
+      } finally {
+        await rm(root, { recursive: true, force: true });
+      }
+    },
+  );
 
   it("refuses a different repository before allocating a job", async () => {
     const fixture = setup();
