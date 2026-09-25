@@ -38,11 +38,13 @@ import {
 } from "./src/isolation";
 import {
   emptyModelTotals,
+  type ModelOutcome,
   type ModelSession,
   type ModelUsage,
   modelCapability,
   modelProxyBaseUrl,
   modelsJsonForProxy,
+  openaiCodexBrokerHandle,
   proxyModelFetch,
   publicModelUsage,
   reserveAttempt,
@@ -57,8 +59,10 @@ import {
   sourceFingerprintCommand,
   sourceMismatchDetail,
 } from "./src/protocol";
+import { SESSION_CAPS } from "./src/provider-budget";
 
 const MODEL_SESSION_KEY = "modelSession";
+const PROBE_SESSIONS_KEY = "probeSessions";
 const MODEL_SEALS_KEY = "modelSeals";
 const COMMAND_SEQUENCE_KEY = "commandSequence";
 
@@ -82,22 +86,54 @@ export class CredentialVaultObject extends DurableObject<unknown> {
 }
 
 export class ReviewSandbox extends Sandbox<ReviewPiEnv> {
+  async putProbeSessions(sessions: Record<string, ModelSession>) {
+    await this.ctx.storage.put(PROBE_SESSIONS_KEY, sessions);
+  }
+
+  async probeOutcome(handle: string) {
+    const { session } = await this.sessionFor(handle);
+    return session?.lastOutcome ?? null;
+  }
+
+  async clearProbeSessions() {
+    await this.ctx.storage.delete(PROBE_SESSIONS_KEY);
+  }
+
+  private async sessionFor(handle?: string) {
+    const probes =
+      await this.ctx.storage.get<Record<string, ModelSession>>(
+        PROBE_SESSIONS_KEY,
+      );
+    if (probes) return { session: probes[handle ?? ""], probes };
+    return {
+      session: await this.ctx.storage.get<ModelSession>(MODEL_SESSION_KEY),
+      probes: null,
+    };
+  }
+
   async putModelSession(session: ModelSession) {
     await this.ctx.storage.put(MODEL_SESSION_KEY, session);
     await this.ctx.storage.put(MODEL_SEALS_KEY, []);
   }
 
-  async consumeModelAttempt() {
-    const session = await this.ctx.storage.get<ModelSession>(MODEL_SESSION_KEY);
+  async consumeModelAttempt(handle?: string) {
+    const { session, probes } = await this.sessionFor(handle);
     if (!session) return { ok: false as const, reason: "no_session" };
     const refusal = reserveAttempt(
       session.totals,
       session.caps,
       session.retryPending === true,
     );
-    if (refusal) return { ok: false as const, reason: refusal };
+    if (refusal) {
+      if (probes) {
+        session.lastOutcome = { httpStatus: 429, reason: refusal };
+        await this.ctx.storage.put(PROBE_SESSIONS_KEY, probes);
+      }
+      return { ok: false as const, reason: refusal };
+    }
     session.retryPending = false;
-    await this.ctx.storage.put(MODEL_SESSION_KEY, session);
+    if (probes) await this.ctx.storage.put(PROBE_SESSIONS_KEY, probes);
+    else await this.ctx.storage.put(MODEL_SESSION_KEY, session);
     return { ok: true as const, session };
   }
 
@@ -105,8 +141,10 @@ export class ReviewSandbox extends Sandbox<ReviewPiEnv> {
     usage: ModelUsage | null,
     retryable: boolean,
     seal: string | null,
+    handle: string,
+    outcome: ModelOutcome,
   ) {
-    const session = await this.ctx.storage.get<ModelSession>(MODEL_SESSION_KEY);
+    const { session, probes } = await this.sessionFor(handle);
     if (!session) return;
     const input = usage?.input ?? null;
     if (input !== null) {
@@ -122,6 +160,11 @@ export class ReviewSandbox extends Sandbox<ReviewPiEnv> {
     }
     if (session.totals.unended !== undefined) session.totals.unended -= 1;
     session.retryPending = retryable;
+    if (probes) {
+      session.lastOutcome = outcome;
+      await this.ctx.storage.put(PROBE_SESSIONS_KEY, probes);
+      return;
+    }
     await this.ctx.storage.put(MODEL_SESSION_KEY, session);
     await this.ctx.storage.put(MODEL_SEALS_KEY, [
       ...((await this.modelSeals()) ?? []),
@@ -146,8 +189,8 @@ export class ReviewSandbox extends Sandbox<ReviewPiEnv> {
   }
 
   /** What the proxy checks a request against before it spends a slot on it. */
-  async openModelSession() {
-    const session = await this.ctx.storage.get<ModelSession>(MODEL_SESSION_KEY);
+  async openModelSession(handle?: string) {
+    const { session } = await this.sessionFor(handle);
     if (!session) return null;
     return {
       handle: session.handle,
@@ -180,6 +223,7 @@ type ReviewPiEnv = Record<
 > &
   Record<"CREDENTIAL_VAULT", DurableObjectNamespace<CredentialVaultObject>> &
   Record<"CODEX_RELAY", DurableObjectNamespace<CodexRelaySandbox>> &
+  Record<"PROBE_RESULTS", R2Bucket> &
   Record<"CONTROL_SECRET" | "GITHUB_READ_TOKEN", string> & {
     /** https clone URL the run's containers fetch through the Git proxy. */
     TARGET_REPOSITORY?: string;
@@ -301,6 +345,442 @@ const isolation = {
   targetUid: TARGET_UID,
 };
 
+type ProbePhase = {
+  status: "ok" | "failed" | "unobserved";
+  durationMs: number | null;
+  durationReason: string | null;
+  phase: string | null;
+  httpStatus: number | null;
+  reason: string | null;
+};
+
+const unobserved = (): ProbePhase => ({
+  status: "unobserved",
+  durationMs: null,
+  durationReason: "not_started",
+  phase: null,
+  httpStatus: null,
+  reason: "not_started",
+});
+
+// A Worker's clock only advances across I/O, so a phase that ends before any
+// has no duration to observe.
+const elapsed = (start: number) => {
+  const durationMs = Math.round((performance.now() - start) * 1000) / 1000;
+  return durationMs > 0
+    ? { durationMs, durationReason: null }
+    : { durationMs: null, durationReason: "no_clock_delta" };
+};
+
+// Pi sends a lane's whole request, tools and system prompt included, so the
+// probe spends a lane's caps. Two requests cover Pi's openai-codex transport,
+// which tries a WebSocket before it falls back to a streamed POST; Pi's own
+// retries are off, so a retry never spends the slot that names the failure.
+const probeCaps = { ...SESSION_CAPS.t1b, maxRequests: 2 };
+const PI_PROBE_SETTINGS = JSON.stringify({
+  retry: { enabled: false, provider: { maxRetries: 0 } },
+});
+
+const PI_PROBE_FAMILIES = {
+  "workers-ai": {
+    provider: "cloudflare-workers-ai",
+    model: "@cf/deepseek-ai/deepseek-v4-flash-0731",
+  },
+  "openai-codex": { provider: "openai-codex", model: "gpt-5.6-sol" },
+  "claude-code": { provider: "claude-code", model: "claude-opus-5" },
+} as const;
+
+const PI_PROBE_SECONDS = 100;
+const PI_MODELS_PATH = "/opt/review/pi-config/models.json";
+const CLAUDE_CODE_EXTENSION = "/opt/review/extensions/claude-code-provider.js";
+
+const asTarget = `setpriv --reuid=${TARGET_UID} --regid=${TARGET_UID} --clear-groups`;
+
+const piProbeCommand = (
+  directory: string,
+  family: keyof typeof PI_PROBE_FAMILIES,
+  accountId: string,
+) => {
+  const { provider, model } = PI_PROBE_FAMILIES[family];
+  const account =
+    family === "workers-ai"
+      ? `CLOUDFLARE_ACCOUNT_ID=${posixQuote(accountId)} `
+      : "";
+  const extension =
+    family === "claude-code" ? ` -e ${posixQuote(CLAUDE_CODE_EXTENSION)}` : "";
+  return `cd ${posixQuote(directory)} && ${asTarget} env HOME=/home/review-target PI_OFFLINE=1 PI_SKIP_VERSION_CHECK=1 ${account}PI_CODING_AGENT_DIR=${posixQuote(directory)} timeout -k 5 ${PI_PROBE_SECONDS} pi --provider ${posixQuote(provider)} --model ${posixQuote(model)} --thinking high --mode json --print --no-session --no-extensions --no-skills --no-prompt-templates --approve${extension} -- ${posixQuote("Reply with exactly pong and nothing else.")} < /dev/null > events.jsonl 2> pi.stderr`;
+};
+
+// The same reading `validate_review_events` gives a lane's stream.
+const PI_SUMMARY = `([.[] | select(.type == "turn_end")] | last | .message) as $m
+| {stopReason: ($m.stopReason // null),
+   hasFinal: (([.[] | select(.type == "agent_end")] | last | (.messages // [])
+     | map(select(.role == "assistant")) | last | (.content // [])
+     | map(select(.type == "text") | .text) | join("\\n") | test("\\\\S")) // false)}`;
+
+const piSummaryCommand = (directory: string) =>
+  `${asTarget} jq -sc ${posixQuote(PI_SUMMARY)} ${posixQuote(`${directory}/events.jsonl`)}`;
+
+const parsePiSummary = (stdout: string) => {
+  try {
+    const value: unknown = JSON.parse(stdout);
+    if (typeof value !== "object" || value === null) return null;
+    const summary = value as Record<string, unknown>;
+    return {
+      stopReason:
+        typeof summary["stopReason"] === "string"
+          ? summary["stopReason"]
+          : null,
+      hasFinal: summary["hasFinal"] === true,
+    };
+  } catch {
+    return null;
+  }
+};
+
+async function operatorProbe(
+  request: Request,
+  env: ReviewPiEnv,
+  origin: string,
+) {
+  if (!env.TARGET_REPOSITORY) {
+    return json({ error: "target_repository_unset" }, 400);
+  }
+  let expectedSources: Record<string, string>;
+  let accountId: string;
+  let workersBearer: string;
+  try {
+    const input: unknown = await request.json();
+    if (typeof input !== "object" || input === null || Array.isArray(input))
+      throw new Error();
+    const body = input as Record<string, unknown>;
+    expectedSources = parseExpectedSources(body["expectedSources"]);
+    const workers = body["workersAi"];
+    if (
+      typeof workers !== "object" ||
+      workers === null ||
+      Array.isArray(workers)
+    )
+      throw new Error();
+    const ai = workers as Record<string, unknown>;
+    if (
+      typeof ai["accountId"] !== "string" ||
+      !/^[a-zA-Z0-9_-]+$/.test(ai["accountId"]) ||
+      typeof ai["bearer"] !== "string" ||
+      !ai["bearer"] ||
+      /[\r\n]/.test(ai["bearer"])
+    )
+      throw new Error();
+    accountId = ai["accountId"];
+    workersBearer = ai["bearer"];
+  } catch {
+    return json({ error: "invalid_probe" }, 400);
+  }
+
+  const runId = assertCloudRunId(`probe-${crypto.randomUUID()}`);
+  const key = `probes/${runId}.json`;
+  if (await env.PROBE_RESULTS.head(key))
+    return json({ error: "probe_exists" }, 409);
+  const sandbox = getSandbox(env.REVIEW_SANDBOX, runId);
+  const directory = runDir(runId);
+  const families = ["workers-ai", "openai-codex", "claude-code"] as const;
+  type Family = (typeof families)[number];
+  const models: Record<Family, ProbePhase> = {
+    "workers-ai": unobserved(),
+    "openai-codex": unobserved(),
+    "claude-code": unobserved(),
+  };
+  const receipt = {
+    runId,
+    clock: "worker.performance.now",
+    startedAt: new Date().toISOString(),
+    coldStart: unobserved(),
+    clone: unobserved(),
+    sessionSetup: unobserved(),
+    models,
+    sessionClear: unobserved(),
+    shutdown: unobserved(),
+  };
+  let stored = true;
+  try {
+    let start = performance.now();
+    try {
+      const fingerprint = await bounded(
+        "probe cold start",
+        sandbox.exec(sourceFingerprintCommand()),
+      );
+      const mismatch = firstSourceMismatch(
+        expectedSources,
+        parseSourceFingerprint(fingerprint.stdout).sources,
+      );
+      receipt.coldStart = mismatch
+        ? {
+            status: "failed",
+            ...elapsed(start),
+            phase: "source_fingerprint",
+            httpStatus: null,
+            reason: `source_mismatch:${mismatch.file}`,
+          }
+        : {
+            status: "ok",
+            ...elapsed(start),
+            phase: "source_fingerprint",
+            httpStatus: null,
+            reason: null,
+          };
+    } catch {
+      receipt.coldStart = {
+        status: "failed",
+        ...elapsed(start),
+        phase: "source_fingerprint",
+        httpStatus: null,
+        reason: "sandbox_exec_failed",
+      };
+    }
+    if (receipt.coldStart.status === "ok") {
+      start = performance.now();
+      try {
+        await bounded(
+          "probe directory",
+          sandbox.mkdir(directory, { recursive: true }),
+        );
+        await bounded(
+          "probe ownership",
+          sandbox.exec(targetChownCommand(directory)),
+        );
+        const remote = `${origin}/git/${await gitCapability(runId, env.CONTROL_SECRET)}`;
+        const command = `setpriv --reuid=${TARGET_UID} --regid=${TARGET_UID} --clear-groups git -c ${posixQuote(`http.extraHeader=x-review-run: ${runId}`)} clone --depth 1 --no-tags --quiet ${posixQuote(remote)} ${posixQuote(`${directory}/clone`)}`;
+        const result = await bounded("probe clone", sandbox.exec(command));
+        receipt.clone =
+          result.exitCode === 0
+            ? {
+                status: "ok",
+                ...elapsed(start),
+                phase: "git_clone",
+                httpStatus: null,
+                reason: null,
+              }
+            : {
+                status: "failed",
+                ...elapsed(start),
+                phase: "git_clone",
+                httpStatus: null,
+                reason: "nonzero_exit",
+              };
+      } catch {
+        receipt.clone = {
+          status: "failed",
+          ...elapsed(start),
+          phase: "git_clone",
+          httpStatus: null,
+          reason: "sandbox_exec_failed",
+        };
+      }
+
+      const capability = await modelCapability(runId, env.CONTROL_SECRET);
+      const base = modelProxyBaseUrl(origin, runId, capability);
+      const handles = {
+        "workers-ai": `review-pi-${crypto.randomUUID()}`,
+        "openai-codex": openaiCodexBrokerHandle(crypto.randomUUID()),
+        "claude-code": `review-pi-${crypto.randomUUID()}`,
+      } satisfies Record<Family, string>;
+      const sessions = {
+        [handles["workers-ai"]]: {
+          handle: handles["workers-ai"],
+          upstreamBaseUrl: `https://api.cloudflare.com/client/v4/accounts/${accountId}/ai/v1`,
+          upstreamAuthorization: `Bearer ${workersBearer}`,
+          caps: probeCaps,
+          totals: emptyModelTotals(),
+        },
+        [handles["openai-codex"]]: {
+          handle: handles["openai-codex"],
+          upstreamBaseUrl: "https://chatgpt.com/backend-api",
+          credentialProvider: "openai-codex",
+          caps: probeCaps,
+          totals: emptyModelTotals(),
+        },
+        [handles["claude-code"]]: {
+          handle: handles["claude-code"],
+          upstreamBaseUrl: "https://api.anthropic.com",
+          credentialProvider: "claude-code",
+          caps: probeCaps,
+          totals: emptyModelTotals(),
+        },
+      } satisfies Record<string, ModelSession>;
+      start = performance.now();
+      try {
+        const laneModels = await readArtifact(sandbox, PI_MODELS_PATH);
+        if (!laneModels.exists || laneModels.truncated) throw new Error();
+        await bounded("probe sessions", sandbox.putProbeSessions(sessions));
+        receipt.sessionSetup = {
+          status: "ok",
+          ...elapsed(start),
+          phase: "session_setup",
+          httpStatus: null,
+          reason: null,
+        };
+        for (const family of families) {
+          const { provider } = PI_PROBE_FAMILIES[family];
+          const piDirectory = `${directory}/pi-${family}`;
+          start = performance.now();
+          let phase = "config_write";
+          try {
+            await bounded(
+              "probe pi directory",
+              sandbox.mkdir(piDirectory, { recursive: true }),
+            );
+            await bounded(
+              "probe models",
+              sandbox.writeFile(
+                `${piDirectory}/models.json`,
+                modelsJsonForProxy(
+                  laneModels.content,
+                  provider,
+                  handles[family],
+                  base,
+                ),
+              ),
+            );
+            await bounded(
+              "probe pi settings",
+              sandbox.writeFile(
+                `${piDirectory}/settings.json`,
+                PI_PROBE_SETTINGS,
+              ),
+            );
+            await bounded(
+              "probe pi ownership",
+              sandbox.exec(targetChownCommand(piDirectory)),
+            );
+            phase = "model_request";
+            const pi = await bounded(
+              "probe pi",
+              sandbox.exec(piProbeCommand(piDirectory, family, accountId)),
+              (PI_PROBE_SECONDS + 15) * 1000,
+            );
+            const observed = await bounded(
+              "probe outcome",
+              sandbox.probeOutcome(handles[family]),
+            );
+            if (pi.exitCode !== 0) {
+              models[family] = {
+                status: "failed",
+                ...elapsed(start),
+                phase,
+                httpStatus: observed?.httpStatus ?? null,
+                reason:
+                  pi.exitCode === 124 || pi.exitCode === 137
+                    ? "pi_timeout"
+                    : "pi_exit",
+              };
+              continue;
+            }
+            phase = "response_read";
+            const summary = await bounded(
+              "probe pi summary",
+              sandbox.exec(piSummaryCommand(piDirectory)),
+            );
+            const outcome = parsePiSummary(summary.stdout);
+            if (summary.exitCode !== 0 || !outcome) {
+              models[family] = {
+                status: "failed",
+                ...elapsed(start),
+                phase,
+                httpStatus: null,
+                reason: "invalid_event_stream",
+              };
+              continue;
+            }
+            const refused =
+              outcome.stopReason === "error" ||
+              outcome.stopReason === "aborted";
+            const reason = refused
+              ? (observed?.reason ?? "model_error")
+              : outcome.stopReason !== "stop"
+                ? "incomplete_result"
+                : outcome.hasFinal
+                  ? null
+                  : "empty_result";
+            models[family] = {
+              status: reason ? "failed" : "ok",
+              ...elapsed(start),
+              phase: refused ? "model_request" : "response_interpret",
+              httpStatus: observed?.httpStatus ?? null,
+              reason,
+            };
+          } catch {
+            models[family] = {
+              status: "failed",
+              ...elapsed(start),
+              phase,
+              httpStatus: null,
+              reason: "probe_step_failed",
+            };
+          }
+        }
+      } catch {
+        receipt.sessionSetup = {
+          status: "failed",
+          ...elapsed(start),
+          phase: "session_setup",
+          httpStatus: null,
+          reason: "session_setup_failed",
+        };
+      }
+    }
+  } finally {
+    let start = performance.now();
+    try {
+      await bounded("probe session clear", sandbox.clearProbeSessions());
+      receipt.sessionClear = {
+        status: "ok",
+        ...elapsed(start),
+        phase: "session_clear",
+        httpStatus: null,
+        reason: null,
+      };
+    } catch {
+      receipt.sessionClear = {
+        status: "failed",
+        ...elapsed(start),
+        phase: "session_clear",
+        httpStatus: null,
+        reason: "clear_failed",
+      };
+    }
+    start = performance.now();
+    const shutdown = await destroySandbox(sandbox);
+    receipt.shutdown = {
+      status: shutdown.acknowledged ? "ok" : "failed",
+      ...elapsed(start),
+      phase: "sandbox_destroy",
+      httpStatus: null,
+      reason: shutdown.acknowledged ? null : "destroy_failed",
+    };
+    try {
+      await env.PROBE_RESULTS.put(key, JSON.stringify(receipt), {
+        httpMetadata: { contentType: "application/json" },
+      });
+    } catch {
+      stored = false;
+    }
+  }
+  if (!stored) return json({ error: "r2_put_failed", runId }, 500);
+  return json({
+    key,
+    runId,
+    status:
+      receipt.coldStart.status === "ok" &&
+      receipt.clone.status === "ok" &&
+      receipt.sessionSetup.status === "ok" &&
+      families.every((family) => models[family].status === "ok") &&
+      receipt.sessionClear.status === "ok" &&
+      receipt.shutdown.status === "ok"
+        ? "ok"
+        : "failed",
+  });
+}
+
 export default {
   async fetch(request: Request, env: ReviewPiEnv) {
     const url0 = new URL(request.url);
@@ -322,15 +802,17 @@ export default {
         request,
         url0,
         env.CONTROL_SECRET,
-        async (runId) =>
-          getSandbox(env.REVIEW_SANDBOX, runId).openModelSession(),
-        async (runId) =>
-          getSandbox(env.REVIEW_SANDBOX, runId).consumeModelAttempt(),
-        async (runId, usage, retryable, seal) =>
+        async (runId, handle) =>
+          getSandbox(env.REVIEW_SANDBOX, runId).openModelSession(handle),
+        async (runId, handle) =>
+          getSandbox(env.REVIEW_SANDBOX, runId).consumeModelAttempt(handle),
+        async (runId, usage, retryable, seal, handle, outcome) =>
           getSandbox(env.REVIEW_SANDBOX, runId).recordModelAttempt(
             usage,
             retryable,
             seal,
+            handle,
+            outcome,
           ),
         (provider, rejectedAccessToken) =>
           env.CREDENTIAL_VAULT.getByName("worker").credential(
@@ -347,6 +829,14 @@ export default {
 
     const url = url0;
     const segments = url.pathname.split("/").filter(Boolean);
+
+    if (
+      segments[0] === "probe" &&
+      segments.length === 1 &&
+      request.method === "POST"
+    ) {
+      return operatorProbe(request, env, url.origin);
+    }
 
     if (segments[0] === "credentials") {
       const vault = env.CREDENTIAL_VAULT.getByName("worker");

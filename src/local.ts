@@ -44,6 +44,7 @@ import {
   RUN_ID_PATTERN,
   TARGET_UID,
 } from "./isolation";
+import { OPENAI_CODEX_JWT_CLAIM, openaiCodexBrokerHandle } from "./model-proxy";
 import {
   firstSourceMismatch,
   IMAGE_SOURCES,
@@ -753,23 +754,14 @@ export function adaptModelsConfig(
   return JSON.stringify({ ...config, providers }, null, 2);
 }
 
-export { BROKER_PORT, CONTROL_DIR, CONTROL_UID, MODEL_BROKER, TARGET_UID };
-
-const OPENAI_CODEX_JWT_CLAIM = "https://api.openai.com/auth";
-const OPENAI_CODEX_HANDLE_ACCOUNT_ID = "review-pi";
-
-const jwtSegment = (value: unknown) =>
-  Buffer.from(JSON.stringify(value)).toString("base64");
-
-/** Pi's openai-codex adapter parses chatgpt_account_id from a three-part JWT apiKey. */
-export function openaiCodexBrokerHandle(nonce: string) {
-  return `${jwtSegment({ alg: "none", typ: "JWT" })}.${jwtSegment({
-    [OPENAI_CODEX_JWT_CLAIM]: {
-      chatgpt_account_id: OPENAI_CODEX_HANDLE_ACCOUNT_ID,
-    },
-    jti: nonce,
-  })}.${nonce}`;
-}
+export {
+  BROKER_PORT,
+  CONTROL_DIR,
+  CONTROL_UID,
+  MODEL_BROKER,
+  openaiCodexBrokerHandle,
+  TARGET_UID,
+};
 
 const openaiCodexAccountIdFromToken = (token: string) => {
   const payload = token.split(".")[1];

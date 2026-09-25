@@ -283,6 +283,18 @@ describe("control API containment probe", () => {
 });
 
 describe("provider canary interpretation", () => {
+  it("reads a Responses stream's text once, from its done event", () => {
+    const body = [
+      'data: {"type":"response.output_text.delta","delta":"pong"}',
+      'data: {"type":"response.output_text.done","text":"pong"}',
+      'data: {"type":"response.completed","response":{"status":"completed"}}',
+    ].join("\n");
+    expect(interpretProviderCanary(200, body)).toMatchObject({
+      completed: true,
+      output: "pong",
+    });
+  });
+
   it("rejects a 200 SSE body that ends in a provider error", () => {
     const body = [
       'data: {"choices":[{"delta":{"content":"hi"}}]}',

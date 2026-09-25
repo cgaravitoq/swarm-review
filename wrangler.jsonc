@@ -13,6 +13,9 @@
   // or in the deployment's own configuration.
   "compatibility_flags": ["nodejs_compat"],
   "observability": { "enabled": true },
+  "r2_buckets": [
+    { "binding": "PROBE_RESULTS", "bucket_name": "swarm-review-probes" }
+  ],
   "durable_objects": {
     "bindings": [
       { "name": "REVIEW_SANDBOX", "class_name": "ReviewSandbox" },

@@ -56,6 +56,9 @@ export type ModelTotals = {
   outputUnobserved?: number;
 };
 
+/** What the upstream answered, or the Worker's own reason when it refused. */
+export type ModelOutcome = { httpStatus: number | null; reason: string | null };
+
 export type ModelSession = {
   handle: string;
   upstreamBaseUrl: string;
@@ -66,6 +69,7 @@ export type ModelSession = {
   totals: ModelTotals;
   /** Set once an attempt failed the way a client repeats; the next one is a retry. */
   retryPending?: boolean;
+  lastOutcome?: ModelOutcome;
 };
 
 const hex = (buffer: ArrayBuffer) =>
@@ -79,6 +83,21 @@ export async function modelCapability(runId: string, secret: string) {
     new TextEncoder().encode(`${secret}:model:${runId}`),
   );
   return hex(digest);
+}
+
+export const OPENAI_CODEX_JWT_CLAIM = "https://api.openai.com/auth";
+const OPENAI_CODEX_HANDLE_ACCOUNT_ID = "review-pi";
+
+const jwtSegment = (value: unknown) => btoa(JSON.stringify(value));
+
+/** Pi's openai-codex adapter parses chatgpt_account_id from a three-part JWT apiKey. */
+export function openaiCodexBrokerHandle(nonce: string) {
+  return `${jwtSegment({ alg: "none", typ: "JWT" })}.${jwtSegment({
+    [OPENAI_CODEX_JWT_CLAIM]: {
+      chatgpt_account_id: OPENAI_CODEX_HANDLE_ACCOUNT_ID,
+    },
+    jti: nonce,
+  })}.${nonce}`;
 }
 
 export function modelProxyBaseUrl(
@@ -258,13 +277,17 @@ export async function proxyModelFetch(
   request: Request,
   url: URL,
   secret: string,
-  open: (runId: string) => Promise<{
+  open: (
+    runId: string,
+    handle: string,
+  ) => Promise<{
     handle: string;
     caps: ModelCaps;
     upstreamBaseUrl: string;
   } | null>,
   consume: (
     runId: string,
+    handle: string,
   ) => Promise<
     { ok: true; session: ModelSession } | { ok: false; reason: string }
   >,
@@ -273,6 +296,8 @@ export async function proxyModelFetch(
     usage: ModelUsage | null,
     retryable: boolean,
     seal: string | null,
+    handle: string,
+    outcome: ModelOutcome,
   ) => Promise<void>,
   vaultCredential?: (
     provider: string,
@@ -296,9 +321,10 @@ export async function proxyModelFetch(
   if (capability !== (await modelCapability(runId, secret))) {
     return jsonError(403, "capability_rejected");
   }
-  const opened = await open(runId);
+  const handle = presentedHandle(request);
+  const opened = await open(runId, handle);
   if (!opened) return jsonError(429, "no_session");
-  if (presentedHandle(request) !== opened.handle) {
+  if (handle !== opened.handle) {
     return jsonError(401, "handle_rejected");
   }
   // Every refusal comes before `consume`: a slot spent on a request that is
@@ -321,7 +347,7 @@ export async function proxyModelFetch(
       ? null
       : await readBoundedBody(request, opened.caps.maxRequestBytes);
   if (body === "max_request_bytes") return jsonError(413, body);
-  const consumed = await consume(runId);
+  const consumed = await consume(runId, handle);
   if (!consumed.ok) return jsonError(429, consumed.reason);
   const headers = new Headers(request.headers);
   headers.delete("host");
@@ -364,30 +390,36 @@ export async function proxyModelFetch(
       upstream = await forward(credential.authorization, credential.accountId);
     }
   } catch (error) {
-    await recordAttempt(runId, null, true, null);
-    if (error instanceof Error && error.message.startsWith("codex_relay_")) {
-      return jsonError(502, error.message);
-    }
-    if (provider) {
-      const reason =
-        error instanceof Error && error.message.startsWith("credential_")
-          ? error.message
-          : "credential_failed";
-      return jsonError(502, reason);
-    }
+    const message = error instanceof Error ? error.message : "";
+    const reason = message.startsWith("codex_relay_")
+      ? message
+      : provider
+        ? message.startsWith("credential_")
+          ? message
+          : "credential_failed"
+        : null;
+    await recordAttempt(runId, null, true, null, handle, {
+      httpStatus: reason ? 502 : null,
+      reason: reason ?? "upstream_fetch_failed",
+    });
+    if (reason) return jsonError(502, reason);
     throw error;
   }
   if (provider && upstream.status === 401) {
     await upstream.body?.cancel();
-    await recordAttempt(runId, null, false, null);
+    await recordAttempt(runId, null, false, null, handle, {
+      httpStatus: 502,
+      reason: "credential_upstream_unauthorized",
+    });
     return jsonError(502, "credential_upstream_unauthorized");
   }
   const retryable = retryableFailure(upstream.status);
+  const outcome = { httpStatus: upstream.status, reason: null };
   const responseHeaders = new Headers(upstream.headers);
   responseHeaders.delete("content-encoding");
   responseHeaders.delete("content-length");
   if (!upstream.body) {
-    await recordAttempt(runId, null, retryable, null);
+    await recordAttempt(runId, null, retryable, null, handle, outcome);
     return new Response(null, {
       status: upstream.status,
       headers: responseHeaders,
@@ -407,7 +439,14 @@ export async function proxyModelFetch(
       const text = decoder.decode();
       sealer.write(text);
       usage.write(text);
-      await recordAttempt(runId, usage.read(), retryable, sealer.seal());
+      await recordAttempt(
+        runId,
+        usage.read(),
+        retryable,
+        sealer.seal(),
+        handle,
+        outcome,
+      );
     },
   });
   return new Response(upstream.body.pipeThrough(stream), {

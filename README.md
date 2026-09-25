@@ -118,6 +118,32 @@ The relay image adds only Bun and its server to the Sandbox runtime, and the rev
 The relay uses direct HTTPS because intercepted HTTPS returns a Worker-side 403 from `chatgpt.com`.
 `allowedHosts` filters intercepted HTTP here, but does not restrict direct HTTPS in the current Containers SDK; the fixed URL in relay code is the enforced outbound destination for relay requests.
 
+## Operator probe
+
+The authenticated `POST /probe` route starts one fresh review Sandbox, measures its first image fingerprint command, clones the configured repository with `--depth 1` through the read-only git proxy, and runs Pi once per model family as the target user.
+Each family gets the image's own `models.json` pointed at `/model/` with that family's handle, exactly as a cloud lane is configured, so each request is the one a lane's Pi sends: `cloudflare-workers-ai` with `@cf/deepseek-ai/deepseek-v4-flash-0731`, `openai-codex` with `gpt-5.6-sol`, and `claude-code` with `claude-opus-5` through the lanes' Claude Code extension.
+A family passes when Pi exits 0 and its last turn stops with text, the reading a lane's stream gets.
+Each family's agent directory turns Pi's retries off, so a family spends one upstream attempt, plus the WebSocket attempt openai-codex makes first.
+A family's HTTP status and reason are what the model proxy observed for its handle: the upstream's status, or the Worker's own refusal such as `codex_relay_failed`, a `credential_*` reason or `max_requests`.
+The Worker stores `probes/<runId>.json` in the `PROBE_RESULTS` R2 bucket and returns only its key and overall status.
+Each phase records a status, failure phase, HTTP status when observed, and milliseconds from the Worker's monotonic `performance.now()` clock.
+A skipped phase has `durationMs: null` with `durationReason: "not_started"`, and a phase the clock did not advance across, such as one that failed before any I/O, has `durationMs: null` with `durationReason: "no_clock_delta"`.
+The receipt does not contain request bodies, provider output, handles or credentials.
+The Sandbox is destroyed after the probe, including failed phases.
+
+The operator supplies a Workers AI bearer and account ID; the Worker uses its credential vault for openai-codex and claude-code.
+Export `WORKER_ORIGIN`, `CONTROL_SECRET`, `CLOUDFLARE_ACCOUNT_ID`, and `WORKERS_AI_API_KEY`, because the script reads them from its environment, then run:
+
+```sh
+bun run scripts/probe.ts "$WORKER_ORIGIN" 1
+bun run scripts/probe.ts "$WORKER_ORIGIN" 5
+bunx wrangler r2 object get "swarm-review-probes/probes/<runId>.json" --remote --pipe
+```
+
+The script starts all probes in a burst concurrently, prints one line per probe with its run id, R2 key and status or its error, and exits 1 when any probe errored or reported a status other than `ok`.
+The bucket must exist before deployment; this repository only declares its binding.
+The local tests prove request routing, isolation and receipt shape with fakes; real provider responses, cold start timings and R2 persistence require a deployed probe.
+
 ## Commands
 
 | Command | What it runs |
