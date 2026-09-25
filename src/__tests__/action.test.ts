@@ -4,6 +4,7 @@ import {
   mkdir,
   mkdtemp,
   readFile,
+  realpath,
   rm,
   writeFile,
 } from "node:fs/promises";
@@ -45,7 +46,7 @@ async function arrange(headRepo: string, pullSucceeds: boolean) {
   );
   await writeFile(
     join(bin, "bun"),
-    '#!/bin/sh\nprintf "bun %s\\n" "$*" >> "$ACTION_LOG"\nif [ "$1" = "$ACTION_ROOT/src/swarm.ts" ]; then printf "%s\\0" "$@" > "$ACTION_ARGS"; out=; id=; previous=; for arg; do case "$previous" in --out) out=$arg;; --swarm-id) id=$arg;; esac; previous=$arg; done; [ -f "$out/$id.run.json" ] || { echo "run notes missing" >&2; exit 1; }; mkdir -p "$out" && mkdir "$out/$id" || exit 1; [ "$ACTION_FAIL" = partial ] && printf "{}" > "$out/$id/swarm-receipt.json" && exit 1; [ "$ACTION_FAIL" = swarm ] && exit 1; fi\nif [ "$1" = build ] && [ "$ACTION_FAIL" = bundle ]; then echo "error: Could not resolve ./missing" >&2; exit 1; fi\nif [ "$1" = build ]; then for outfile; do :; done; [ -f "$outfile" ] || { mkdir -p "$(dirname "$outfile")" && printf bundle > "$outfile"; }; fi\nif [ "$2" = "$ACTION_ROOT/scripts/deploy.ts" ] && [ "$ACTION_FAIL" = deploy ]; then printf "exec /bin/sh: exec format error\\ndocker build exited with code 1\\n" >&2; exit 1; fi\nexit 0\n',
+    '#!/bin/sh\nprintf "bun %s\\n" "$*" >> "$ACTION_LOG"\nif [ "$1" = "$ACTION_ROOT/src/swarm.ts" ]; then printf "%s\\0" "$@" > "$ACTION_ARGS"; out=; id=; previous=; for arg; do case "$previous" in --out) out=$arg;; --swarm-id) id=$arg;; esac; previous=$arg; done; [ -f "$out/$id.run.json" ] || { echo "run notes missing" >&2; exit 1; }; mkdir -p "$out" && mkdir "$out/$id" || exit 1; [ "$ACTION_FAIL" = partial ] && printf "{}" > "$out/$id/swarm-receipt.json" && exit 1; [ "$ACTION_FAIL" = swarm ] && exit 1; fi\nif [ "$1" = build ] && [ "$ACTION_FAIL" = bundle ]; then echo "error: Could not resolve ./missing" >&2; exit 1; fi\nif [ "$1" = build ]; then pwd -P > "$ACTION_BUILD_CWD"; for outfile; do :; done; [ -f "$outfile" ] || { mkdir -p "$(dirname "$outfile")" && printf bundle > "$outfile"; }; fi\nif [ "$2" = "$ACTION_ROOT/scripts/deploy.ts" ] && [ "$ACTION_FAIL" = deploy ]; then printf "exec /bin/sh: exec format error\\ndocker build exited with code 1\\n" >&2; exit 1; fi\nexit 0\n',
   );
   for (const name of ["gh", "docker", "bun"]) {
     await chmod(join(bin, name), 0o755);
@@ -54,6 +55,7 @@ async function arrange(headRepo: string, pullSucceeds: boolean) {
     PATH: `${bin}:${process.env["PATH"] ?? ""}`,
     ACTION_LOG: join(root, "argv.log"),
     ACTION_ARGS: join(root, "swarm-args"),
+    ACTION_BUILD_CWD: join(root, "build-cwd"),
     ACTION_ROOT: packageRoot,
     GITHUB_ACTION_PATH: packageRoot,
     GITHUB_ENV: join(root, "github-env"),
@@ -77,6 +79,7 @@ async function arrange(headRepo: string, pullSucceeds: boolean) {
       (await readFile(env.ACTION_LOG, "utf8")).trim().split("\n"),
     logText: async () => readFile(env.ACTION_LOG, "utf8"),
     envFile: async () => readFile(env.GITHUB_ENV, "utf8").catch(() => ""),
+    buildCwd: async () => (await readFile(env.ACTION_BUILD_CWD, "utf8")).trim(),
     swarmArgs: async () =>
       (await readFile(env.ACTION_ARGS, "utf8")).split("\0").slice(0, -1),
     notes: async () => {
@@ -298,6 +301,7 @@ describe("composite action driver", () => {
     );
     expect(bundle).toBeGreaterThanOrEqual(0);
     expect(bundle).toBeLessThan(log.indexOf(`docker pull ${image}`));
+    expect(await fixture.buildCwd()).toBe(await realpath(actionRoot));
   });
 
   it("builds and pushes the derived image when pull fails", async () => {

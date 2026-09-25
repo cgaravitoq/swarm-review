@@ -41,6 +41,25 @@ export async function imageTagFromFiles(
   return imageTag(sources, await readFile(lockfilePath));
 }
 
+/**
+ * The one way the engine bundle is built. Bun writes each module's path
+ * relative to its working directory into the output, so a build run from any
+ * other directory is different bytes and therefore a different image tag.
+ */
+export function engineBundle(packageRoot: string, outfile: string) {
+  return {
+    args: [
+      "build",
+      join(packageRoot, "src", "swarm.ts"),
+      "--target",
+      "bun",
+      "--outfile",
+      outfile,
+    ],
+    cwd: packageRoot,
+  };
+}
+
 export function imageReference(repository: string, tag: string): string {
   if (!/^[a-z0-9_.-]+\/[a-z0-9_.-]+$/i.test(repository)) {
     throw new Error(`expected owner/repo, got ${repository}`);

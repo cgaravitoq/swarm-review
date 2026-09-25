@@ -1,15 +1,20 @@
+import { spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
-import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { cp, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
+import { fileURLToPath } from "node:url";
 import { describe, expect, it } from "vitest";
 import {
+  engineBundle,
   imageReference,
   imageTag,
   imageTagFromFiles,
   laneImageReference,
 } from "../image-tag";
 import { IMAGE_SOURCES } from "../protocol";
+
+const packageRoot = join(dirname(fileURLToPath(import.meta.url)), "../..");
 
 const digest = (content: string) =>
   createHash("sha256").update(content).digest("hex");
@@ -90,6 +95,38 @@ describe("sandbox image tag", () => {
         expect(await imageTagFromFiles(directory, lockfile)).not.toBe(expected);
         await writeFile(file, original);
       }
+    } finally {
+      await rm(directory, { recursive: true, force: true });
+    }
+  });
+
+  it("builds the same engine bytes into any context, so the action and the image build derive one tag", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "review-image-engine-"));
+    try {
+      const lockfile = join(directory, "bun.lock");
+      await writeFile(lockfile, lock);
+      const tags: string[] = [];
+      for (const build of ["action", "deploy"]) {
+        const container = join(directory, build);
+        await cp(join(packageRoot, "container"), container, {
+          recursive: true,
+          filter: (path) =>
+            !path.startsWith(join(packageRoot, "container", "context")),
+        });
+        const { args, cwd } = engineBundle(
+          packageRoot,
+          join(container, "context", "swarm.js"),
+        );
+        const built = spawnSync("bun", args, { cwd, encoding: "utf8" });
+        expect(built.status, built.stderr).toBe(0);
+        tags.push(await imageTagFromFiles(container, lockfile));
+      }
+      expect(
+        await readFile(join(directory, "action", "context", "swarm.js")),
+      ).toEqual(
+        await readFile(join(directory, "deploy", "context", "swarm.js")),
+      );
+      expect(tags[0]).toBe(tags[1]);
     } finally {
       await rm(directory, { recursive: true, force: true });
     }
