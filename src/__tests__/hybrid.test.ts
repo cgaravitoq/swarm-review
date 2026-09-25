@@ -66,7 +66,7 @@ const reportTurn = args.includes("--no-tools");
 const env = Object.keys(process.env).sort();
 const phase = JSON.parse(readFileSync(process.env.PI_OUT + "/status.json", "utf8")).phase;
 const verifying = phase === "verifying";
-appendFileSync(process.env.PI_LOG, JSON.stringify({args, env, phase, family: process.env.PI_FAMILY, promptChars: prompt.length, prompt}) + "\\n");
+appendFileSync(process.env.PI_LOG, JSON.stringify({at: Date.now(), args, env, phase, family: process.env.PI_FAMILY, promptChars: prompt.length, prompt}) + "\\n");
 const event = (data) => process.stdout.write(JSON.stringify(data) + "\\n");
 if ((process.env.PI_HANG === "cap" || process.env.PI_HANG === "time") && !reportTurn) {
   setInterval(() => {
@@ -77,7 +77,7 @@ if ((process.env.PI_HANG === "cap" || process.env.PI_HANG === "time") && !report
   event({type:"turn_start"});
   event({type:"turn_end",message:{stopReason:"error",errorMessage:"400 status code (no body)",usage:{input:0,output:0,totalTokens:0}}});
   event({type:"agent_end",messages:[{role:"assistant",content:[],stopReason:"error",errorMessage:"400 status code (no body)"}]});
-} else if (process.env.PI_HANG === "deadline") {
+} else if (process.env.PI_HANG === "deadline" || (process.env.PI_HANG === "stall" && !reportTurn)) {
   setInterval(() => {}, 1000);
 } else {
   event({type:"turn_start"});
@@ -399,7 +399,7 @@ it("cuts a slow verifier within its own time budget and leaves its candidate unv
     stopReason: "deadline",
   });
   expect(receipt.findings[0]?.status).toBe("unverified");
-  expect(receipt.wallSeconds).toBeLessThan(4);
+  expect(receipt.wallSeconds).toBeLessThanOrEqual(4);
 });
 
 it("keeps only the last 16 KiB of a lane's final text while parsing the whole answer", async () => {
@@ -449,7 +449,114 @@ it("kills a lane at the deadline and writes its receipt", async () => {
     await readFile(join(input.out, "receipt.json"), "utf8"),
   ) as HybridReceipt;
   expect(receipt.lanes?.[0]?.status).toBe("cancelled");
-  expect(receipt.lanes?.[0]?.stopReason).toBe("deadline");
+  expect(receipt.lanes?.[0]?.stopReason).toBe("review deadline");
+});
+
+type Call = { at: number; args: string[]; phase: string; family: string };
+const calls = async (log: string) =>
+  (await readFile(log, "utf8"))
+    .trim()
+    .split("\n")
+    .map((line) => JSON.parse(line) as Call);
+const windows = async (out: string) => {
+  const status = JSON.parse(await readFile(join(out, "status.json"), "utf8"));
+  const receipt = JSON.parse(
+    await readFile(join(out, "receipt.json"), "utf8"),
+  ) as HybridReceipt & { startedAt: string; finishedAt: string };
+  return {
+    receipt,
+    startedAt: Date.parse(receipt.startedAt),
+    reviewDeadlineAt: Date.parse(status.reviewDeadlineAt),
+    deadlineAt: Date.parse(status.deadlineAt),
+  };
+};
+
+it("hands a reviewer still running at the review deadline one tools-off report turn and keeps its findings", async () => {
+  const input = await setup();
+  const config = JSON.parse(await readFile(input.lanes, "utf8"));
+  config.reviewers[0].env.PI_HANG = "stall";
+  await writeFile(input.lanes, JSON.stringify(config));
+  const result = run(input, 10);
+  expect(result.status, result.stderr).toBe(0);
+  const { receipt, startedAt, reviewDeadlineAt } = await windows(input.out);
+  expect(reviewDeadlineAt - startedAt).toBe(6000);
+  const log = await calls(input.log);
+  const reviewer = log.filter((call) => call.family === "workers-ai");
+  expect(reviewer.map((call) => call.args.includes("--no-tools"))).toEqual([
+    false,
+    true,
+  ]);
+  expect(reviewer[1]!.at).toBeLessThan(reviewDeadlineAt);
+  expect(receipt.lanes[0]).toMatchObject({ status: "completed" });
+  expect(receipt.candidates).toHaveLength(1);
+  expect(receipt.findings[0]?.status).toBe("confirmed");
+});
+
+it("declares a reviewer cut at the review deadline when its report turn does not finish", async () => {
+  const input = await setup();
+  const config = JSON.parse(await readFile(input.lanes, "utf8"));
+  config.reviewers[0].env.PI_HANG = "deadline";
+  await writeFile(input.lanes, JSON.stringify(config));
+  const result = run(input, 10);
+  expect(result.status, result.stderr).toBe(0);
+  const { receipt, startedAt, reviewDeadlineAt } = await windows(input.out);
+  const log = await calls(input.log);
+  expect(log.map((call) => call.args.includes("--no-tools"))).toEqual([
+    false,
+    true,
+  ]);
+  expect(receipt.lanes[0]).toMatchObject({
+    status: "cancelled",
+    stopReason: "review deadline",
+  });
+  expect(receipt.status).toBe("partial");
+  expect(Date.parse(receipt.finishedAt)).toBeLessThan(reviewDeadlineAt + 1000);
+  expect(reviewDeadlineAt - startedAt).toBe(6000);
+});
+
+it("starts the verifiers after a stalled reviewer's review deadline and ends them by the run deadline", async () => {
+  const input = await setup("claude-code");
+  const config = JSON.parse(await readFile(input.lanes, "utf8"));
+  config.reviewers.push({
+    ...config.reviewers[0],
+    family: "openai-codex",
+    env: {
+      ...config.reviewers[0].env,
+      PI_FAMILY: "openai-codex",
+      PI_HANG: "deadline",
+    },
+  });
+  config.verifiers[0].env = {
+    ...config.verifiers[0].env,
+    PI_FAMILY: "claude-code",
+    PI_HANG: "deadline",
+  };
+  await writeFile(input.lanes, JSON.stringify(config));
+  const result = run(input, 10);
+  expect(result.status, result.stderr).toBe(0);
+  const { receipt, reviewDeadlineAt, deadlineAt } = await windows(input.out);
+  const verifier = (await calls(input.log)).find(
+    (call) => call.family === "claude-code",
+  );
+  expect(verifier?.at).toBeGreaterThanOrEqual(reviewDeadlineAt);
+  const verifierLane = receipt.lanes.find((lane) => lane.role === "verifier");
+  expect(verifierLane).toMatchObject({
+    status: "cancelled",
+    stopReason: "deadline",
+  });
+  expect(Date.parse(receipt.finishedAt)).toBeLessThan(deadlineAt + 500);
+  expect(receipt.findings[0]?.status).toBe("unverified");
+});
+
+it("starts the verifiers before the review deadline when every reviewer ends early", async () => {
+  const input = await setup();
+  const result = run(input, 10);
+  expect(result.status, result.stderr).toBe(0);
+  const { reviewDeadlineAt } = await windows(input.out);
+  const verifier = (await calls(input.log)).find(
+    (call) => call.phase === "verifying",
+  );
+  expect(verifier?.at).toBeLessThan(reviewDeadlineAt);
 });
 
 it("runs the single-file bundle from a checkout without node_modules", async () => {

@@ -85,6 +85,7 @@ function parseLane(value: unknown): Lane {
 }
 
 const turnCap = 8;
+const reviewShare = 0.6;
 const tools = "read,grep,find,ls";
 const finalTextTail = (value: string) => {
   const bytes = Buffer.from(value);
@@ -99,6 +100,7 @@ function runPi(input: {
   prompt: string;
   reportPrompt: string;
   deadlineAt: number;
+  cutReason: string;
   children: Set<ChildProcess>;
 }): Promise<LaneResult> {
   return new Promise((resolveResult) => {
@@ -135,12 +137,12 @@ function runPi(input: {
     let usage: LaneResult["usage"] = null;
     let finalText = "";
     let piError: string | null = null;
-    let cut: "deadline" | "turn cap" | null = null;
+    let cut: string | null = null;
     let complete = false;
     let reportTurn = false;
     let handoff = false;
     let child: ChildProcess;
-    const kill = (reason: "deadline" | "turn cap") => {
+    const kill = (reason: string) => {
       if (complete || cut) return;
       cut = reason;
       if (child.pid) {
@@ -152,7 +154,7 @@ function runPi(input: {
       }
     };
     const timer = setTimeout(
-      () => kill("deadline"),
+      () => kill(input.cutReason),
       Math.max(0, input.deadlineAt - Date.now()),
     );
     const reportReserve = Math.min(
@@ -297,7 +299,7 @@ function runPi(input: {
           clearTimeout(reportTimer);
           start(input.reportPrompt);
         } else {
-          if (handoff && !cut) cut = "deadline";
+          if (handoff && !cut) cut = input.cutReason;
           finish(code);
         }
       });
@@ -344,6 +346,7 @@ export async function runHybrid(argv: string[]) {
   if (actualHead !== head) throw new Error("source HEAD differs from --head");
   const startedAt = Date.now();
   const deadlineAt = startedAt + timeout * 1000;
+  const reviewDeadlineAt = startedAt + Math.floor(timeout * 1000 * reviewShare);
   const children = new Set<ChildProcess>();
   const stop = () => {
     for (const child of children)
@@ -387,6 +390,7 @@ export async function runHybrid(argv: string[]) {
     candidates: 0,
     verified: 0,
     deadlineAt: new Date(deadlineAt).toISOString(),
+    reviewDeadlineAt: new Date(reviewDeadlineAt).toISOString(),
   };
   let statusWrite = Promise.resolve();
   const writeStatus = () => {
@@ -433,7 +437,8 @@ export async function runHybrid(argv: string[]) {
           prompt,
           reportPrompt:
             "Stop investigating and write your report now as the required fenced JSON. You have no tools. Use status partial and a blockerReason if the investigation is incomplete.",
-          deadlineAt,
+          deadlineAt: reviewDeadlineAt,
+          cutReason: "review deadline",
           children,
         });
         const parsed =
@@ -517,9 +522,8 @@ export async function runHybrid(argv: string[]) {
           prompt: `${verifierPrompt}\n\n${JSON.stringify(brief)}\n\n${pack.pack}`,
           reportPrompt:
             "Stop investigating and write your verdict now as the required fenced JSON. You have no tools. Confirm or reject only if the evidence supports it; otherwise state that you cannot decide. Never invent evidence.",
-          deadlineAt:
-            Date.now() +
-            Math.min(120_000, Math.floor((deadlineAt - Date.now()) / 2)),
+          deadlineAt: Math.min(Date.now() + 120_000, deadlineAt),
+          cutReason: "deadline",
           children,
         });
         const parsed =
