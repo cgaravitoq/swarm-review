@@ -21,6 +21,7 @@ import {
   REVIEW_RUNNER,
   runDir,
 } from "../protocol";
+import { SESSION_CAPS } from "../provider-budget";
 
 const getSandbox = vi.hoisted(() => vi.fn());
 
@@ -330,6 +331,30 @@ describe("cloud reviews", () => {
       CLOUDFLARE_ACCOUNT_ID: "fake-account",
     });
     expect(fixture.sandbox.putProbeSessions).toHaveBeenCalledOnce();
+    const sessions = fixture.sandbox.putProbeSessions.mock.calls[0]?.[0] ?? {};
+    expect(Object.keys(sessions)).toHaveLength(6);
+    for (const session of Object.values(sessions)) {
+      expect(session).toMatchObject({ caps: SESSION_CAPS.t1b });
+    }
+    const modelFiles = [...fixture.files.entries()].filter(
+      ([file]) =>
+        file.startsWith(`/workspace/runs/${reviewId}/pi-`) &&
+        file.endsWith("/models.json"),
+    );
+    expect(modelFiles).toHaveLength(6);
+    for (const [, body] of modelFiles) {
+      expect(body).not.toContain("fake-workers-bearer");
+      const providers = JSON.parse(body).providers as Record<
+        string,
+        { apiKey?: string; baseUrl?: string }
+      >;
+      const configured = Object.values(providers).find(
+        (provider) => provider.apiKey,
+      );
+      expect(configured?.apiKey).toBeTypeOf("string");
+      expect(configured?.baseUrl).toContain(`/model/${reviewId}/`);
+      expect(sessions).toHaveProperty(configured?.apiKey ?? "missing");
+    }
     expect(fixture.sandbox.destroy).toHaveBeenCalledOnce();
     expect(fixture.r2.has(`reviews/${reviewId}/receipt.json`)).toBe(true);
     const got = await handler.fetch(
