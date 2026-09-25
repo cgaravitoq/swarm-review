@@ -3,6 +3,10 @@ export const CODEX_RELAY_PORT = 3211;
 export const CODEX_UPSTREAM = "https://chatgpt.com/backend-api/codex/responses";
 const CODEX_RELAY_COMMAND = "/usr/local/bun/bin/bun /opt/relay/server.ts";
 const CODEX_RELAY_READY_MS = 30_000;
+const refusals = new WeakMap<Response, string>();
+
+export const relayRefusalReason = (response: Response) =>
+  refusals.get(response) ?? null;
 
 type SandboxSdk = typeof import("@cloudflare/sandbox");
 type RelayNamespace = Parameters<SandboxSdk["getSandbox"]>[0];
@@ -41,7 +45,9 @@ export function createCodexRelayTransport(
 ): typeof fetch {
   return async (input, init) => {
     if (String(input) !== CODEX_UPSTREAM || init?.method !== "POST") {
-      return new Response(null, { status: 404 });
+      const response = new Response(null, { status: 404 });
+      refusals.set(response, "codex_relay_non_post");
+      return response;
     }
     try {
       const sandbox = await factory(namespace, CODEX_RELAY_ID);
