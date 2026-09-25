@@ -12,6 +12,7 @@ import {
   WORKER_SSE_LINE_CHARS,
 } from "../container/response-seal";
 import { type ModelUsage, usageReader } from "../container/response-usage";
+import { relayRefusalReason } from "./codex-relay";
 import { assertCloudRunId } from "./isolation";
 
 export type { ModelUsage };
@@ -32,10 +33,11 @@ export type ModelTotals = {
   /**
    * Attempts admitted whose end this session has not seen.
    *
-   * `recordAttempt` runs at the stream's flush, so a client that walks away
-   * from a response leaves its slot spent and its end unobserved. The count is
-   * the control side's own statement of that, and the totals a row reads from
-   * it carry one request's tokens less than the requests it names.
+   * An admitted attempt whose response has neither ended, errored nor been
+   * cancelled: only a runtime that drops a stream without cancelling it leaves
+   * one here. The count is the control side's own statement of that. An
+   * attempt that errored or was cancelled leaves the count, and counts in the
+   * unobserved sides below unless its closing usage frame went by.
    *
    * Absent on a session a Worker stored before the count existed: Durable
    * Object storage outlives a redeploy, and admissions nobody counted cannot
@@ -45,7 +47,8 @@ export type ModelTotals = {
   /**
    * Ended attempts whose response never reported that side of their usage: an
    * attempt the upstream never answered, an answer without a body or a usage
-   * frame, or one whose frames this hop could not read.
+   * frame, one whose frames this hop could not read, or one that errored or
+   * was cancelled before its closing usage frame.
    *
    * `input` and `output` add only what a provider reported, so each is short by
    * the attempts counted here, and a reader that saw only the sums would read
@@ -304,6 +307,11 @@ export async function proxyModelFetch(
     rejectedAccessToken?: string,
   ) => Promise<{ authorization: string; accountId?: string }>,
   relayFetch?: typeof fetch,
+  observeOutcome?: (
+    runId: string,
+    handle: string,
+    outcome: ModelOutcome,
+  ) => Promise<void>,
 ): Promise<Response> {
   const segments = url.pathname.split("/").filter(Boolean);
   const runIdRaw = segments[1];
@@ -414,7 +422,12 @@ export async function proxyModelFetch(
     return jsonError(502, "credential_upstream_unauthorized");
   }
   const retryable = retryableFailure(upstream.status);
-  const outcome = { httpStatus: upstream.status, reason: null };
+  const refusal = relayRefusalReason(upstream);
+  const outcome = {
+    httpStatus: refusal ? null : upstream.status,
+    reason: refusal,
+  };
+  await observeOutcome?.(runId, handle, outcome);
   const responseHeaders = new Headers(upstream.headers);
   responseHeaders.delete("content-encoding");
   responseHeaders.delete("content-length");
@@ -428,28 +441,53 @@ export async function proxyModelFetch(
   const decoder = new TextDecoder();
   const sealer = responseSealer();
   const usage = usageReader({ lineChars: WORKER_SSE_LINE_CHARS });
-  const stream = new TransformStream<Uint8Array, Uint8Array>({
-    transform(chunk, controller) {
-      const text = decoder.decode(chunk, { stream: true });
-      sealer.write(text);
-      usage.write(text);
-      controller.enqueue(chunk);
+  const reader = upstream.body.getReader();
+  let recorded: Promise<void> | undefined;
+  const finish = (complete: boolean) => {
+    const reported = usage.read();
+    recorded ??= recordAttempt(
+      runId,
+      complete || usage.closed() ? reported : { input: null, output: null },
+      retryable,
+      complete ? sealer.seal() : null,
+      handle,
+      outcome,
+    );
+    return recorded;
+  };
+  const stream = new ReadableStream<Uint8Array>({
+    async pull(controller) {
+      try {
+        const { done, value } = await reader.read();
+        if (done) {
+          const text = decoder.decode();
+          sealer.write(text);
+          usage.write(text);
+          await finish(true);
+          controller.close();
+          return;
+        }
+        const text = decoder.decode(value, { stream: true });
+        sealer.write(text);
+        usage.write(text);
+        controller.enqueue(value);
+      } catch (error) {
+        try {
+          await finish(false);
+        } finally {
+          controller.error(error);
+        }
+      }
     },
-    async flush() {
-      const text = decoder.decode();
-      sealer.write(text);
-      usage.write(text);
-      await recordAttempt(
-        runId,
-        usage.read(),
-        retryable,
-        sealer.seal(),
-        handle,
-        outcome,
-      );
+    async cancel(reason) {
+      try {
+        await finish(false);
+      } finally {
+        await reader.cancel(reason);
+      }
     },
   });
-  return new Response(upstream.body.pipeThrough(stream), {
+  return new Response(stream, {
     status: upstream.status,
     headers: responseHeaders,
   });

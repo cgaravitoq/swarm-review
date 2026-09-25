@@ -67,6 +67,159 @@ const proxyTarget = async (runId: string, secret = "control-secret") => {
 };
 
 describe("model proxy", () => {
+  it("records the relay's GET refusal and the streamed POST's status when Pi cancels", async () => {
+    const runId = "codex-cancel-run";
+    const capability = await modelCapability(runId, "control-secret");
+    const url = new URL(
+      `https://review.invalid/model/${runId}/${capability}/codex/responses`,
+    );
+    const body = new ReadableStream<Uint8Array>({
+      start(controller) {
+        controller.enqueue(
+          new TextEncoder().encode(
+            'data: {"type":"response.output_text.delta","output_index":0,"delta":"pong"}\n\ndata: {"type":"response.completed","response":{"usage":{"input_tokens":4,"output_tokens":2}}}\n\n',
+          ),
+        );
+      },
+    });
+    const containerFetch = vi.fn(async (_url: string, init: RequestInit) => {
+      expect(init.method).toBe("POST");
+      expect(new Headers(init.headers).get("authorization")).toBe(
+        "Bearer fake-upstream",
+      );
+      expect(await new Response(init.body).text()).toBe('{"input":"hello"}');
+      return new Response(body, { status: 200 });
+    });
+    const process = {
+      id: "relay",
+      status: "running",
+      command: "/usr/local/bun/bin/bun /opt/relay/server.ts",
+      waitForPort: async () => undefined,
+    };
+    const relay = createCodexRelayTransport(
+      {} as Parameters<typeof createCodexRelayTransport>[0],
+      () => ({
+        listProcesses: async () => [process],
+        getProcess: async () => process,
+        startProcess: async () => process,
+        containerFetch,
+      }),
+    );
+    const recorded = vi.fn(async () => undefined);
+    const observed = vi.fn(async () => undefined);
+    const request = (method: "GET" | "POST") =>
+      new Request(url, {
+        method,
+        headers: { authorization: "Bearer review-pi-handle" },
+        ...(method === "POST" && { body: '{"input":"hello"}' }),
+      });
+    const proxy = (method: "GET" | "POST") =>
+      proxyModelFetch(
+        request(method),
+        url,
+        "control-secret",
+        async () => ({
+          handle: "review-pi-handle",
+          caps: capsFor(),
+          upstreamBaseUrl: "https://chatgpt.com/backend-api",
+        }),
+        async () => ({
+          ok: true as const,
+          session: {
+            handle: "review-pi-handle",
+            upstreamBaseUrl: "https://chatgpt.com/backend-api",
+            credentialProvider: "openai-codex",
+            caps: capsFor(),
+            totals: emptyModelTotals(),
+          },
+        }),
+        recorded,
+        async () => ({ authorization: "Bearer fake-upstream" }),
+        relay,
+        observed,
+      );
+    const refused = await proxy("GET");
+    expect(refused.status).toBe(404);
+    expect(recorded).toHaveBeenCalledWith(
+      runId,
+      null,
+      false,
+      null,
+      "review-pi-handle",
+      { httpStatus: null, reason: "codex_relay_non_post" },
+    );
+    const answer = await proxy("POST");
+    expect(answer.status).toBe(200);
+    expect(observed).toHaveBeenLastCalledWith(runId, "review-pi-handle", {
+      httpStatus: 200,
+      reason: null,
+    });
+    const reader = answer.body?.getReader();
+    expect(new TextDecoder().decode((await reader?.read())?.value)).toContain(
+      "response.completed",
+    );
+    await reader?.cancel();
+    expect(recorded).toHaveBeenCalledTimes(2);
+    expect(recorded).toHaveBeenLastCalledWith(
+      runId,
+      { input: 4, output: 2 },
+      false,
+      null,
+      "review-pi-handle",
+      { httpStatus: 200, reason: null },
+    );
+    expect(containerFetch).toHaveBeenCalledOnce();
+  });
+
+  it("observes a streamed response's status before its normal end and records it once", async () => {
+    const url = await proxyTarget("complete-stream-run");
+    const upstream = vi.fn<typeof fetch>(async (_input, init) => {
+      expect(String(_input)).toBe("https://api.x.ai/v1/chat/completions");
+      expect(init?.method).toBe("POST");
+      expect(new Headers(init?.headers).get("authorization")).toBe(
+        "Bearer real-secret",
+      );
+      expect(await new Response(init?.body).text()).toBe("{}");
+      return new Response(
+        'data: {"choices":[{"delta":{"content":"pong"}}],"usage":{"prompt_tokens":3,"completion_tokens":1}}\n\n',
+        { status: 200, headers: { "content-type": "text/event-stream" } },
+      );
+    });
+    vi.stubGlobal("fetch", upstream);
+    const recorded = vi.fn(async () => undefined);
+    const observed = vi.fn(async () => undefined);
+    const response = await proxyModelFetch(
+      new Request(url, {
+        method: "POST",
+        headers: { authorization: "Bearer review-pi-handle" },
+        body: "{}",
+      }),
+      url,
+      "control-secret",
+      sessionOpener(),
+      sessionConsumer(),
+      recorded,
+      undefined,
+      undefined,
+      observed,
+    );
+    expect(observed).toHaveBeenCalledWith(
+      "complete-stream-run",
+      "review-pi-handle",
+      { httpStatus: 200, reason: null },
+    );
+    expect(await response.text()).toContain("pong");
+    expect(recorded).toHaveBeenCalledOnce();
+    expect(recorded).toHaveBeenCalledWith(
+      "complete-stream-run",
+      { input: 3, output: 1 },
+      false,
+      createHash("sha256").update("pong").digest("hex"),
+      "review-pi-handle",
+      { httpStatus: 200, reason: null },
+    );
+  });
+
   it("routes Codex through the relay with the exact request and refreshes a 401", async () => {
     const runId = "relay-run";
     const capability = await modelCapability(runId, "control-secret");
@@ -982,6 +1135,71 @@ describe("model proxy", () => {
 
     expect(await response.text()).toHaveLength(bytes.byteLength);
     expect(recorded).toEqual([{ input: 1200, output: 42 }]);
+  });
+
+  it("records a partial usage as unobserved when the reader cancels before the closing frame", async () => {
+    const opening = [
+      'event: message_start\ndata: {"type":"message_start","message":{"usage":{"input_tokens":10,"output_tokens":1}}}',
+      'event: content_block_delta\ndata: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"partial"}}',
+    ]
+      .map((frame) => `${frame}\n\n`)
+      .join("");
+    const closing = [
+      'event: message_delta\ndata: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":500}}',
+      'event: message_stop\ndata: {"type":"message_stop"}',
+    ]
+      .map((frame) => `${frame}\n\n`)
+      .join("");
+    const upstream = vi.fn<typeof fetch>(async (input, init) => {
+      expect(String(input)).toBe("https://api.x.ai/v1/chat/completions");
+      expect(init?.method).toBe("POST");
+      expect(new Headers(init?.headers).get("authorization")).toBe(
+        "Bearer real-secret",
+      );
+      let sent = 0;
+      return new Response(
+        new ReadableStream<Uint8Array>({
+          pull(controller) {
+            const frames = [opening, closing];
+            const next = frames[sent];
+            sent += 1;
+            if (next === undefined) controller.close();
+            else controller.enqueue(new TextEncoder().encode(next));
+          },
+        }),
+        { status: 200, headers: { "content-type": "text/event-stream" } },
+      );
+    });
+    vi.stubGlobal("fetch", upstream);
+    const url = await proxyTarget("run-partial-usage");
+    const recorded: (ModelUsage | null)[] = [];
+    const proxy = () =>
+      proxyModelFetch(
+        new Request(url, {
+          method: "POST",
+          headers: { authorization: "Bearer review-pi-handle" },
+          body: "{}",
+        }),
+        url,
+        "control-secret",
+        sessionOpener(),
+        sessionConsumer(),
+        async (_runId, usage) => {
+          recorded.push(usage);
+        },
+      );
+
+    const cancelled = (await proxy()).body?.getReader();
+    expect(new TextDecoder().decode((await cancelled?.read())?.value)).toBe(
+      opening,
+    );
+    await cancelled?.cancel();
+    await (await proxy()).text();
+
+    expect(recorded).toEqual([
+      { input: null, output: null },
+      { input: 10, output: 500 },
+    ]);
   });
 
   it("seals the answer text it streamed", async () => {

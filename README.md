@@ -125,7 +125,8 @@ The authenticated `POST /probe` route starts one fresh review Sandbox, measures 
 Each family gets the image's own `models.json` pointed at `/model/` with that family's handle, exactly as a cloud lane is configured, so each request is the one a lane's Pi sends: `cloudflare-workers-ai` with `@cf/deepseek-ai/deepseek-v4-flash-0731`, `openai-codex` with `gpt-5.6-sol`, and `claude-code` with `claude-opus-5` through the lanes' Claude Code extension.
 A family passes when Pi exits 0 and its last turn stops with text, the reading a lane's stream gets.
 Each family's agent directory turns Pi's retries off, so a family spends one upstream attempt, plus the WebSocket attempt openai-codex makes first.
-A family's HTTP status and reason are what the model proxy observed for its handle: the upstream's status, or the Worker's own refusal such as `codex_relay_failed`, a `credential_*` reason or `max_requests`.
+A family's HTTP status is the status of the response that produced its turn, recorded when that response arrives even if Pi stops reading its stream early.
+The reason distinguishes the Worker's own refusals, including the relay's non-POST 404, `codex_relay_failed`, a `credential_*` reason or `max_requests`, from an upstream response.
 The Worker stores `probes/<runId>.json` in the `PROBE_RESULTS` R2 bucket and returns only its key and overall status.
 Each phase records a status, failure phase, HTTP status when observed, and milliseconds from the Worker's monotonic `performance.now()` clock.
 A skipped phase has `durationMs: null` with `durationReason: "not_started"`, and a phase the clock did not advance across, such as one that failed before any I/O, has `durationMs: null` with `durationReason: "no_clock_delta"`.

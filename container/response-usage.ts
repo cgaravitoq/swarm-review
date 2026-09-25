@@ -12,6 +12,14 @@ const USAGE_FIELDS = [
   "outputTokens",
 ] as const;
 
+const CLOSING_EVENTS = new Set([
+  "response.completed",
+  "response.done",
+  "response.incomplete",
+  "message_delta",
+  "message_stop",
+]);
+
 const objectRecord = (value: unknown): Record<string, unknown> | null =>
   typeof value === "object" && value !== null && Array.isArray(value) === false
     ? (value as Record<string, unknown>)
@@ -44,16 +52,24 @@ const objectRecord = (value: unknown): Record<string, unknown> | null =>
  * two-byte line at the bound, V8's smallest passing `--max-old-space-size`
  * moves from 40 to 56 MB at the Worker's bound, inside its isolate's 128, and
  * from 144 to 208 MB at the container's.
+ *
+ * `closed` says whether a frame that carries the final usage went by: a
+ * Responses closing event, Anthropic's `message_delta` or `message_stop`, a
+ * chat chunk with its own usage, or `[DONE]`. Before one, Anthropic has only
+ * reported the output it opened with, so a stream that stops early has no
+ * usage a reader may count as whole.
  */
 export const usageReader = ({ lineChars }: { lineChars: number }) => {
   const last = new Map<(typeof USAGE_FIELDS)[number], number>();
   let pending = "";
   let unreadable = false;
+  let closed = false;
 
   const readLine = (line: string) => {
     const payload = line.startsWith("data:")
       ? line.slice(5).trim()
       : line.trim();
+    if (payload === "[DONE]") closed = true;
     if (!payload || payload === "[DONE]") return;
     let parsed: unknown;
     try {
@@ -63,6 +79,14 @@ export const usageReader = ({ lineChars }: { lineChars: number }) => {
     }
     const frame = objectRecord(parsed);
     if (!frame) return;
+    const type = frame["type"];
+    if (
+      typeof type === "string"
+        ? CLOSING_EVENTS.has(type)
+        : objectRecord(frame["usage"]) !== null
+    ) {
+      closed = true;
+    }
     // OpenAI's Responses API nests it under the response, Anthropic's
     // Messages API under the message it opens with.
     const usage =
@@ -115,6 +139,7 @@ export const usageReader = ({ lineChars }: { lineChars: number }) => {
           null,
       };
     },
+    closed: () => closed,
   };
 };
 

@@ -95,6 +95,13 @@ export class ReviewSandbox extends Sandbox<ReviewPiEnv> {
     return session?.lastOutcome ?? null;
   }
 
+  async recordModelOutcome(handle: string, outcome: ModelOutcome) {
+    const { session, probes } = await this.sessionFor(handle);
+    if (!session || !probes) return;
+    session.lastOutcome = outcome;
+    await this.ctx.storage.put(PROBE_SESSIONS_KEY, probes);
+  }
+
   async clearProbeSessions() {
     await this.ctx.storage.delete(PROBE_SESSIONS_KEY);
   }
@@ -820,6 +827,11 @@ export default {
             rejectedAccessToken,
           ),
         createCodexRelayTransport(env.CODEX_RELAY),
+        async (runId, handle, outcome) =>
+          getSandbox(env.REVIEW_SANDBOX, runId).recordModelOutcome(
+            handle,
+            outcome,
+          ),
       );
     }
 

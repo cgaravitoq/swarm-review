@@ -285,6 +285,7 @@ describe("operator probe", () => {
       | "cap"
       | "relay"
       | "codex-400"
+      | "codex-cancel"
       | "session"
       | "pi-exit",
   ) => {
@@ -355,6 +356,19 @@ describe("operator probe", () => {
           return new Response(JSON.stringify({ detail: "Unsupported model" }), {
             status: 400,
           });
+        if (failure === "codex-cancel")
+          return new Response(
+            new ReadableStream<Uint8Array>({
+              start(controller) {
+                controller.enqueue(
+                  new TextEncoder().encode(
+                    'data: {"type":"response.completed","response":{"usage":{"input_tokens":4,"output_tokens":2}}}\n\n',
+                  ),
+                );
+              },
+            }),
+            { status: 200, headers: { "content-type": "text/event-stream" } },
+          );
         return new Response(
           JSON.stringify({
             status: "completed",
@@ -453,7 +467,13 @@ describe("operator probe", () => {
             }),
             probeEnv,
           );
-          text = await response.text();
+          if (failure === "codex-cancel" && family === "openai-codex") {
+            const reader = response.body?.getReader();
+            text = new TextDecoder().decode((await reader?.read())?.value);
+            await reader?.cancel();
+          } else {
+            text = await response.text();
+          }
           attempt += 1;
         } while (
           attempt <= retries &&
@@ -679,6 +699,35 @@ describe("operator probe", () => {
     expect(receipt.models["openai-codex"].status).toBe("ok");
     expect(receipt.models["claude-code"].status).toBe("ok");
     expect(fixture.destroy).toHaveBeenCalledOnce();
+  });
+
+  it("uses the streamed POST status for a successful Codex probe after Pi cancels", async () => {
+    const fixture = setup("codex-cancel");
+    const attempts = vi.spyOn(fixture.sandbox, "recordModelAttempt");
+    await handler.fetch(
+      authorized("https://review.invalid/probe", {
+        method: "POST",
+        body: JSON.stringify(input()),
+      }),
+      fixture.probeEnv,
+    );
+    const receipt = JSON.parse(fixture.object.put.mock.calls[0]?.[1] ?? "");
+    expect(receipt.models["openai-codex"]).toMatchObject({
+      status: "ok",
+      httpStatus: 200,
+      reason: null,
+    });
+    expect(fixture.relay.containerFetch).toHaveBeenCalledOnce();
+    expect(
+      attempts.mock.calls
+        .map((call) => call[4])
+        .filter((outcome) => outcome.reason === "codex_relay_non_post"),
+    ).toEqual([{ httpStatus: null, reason: "codex_relay_non_post" }]);
+    expect(
+      attempts.mock.calls
+        .map((call) => call[4])
+        .filter((outcome) => outcome.httpStatus === 200),
+    ).toHaveLength(3);
   });
 
   it("refuses to overwrite an existing receipt before starting a Sandbox", async () => {
@@ -1877,32 +1926,83 @@ describe("cloud model session accounting", () => {
     });
   });
 
-  it("keeps an attempt unended when the client walks away before the stream closes", async () => {
+  it("records a cancelled lane attempt with unobserved usage and seal", async () => {
     const sandbox = await runningSandbox();
     getSandbox.mockReturnValue(sandbox);
-    // A provider that opens a body and never closes it: the flush that records
-    // the attempt never runs, so the slot is spent with no end observed.
     vi.stubGlobal(
       "fetch",
       vi.fn<typeof fetch>(() =>
         Promise.resolve(
-          new Response(new ReadableStream({ start() {} }), {
-            status: 200,
-            headers: { "content-type": "text/event-stream" },
-          }),
+          new Response(
+            new ReadableStream<Uint8Array>({
+              start(controller) {
+                controller.enqueue(
+                  new TextEncoder().encode(
+                    'data: {"choices":[{"delta":{"content":"partial answer"}}]}\n\n',
+                  ),
+                );
+              },
+            }),
+            {
+              status: 200,
+              headers: { "content-type": "text/event-stream" },
+            },
+          ),
         ),
       ),
     );
 
     const response = await postModel("abandoned-run");
-    await response.body?.cancel();
+    const reader = response.body?.getReader();
+    expect(new TextDecoder().decode((await reader?.read())?.value)).toContain(
+      "partial answer",
+    );
+    await reader?.cancel();
 
-    // The request is counted and the record says it never ended, so a row that
-    // reads these totals cannot read its tokens as an observed zero.
     expect(await sandbox.modelUsage()).toMatchObject({
-      totals: { requests: 1, unended: 1 },
+      totals: {
+        requests: 1,
+        unended: 0,
+        input: null,
+        output: null,
+        inputUnobserved: 1,
+        outputUnobserved: 1,
+      },
     });
-    expect(await sandbox.modelSeals()).toEqual([]);
+    expect(await sandbox.modelSeals()).toEqual([null]);
+  });
+
+  it("records a streamed upstream error once with unobserved usage and seal", async () => {
+    const sandbox = await runningSandbox();
+    getSandbox.mockReturnValue(sandbox);
+    vi.stubGlobal(
+      "fetch",
+      vi.fn<typeof fetch>(() =>
+        Promise.resolve(
+          new Response(
+            new ReadableStream<Uint8Array>({
+              pull(controller) {
+                controller.error(new Error("upstream stream failed"));
+              },
+            }),
+            { status: 200 },
+          ),
+        ),
+      ),
+    );
+
+    const response = await postModel("stream-error-run");
+    await expect(response.text()).rejects.toThrow("upstream stream failed");
+    expect((await sandbox.modelUsage())?.totals).toEqual({
+      requests: 1,
+      retries: 0,
+      input: null,
+      output: null,
+      unended: 0,
+      inputUnobserved: 1,
+      outputUnobserved: 1,
+    });
+    expect(await sandbox.modelSeals()).toEqual([null]);
   });
 
   it("leaves unended unobserved on a session stored before it was counted", async () => {
