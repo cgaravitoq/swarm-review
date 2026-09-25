@@ -44,6 +44,19 @@ bun run src/swarm.ts \
   --out /tmp/swarm-1234
 ```
 
+For read-only Pi reviewers seeded with a context pack, provide reviewer and verifier model lanes in `lanes.json` and run:
+
+```sh
+bun run src/swarm.ts --hybrid --repo owner/name --source /path/to/checkout \
+  --pr 1234 --head <head-sha> --base <merge-base-sha> \
+  --lanes /path/to/lanes.json --out /tmp/hybrid-1234
+```
+
+The hybrid run writes `status.json` and a publish-compatible `receipt.json` directly in `--out`.
+It defaults to an eight-minute deadline and never installs dependencies or runs project checks.
+The lanes file has `reviewers` and `verifiers` arrays; each entry names `family`, `provider`, `model`, `piDir`, `extensions` and `env`.
+Each verifier family may appear once, and a candidate needs a verifier from a family other than every family that reported it.
+
 ### GitHub Action
 
 The composite action reviews a pull request on the job's Docker host and publishes confirmed findings.
