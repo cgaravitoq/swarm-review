@@ -101,6 +101,23 @@ bun run deploy --target /path/to/checkout --var TARGET_REPOSITORY:https://github
 
 `--target` is read locally, to bake the target's lockfile into the image; every other flag goes to `wrangler deploy`.
 
+## Creating the review GitHub App
+
+After deploying a Worker, create a private App under your account or an organization:
+
+```sh
+bun run create-app --name "Review App" --worker https://example.workers.dev
+bun run create-app --name "Review App" --worker https://example.workers.dev --org example --config wrangler.jsonc
+```
+
+Open the local URL the command prints in your browser.
+It submits a GitHub App manifest with Checks and pull request write access, contents and metadata read access, and the `pull_request` and `check_run` events.
+After GitHub redirects back, the command verifies the callback state, exchanges the one-time code, and sends the App ID, PKCS#8 private key, and webhook secret to `wrangler secret put` through stdin.
+It prints the App slug, ID, and installation URL after all three secrets are stored.
+The local listener binds only to `127.0.0.1` and closes after the exchange.
+The registration code expires after one hour.
+Install the App separately after creation.
+
 The Worker can hold its own `openai-codex` and `claude-code` subscription credentials in the `CREDENTIAL_VAULT` Durable Object.
 After deployment, an operator exports `WORKER_ORIGIN` and `CONTROL_SECRET` (`export CONTROL_SECRET=...`) so the script's environment carries them, authenticates a separate `CODEX_HOME` with `codex login`, then sends its `auth.json` directly to the Worker through stdin:
 
