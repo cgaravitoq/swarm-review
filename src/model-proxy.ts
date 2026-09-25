@@ -33,9 +33,11 @@ export type ModelTotals = {
   /**
    * Attempts admitted whose end this session has not seen.
    *
-   * An admitted attempt whose response has not ended or been cancelled.
-   * The count is the control side's own statement of that, and the totals a
-   * row reads from it carry one request's tokens less than the requests it names.
+   * An admitted attempt whose response has neither ended, errored nor been
+   * cancelled: only a runtime that drops a stream without cancelling it leaves
+   * one here. The count is the control side's own statement of that. An
+   * attempt that errored or was cancelled leaves the count, and counts in the
+   * unobserved sides below unless its closing usage frame went by.
    *
    * Absent on a session a Worker stored before the count existed: Durable
    * Object storage outlives a redeploy, and admissions nobody counted cannot
@@ -45,7 +47,8 @@ export type ModelTotals = {
   /**
    * Ended attempts whose response never reported that side of their usage: an
    * attempt the upstream never answered, an answer without a body or a usage
-   * frame, or one whose frames this hop could not read.
+   * frame, one whose frames this hop could not read, or one that errored or
+   * was cancelled before its closing usage frame.
    *
    * `input` and `output` add only what a provider reported, so each is short by
    * the attempts counted here, and a reader that saw only the sums would read
@@ -441,9 +444,10 @@ export async function proxyModelFetch(
   const reader = upstream.body.getReader();
   let recorded: Promise<void> | undefined;
   const finish = (complete: boolean) => {
+    const reported = usage.read();
     recorded ??= recordAttempt(
       runId,
-      usage.read(),
+      complete || usage.closed() ? reported : { input: null, output: null },
       retryable,
       complete ? sealer.seal() : null,
       handle,

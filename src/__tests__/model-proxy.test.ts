@@ -1137,6 +1137,71 @@ describe("model proxy", () => {
     expect(recorded).toEqual([{ input: 1200, output: 42 }]);
   });
 
+  it("records a partial usage as unobserved when the reader cancels before the closing frame", async () => {
+    const opening = [
+      'event: message_start\ndata: {"type":"message_start","message":{"usage":{"input_tokens":10,"output_tokens":1}}}',
+      'event: content_block_delta\ndata: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"partial"}}',
+    ]
+      .map((frame) => `${frame}\n\n`)
+      .join("");
+    const closing = [
+      'event: message_delta\ndata: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":500}}',
+      'event: message_stop\ndata: {"type":"message_stop"}',
+    ]
+      .map((frame) => `${frame}\n\n`)
+      .join("");
+    const upstream = vi.fn<typeof fetch>(async (input, init) => {
+      expect(String(input)).toBe("https://api.x.ai/v1/chat/completions");
+      expect(init?.method).toBe("POST");
+      expect(new Headers(init?.headers).get("authorization")).toBe(
+        "Bearer real-secret",
+      );
+      let sent = 0;
+      return new Response(
+        new ReadableStream<Uint8Array>({
+          pull(controller) {
+            const frames = [opening, closing];
+            const next = frames[sent];
+            sent += 1;
+            if (next === undefined) controller.close();
+            else controller.enqueue(new TextEncoder().encode(next));
+          },
+        }),
+        { status: 200, headers: { "content-type": "text/event-stream" } },
+      );
+    });
+    vi.stubGlobal("fetch", upstream);
+    const url = await proxyTarget("run-partial-usage");
+    const recorded: (ModelUsage | null)[] = [];
+    const proxy = () =>
+      proxyModelFetch(
+        new Request(url, {
+          method: "POST",
+          headers: { authorization: "Bearer review-pi-handle" },
+          body: "{}",
+        }),
+        url,
+        "control-secret",
+        sessionOpener(),
+        sessionConsumer(),
+        async (_runId, usage) => {
+          recorded.push(usage);
+        },
+      );
+
+    const cancelled = (await proxy()).body?.getReader();
+    expect(new TextDecoder().decode((await cancelled?.read())?.value)).toBe(
+      opening,
+    );
+    await cancelled?.cancel();
+    await (await proxy()).text();
+
+    expect(recorded).toEqual([
+      { input: null, output: null },
+      { input: 10, output: 500 },
+    ]);
+  });
+
   it("seals the answer text it streamed", async () => {
     const body = [
       'data: {"type":"message_start","message":{"content":[]}}',
