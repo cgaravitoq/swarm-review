@@ -6,9 +6,12 @@ import { afterEach, expect, it } from "vitest";
 import { assertPublishableReceipt, type SwarmReceipt } from "../publish";
 
 type HybridReceipt = SwarmReceipt & {
+  candidates: unknown[];
   lanes: (NonNullable<SwarmReceipt["lanes"]>[number] & {
     stopReason: string | null;
     turns: number;
+    finalText: string;
+    contractError: string | null;
   })[];
 };
 
@@ -59,16 +62,17 @@ async function setup(verifierFamily = "openai-codex") {
 import { appendFileSync, readFileSync } from "node:fs";
 const args = process.argv.slice(2);
 const prompt = readFileSync(0, "utf8");
-const verifying = prompt.includes('"candidates"');
+const reportTurn = args.includes("--no-tools");
 const env = Object.keys(process.env).sort();
 const phase = JSON.parse(readFileSync(process.env.PI_OUT + "/status.json", "utf8")).phase;
-appendFileSync(process.env.PI_LOG, JSON.stringify({args, env, phase, family: process.env.PI_FAMILY, promptChars: prompt.length}) + "\\n");
+const verifying = phase === "verifying";
+appendFileSync(process.env.PI_LOG, JSON.stringify({args, env, phase, family: process.env.PI_FAMILY, promptChars: prompt.length, prompt}) + "\\n");
 const event = (data) => process.stdout.write(JSON.stringify(data) + "\\n");
-if (process.env.PI_HANG === "cap") {
+if ((process.env.PI_HANG === "cap" || process.env.PI_HANG === "time") && !reportTurn) {
   setInterval(() => {
     event({type:"turn_start"});
     event({type:"turn_end",message:{stopReason:"tool_use",usage:{input:1,output:1,totalTokens:2}}});
-  }, 20);
+  }, process.env.PI_HANG === "time" ? 300 : 20);
 } else if (process.env.PI_HANG === "error") {
   event({type:"turn_start"});
   event({type:"turn_end",message:{stopReason:"error",errorMessage:"400 status code (no body)",usage:{input:0,output:0,totalTokens:0}}});
@@ -82,7 +86,8 @@ if (process.env.PI_HANG === "cap") {
     ? {verdicts:[{id:"c1",status:"confirmed",severity:"P1",evidenceStrength:"static",diffRelation:"added",declaredIntent:null,reason:"value changes for callers"}]}
     : {status:"complete",blockerReason:"",findings:[{severity:"P1",file:"a.ts",line:1,mechanism:"value changes",evidence:"diff",affectedBehavior:"caller sees 2"}]};
   const fence = String.fromCharCode(96).repeat(3);
-  event({type:"agent_end",messages:[{role:"assistant",content:[{type:"text",text:fence+"json\\n"+JSON.stringify(answer)+"\\n"+fence}]}]});
+  const text = process.env.PI_REPORT === "empty" && !verifying ? "" : process.env.PI_REPORT === "invalid" && !verifying ? "not a report" : process.env.PI_REPORT === "large" && !verifying ? "🧪".repeat(5000) + fence + "json\\n" + JSON.stringify(answer) + "\\n" + fence : fence + "json\\n" + JSON.stringify(answer) + "\\n" + fence;
+  event({type:"agent_end",messages:[{role:"assistant",content:[{type:"text",text}]}]});
 }
 `;
   await writeFile(join(bin, "pi"), fake, { mode: 0o755 });
@@ -170,7 +175,7 @@ it("runs read-only cross-family lanes with a scrubbed environment and a publisha
     "openai-codex",
   ]);
   for (const call of calls) {
-    expect(call.args).toContain("--no-session");
+    expect(call.args).toContain("--session-id");
     expect(call.args).toContain("--no-extensions");
     expect(call.args).toContain("--no-skills");
     expect(call.args).toContain("--no-prompt-templates");
@@ -278,7 +283,7 @@ it("uses a third family when two finder families reported the same candidate", a
   expect(receipt.findings[0].status).toBe("confirmed");
 });
 
-it("kills a lane at the turn cap and declares it", async () => {
+it("gives a lane at the tool-turn budget one tools-off report turn and publishes its candidate", async () => {
   const input = await setup();
   const config = JSON.parse(await readFile(input.lanes, "utf8"));
   config.reviewers[0].env.PI_HANG = "cap";
@@ -288,10 +293,131 @@ it("kills a lane at the turn cap and declares it", async () => {
   const receipt = JSON.parse(
     await readFile(join(input.out, "receipt.json"), "utf8"),
   ) as HybridReceipt;
-  expect(receipt.lanes?.[0]?.status).toBe("cancelled");
+  expect(receipt.lanes?.[0]?.status).toBe("completed");
   expect(receipt.lanes?.[0]?.model).toBe("test-a");
-  expect(receipt.lanes?.[0]?.stopReason).toBe("turn cap");
-  expect(receipt.lanes?.[0]?.turns).toBe(8);
+  expect(receipt.lanes?.[0]?.turns).toBe(9);
+  expect(receipt.candidates).toHaveLength(1);
+  const calls = (await readFile(input.log, "utf8"))
+    .trim()
+    .split("\n")
+    .map((line) => JSON.parse(line) as { args: string[]; prompt: string });
+  expect(calls).toHaveLength(3);
+  expect(calls[1]?.args).toContain("--no-tools");
+  expect(calls[1]?.args).toContain("--session-id");
+  const sessionId = (args: string[]) => args[args.indexOf("--session-id") + 1];
+  expect(sessionId(calls[1]!.args)).toBe(sessionId(calls[0]!.args));
+  expect(calls[1]?.prompt).toContain("report now");
+});
+
+it("records an unparseable report as a contract error with its final text", async () => {
+  const input = await setup();
+  const config = JSON.parse(await readFile(input.lanes, "utf8"));
+  config.reviewers[0].env.PI_REPORT = "invalid";
+  await writeFile(input.lanes, JSON.stringify(config));
+  const result = run(input);
+  expect(result.status, result.stderr).toBe(0);
+  const receipt = JSON.parse(
+    await readFile(join(input.out, "receipt.json"), "utf8"),
+  ) as HybridReceipt;
+  expect(receipt.lanes[0]).toMatchObject({
+    status: "malformed",
+    contractError: "no fenced json block",
+    finalText: "not a report",
+  });
+  expect(receipt.candidates).toHaveLength(0);
+});
+
+it("records an empty final answer as a contract error", async () => {
+  const input = await setup();
+  const config = JSON.parse(await readFile(input.lanes, "utf8"));
+  config.reviewers[0].env.PI_REPORT = "empty";
+  await writeFile(input.lanes, JSON.stringify(config));
+  const result = run(input);
+  expect(result.status, result.stderr).toBe(0);
+  const receipt = JSON.parse(
+    await readFile(join(input.out, "receipt.json"), "utf8"),
+  ) as HybridReceipt;
+  expect(receipt.lanes[0]).toMatchObject({
+    status: "malformed",
+    contractError: "no fenced json block",
+    finalText: "",
+  });
+  expect(receipt.candidates).toHaveLength(0);
+});
+
+it("reserves time for a tools-off report before the deadline", async () => {
+  const input = await setup();
+  const config = JSON.parse(await readFile(input.lanes, "utf8"));
+  config.reviewers[0].env.PI_HANG = "time";
+  await writeFile(input.lanes, JSON.stringify(config));
+  const result = run(input, 3);
+  expect(result.status, result.stderr).toBe(0);
+  const receipt = JSON.parse(
+    await readFile(join(input.out, "receipt.json"), "utf8"),
+  ) as HybridReceipt;
+  expect(receipt.lanes[0]?.status).toBe("completed");
+  expect(receipt.lanes[0]?.turns).toBeLessThan(9);
+  expect(receipt.candidates).toHaveLength(1);
+  const calls = (await readFile(input.log, "utf8"))
+    .trim()
+    .split("\n")
+    .map((line) => JSON.parse(line) as { args: string[] });
+  expect(calls[1]?.args).toContain("--no-tools");
+});
+
+it("gives a verifier at its tool-turn budget one tools-off verdict turn", async () => {
+  const input = await setup();
+  const config = JSON.parse(await readFile(input.lanes, "utf8"));
+  config.verifiers[0].env.PI_HANG = "cap";
+  await writeFile(input.lanes, JSON.stringify(config));
+  const result = run(input, 6);
+  expect(result.status, result.stderr).toBe(0);
+  const receipt = JSON.parse(
+    await readFile(join(input.out, "receipt.json"), "utf8"),
+  ) as HybridReceipt;
+  expect(receipt.lanes[1]).toMatchObject({ status: "completed", turns: 9 });
+  expect(receipt.findings[0]?.status).toBe("confirmed");
+  const calls = (await readFile(input.log, "utf8"))
+    .trim()
+    .split("\n")
+    .map((line) => JSON.parse(line) as { args: string[] });
+  expect(calls[2]?.args).toContain("--no-tools");
+});
+
+it("cuts a slow verifier within its own time budget and leaves its candidate unverified", async () => {
+  const input = await setup();
+  const config = JSON.parse(await readFile(input.lanes, "utf8"));
+  config.verifiers[0].env.PI_HANG = "deadline";
+  await writeFile(input.lanes, JSON.stringify(config));
+  const result = run(input, 4);
+  expect(result.status, result.stderr).toBe(0);
+  const receipt = JSON.parse(
+    await readFile(join(input.out, "receipt.json"), "utf8"),
+  ) as HybridReceipt;
+  expect(receipt.lanes[1]).toMatchObject({
+    status: "cancelled",
+    stopReason: "deadline",
+  });
+  expect(receipt.findings[0]?.status).toBe("unverified");
+  expect(receipt.wallSeconds).toBeLessThan(4);
+});
+
+it("keeps only the last 16 KiB of a lane's final text while parsing the whole answer", async () => {
+  const input = await setup();
+  const config = JSON.parse(await readFile(input.lanes, "utf8"));
+  config.reviewers[0].env.PI_REPORT = "large";
+  await writeFile(input.lanes, JSON.stringify(config));
+  const result = run(input);
+  expect(result.status, result.stderr).toBe(0);
+  const receipt = JSON.parse(
+    await readFile(join(input.out, "receipt.json"), "utf8"),
+  ) as HybridReceipt;
+  expect(Buffer.byteLength(receipt.lanes[0]!.finalText)).toBeLessThanOrEqual(
+    16 * 1024,
+  );
+  expect(receipt.lanes[0]?.finalText).not.toContain("\uFFFD");
+  expect(receipt.lanes[0]?.finalText).toContain('"status":"complete"');
+  expect(receipt.candidates).toHaveLength(1);
 });
 
 it("records Pi's own error for a lane whose turn ended in error", async () => {

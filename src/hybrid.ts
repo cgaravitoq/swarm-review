@@ -1,6 +1,8 @@
 import { type ChildProcess, execFileSync, spawn } from "node:child_process";
 import { randomUUID } from "node:crypto";
+import { mkdtempSync, rmSync } from "node:fs";
 import { mkdir, readFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { reviewerPrompt, verifierPrompt } from "../prompts/hybrid";
 import { writeAtomic } from "./attempt";
@@ -84,15 +86,24 @@ function parseLane(value: unknown): Lane {
 
 const turnCap = 8;
 const tools = "read,grep,find,ls";
+const finalTextTail = (value: string) => {
+  const bytes = Buffer.from(value);
+  let start = Math.max(0, bytes.length - 16 * 1024);
+  while (start < bytes.length && (bytes[start]! & 0xc0) === 0x80) start++;
+  return bytes.subarray(start).toString();
+};
 
 function runPi(input: {
   lane: Lane;
   source: string;
   prompt: string;
+  reportPrompt: string;
   deadlineAt: number;
   children: Set<ChildProcess>;
 }): Promise<LaneResult> {
   return new Promise((resolveResult) => {
+    const sessionDir = mkdtempSync(join(tmpdir(), "hybrid-pi-"));
+    const sessionId = randomUUID();
     const args = [
       "--provider",
       input.lane.provider,
@@ -101,12 +112,13 @@ function runPi(input: {
       "--mode",
       "json",
       "--print",
-      "--no-session",
+      "--session-dir",
+      sessionDir,
+      "--session-id",
+      sessionId,
       "--no-extensions",
       "--no-skills",
       "--no-prompt-templates",
-      "--tools",
-      tools,
       ...input.lane.extensions.flatMap((extension) => ["-e", extension]),
     ];
     const env = {
@@ -117,20 +129,6 @@ function runPi(input: {
       PI_OFFLINE: "1",
       PI_SKIP_VERSION_CHECK: "1",
     };
-    const child = spawn("pi", args, {
-      cwd: input.source,
-      env,
-      detached: true,
-      stdio: ["pipe", "pipe", "pipe"],
-    });
-    input.children.add(child);
-    // A context pack outgrows the 128 KiB Linux allows one argument, so the
-    // prompt goes through stdin, which Pi's print mode reads as the message.
-    child.stdin?.on("error", (error) => {
-      stderr += error.message;
-    });
-    child.stdin?.end(input.prompt);
-    let stdout = "";
     let stderr = "";
     let turns = 0;
     let stopReason: string | null = null;
@@ -139,6 +137,9 @@ function runPi(input: {
     let piError: string | null = null;
     let cut: "deadline" | "turn cap" | null = null;
     let complete = false;
+    let reportTurn = false;
+    let handoff = false;
+    let child: ChildProcess;
     const kill = (reason: "deadline" | "turn cap") => {
       if (complete || cut) return;
       cut = reason;
@@ -154,8 +155,49 @@ function runPi(input: {
       () => kill("deadline"),
       Math.max(0, input.deadlineAt - Date.now()),
     );
+    const reportReserve = Math.min(
+      60_000,
+      Math.floor((input.deadlineAt - Date.now()) / 4),
+    );
+    const reportTimer = setTimeout(
+      () => requestReport(),
+      Math.max(0, input.deadlineAt - Date.now() - reportReserve),
+    );
+    const finish = (code: number | null) => {
+      complete = true;
+      clearTimeout(timer);
+      clearTimeout(reportTimer);
+      rmSync(sessionDir, { recursive: true, force: true });
+      const status = cut
+        ? "cut"
+        : code === 0 && stopReason !== "error"
+          ? "completed"
+          : "failed";
+      resolveResult({
+        status,
+        stopReason: cut ?? stopReason,
+        turns,
+        usage,
+        finalText,
+        error:
+          status === "failed"
+            ? piError || stderr.trim() || `pi exited ${code}`
+            : null,
+      });
+    };
+    const requestReport = () => {
+      if (complete || cut || reportTurn || handoff || finalText) return;
+      handoff = true;
+      if (child.pid) {
+        try {
+          process.kill(-child.pid, "SIGKILL");
+        } catch {
+          child.kill("SIGKILL");
+        }
+      }
+    };
     const consume = (line: string) => {
-      if (cut) return;
+      if (cut || handoff) return;
       let event: Record<string, unknown> | null = null;
       try {
         event = record(JSON.parse(line));
@@ -189,8 +231,11 @@ function runPi(input: {
             usage.totalTokens += totalTokens;
           }
         }
+        if (!reportTurn && turns >= turnCap && stopReason === "tool_use")
+          requestReport();
       }
-      if (event["type"] === "turn_start" && turns >= turnCap) kill("turn cap");
+      if (event["type"] === "turn_start" && reportTurn && turns > turnCap)
+        kill("turn cap");
       if (event["type"] === "agent_end") {
         const messages = event["messages"];
         if (Array.isArray(messages)) {
@@ -211,43 +256,53 @@ function runPi(input: {
         }
       }
     };
-    child.stdout?.on("data", (chunk: Buffer) => {
-      stdout += chunk.toString();
-      let newline = stdout.indexOf("\n");
-      while (newline >= 0) {
-        consume(stdout.slice(0, newline));
-        stdout = stdout.slice(newline + 1);
-        newline = stdout.indexOf("\n");
-      }
-    });
-    child.stderr?.on("data", (chunk: Buffer) => {
-      stderr += chunk.toString();
-    });
-    child.once("error", (error) => {
-      stderr += error.message;
-    });
-    child.once("close", (code) => {
-      complete = true;
-      clearTimeout(timer);
-      input.children.delete(child);
-      if (stdout.trim()) consume(stdout.trim());
-      const status = cut
-        ? "cut"
-        : code === 0 && finalText && stopReason !== "error"
-          ? "completed"
-          : "failed";
-      resolveResult({
-        status,
-        stopReason: cut ?? stopReason,
-        turns,
-        usage,
-        finalText,
-        error:
-          status === "failed"
-            ? piError || stderr.trim() || `pi exited ${code}`
-            : null,
+    const start = (prompt: string) => {
+      let stdout = "";
+      child = spawn(
+        "pi",
+        [...args, ...(reportTurn ? ["--no-tools"] : ["--tools", tools])],
+        {
+          cwd: input.source,
+          env,
+          detached: true,
+          stdio: ["pipe", "pipe", "pipe"],
+        },
+      );
+      input.children.add(child);
+      child.stdin?.on("error", (error) => {
+        stderr += error.message;
       });
-    });
+      child.stdin?.end(prompt);
+      child.stdout?.on("data", (chunk: Buffer) => {
+        stdout += chunk.toString();
+        let newline = stdout.indexOf("\n");
+        while (newline >= 0) {
+          consume(stdout.slice(0, newline));
+          stdout = stdout.slice(newline + 1);
+          newline = stdout.indexOf("\n");
+        }
+      });
+      child.stderr?.on("data", (chunk: Buffer) => {
+        stderr += chunk.toString();
+      });
+      child.once("error", (error) => {
+        stderr += error.message;
+      });
+      child.once("close", (code) => {
+        input.children.delete(child);
+        if (stdout.trim()) consume(stdout.trim());
+        if (handoff && !cut && Date.now() < input.deadlineAt) {
+          handoff = false;
+          reportTurn = true;
+          clearTimeout(reportTimer);
+          start(input.reportPrompt);
+        } else {
+          if (handoff && !cut) cut = "deadline";
+          finish(code);
+        }
+      });
+    };
+    start(input.prompt);
   });
 }
 
@@ -352,6 +407,7 @@ export async function runHybrid(argv: string[]) {
     stopReason: string | null;
     turns: number;
     usage: LaneResult["usage"];
+    finalText: string;
     blockerReason?: string | null;
     contractError?: string | null;
     error?: string | null;
@@ -375,6 +431,8 @@ export async function runHybrid(argv: string[]) {
           lane,
           source,
           prompt,
+          reportPrompt:
+            "Stop investigating and write your report now as the required fenced JSON. You have no tools. Use status partial and a blockerReason if the investigation is incomplete.",
           deadlineAt,
           children,
         });
@@ -402,6 +460,7 @@ export async function runHybrid(argv: string[]) {
           stopReason: result.stopReason,
           turns: result.turns,
           usage: result.usage,
+          finalText: finalTextTail(result.finalText),
           blockerReason: parsed?.blockerReason ?? null,
           contractError: parsed?.error ?? null,
           error: result.error,
@@ -456,7 +515,11 @@ export async function runHybrid(argv: string[]) {
           lane,
           source,
           prompt: `${verifierPrompt}\n\n${JSON.stringify(brief)}\n\n${pack.pack}`,
-          deadlineAt,
+          reportPrompt:
+            "Stop investigating and write your verdict now as the required fenced JSON. You have no tools. Confirm or reject only if the evidence supports it; otherwise state that you cannot decide. Never invent evidence.",
+          deadlineAt:
+            Date.now() +
+            Math.min(120_000, Math.floor((deadlineAt - Date.now()) / 2)),
           children,
         });
         const parsed =
@@ -484,6 +547,7 @@ export async function runHybrid(argv: string[]) {
           stopReason: result.stopReason,
           turns: result.turns,
           usage: result.usage,
+          finalText: finalTextTail(result.finalText),
           candidateIds: [candidate.id],
           contractError: parsed?.error ?? null,
           error: result.error,
