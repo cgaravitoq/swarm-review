@@ -26,6 +26,7 @@ import {
   openPull,
   type PullRequestEvent,
   pullRequestEvent,
+  readBrief,
   verifyWebhook,
 } from "./src/github-app";
 import {
@@ -127,6 +128,7 @@ type AppReview = {
   acceptedAt: number;
   phase: "pending" | "running" | "publishing" | "done";
   outcome: string | null;
+  briefNote?: string | null;
 };
 
 const SUPERSEDED_SUMMARY = "A newer pull request event superseded this review.";
@@ -296,12 +298,15 @@ export class PullRequestReview extends DurableObject<ReviewPiEnv> {
           repository,
           installationId: state.event.installationId,
         });
+        const brief = await readBrief(token, repository, state.event.base);
+        state.briefNote = brief.note ?? null;
         await startReview(this.env, {
           reviewId,
           repository,
           pr: state.event.number,
           head: state.event.head,
           base: state.mergeBase,
+          ...(brief.context ? { context: brief.context } : {}),
           origin: state.origin,
           deadlineAt: new Date(Date.now() + REVIEW_DEADLINE_MS).toISOString(),
         });
@@ -463,7 +468,7 @@ export class PullRequestReview extends DurableObject<ReviewPiEnv> {
       state.event.repository,
       state.checkRunId!,
       conclusion,
-      summary,
+      state.briefNote ? `${summary}\n\n${state.briefNote}` : summary,
     );
     state.phase = "done";
     state.outcome = summary;

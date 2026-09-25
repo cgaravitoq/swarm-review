@@ -370,3 +370,35 @@ export async function completeCheck(
   if (!response.ok)
     throw new GitHubRequestError(`update_check_${response.status}`, response);
 }
+
+export const BRIEF_PATH = ".swarm-review/brief.md";
+export const BRIEF_MAX_CHARS = 64_000;
+
+export async function readBrief(
+  token: string,
+  repository: string,
+  base: string,
+): Promise<{ context?: string; note?: string }> {
+  const unused = (why: string) => ({
+    note: `The repository brief \`${BRIEF_PATH}\` ${why}, so the default brief steered this review.`,
+  });
+  try {
+    const response = await fetch(
+      `${api}/repos/${repository}/contents/${BRIEF_PATH}?ref=${base}`,
+      {
+        headers: {
+          ...headers(token),
+          accept: "application/vnd.github.raw+json",
+        },
+      },
+    );
+    if (response.status === 404) return {};
+    if (!response.ok) return unused(`could not be read (${response.status})`);
+    const context = await response.text();
+    return context.length > BRIEF_MAX_CHARS
+      ? unused(`is over ${BRIEF_MAX_CHARS} characters`)
+      : { context };
+  } catch {
+    return unused("could not be read");
+  }
+}

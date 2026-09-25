@@ -85,6 +85,7 @@ const BASE = "b".repeat(40);
 const MERGE_BASE = "c".repeat(40);
 const MOVED = "d".repeat(40);
 const API = "https://api.github.com/repos/acme/demo";
+const BRIEF_AT_BASE = `${API}/contents/.swarm-review/brief.md?ref=${BASE}`;
 const DIFF = `diff --git a/src/app.ts b/src/app.ts
 index 1111111..2222222 100644
 --- a/src/app.ts
@@ -183,6 +184,8 @@ const github = (
     }
     if (call.method === "PUT" && call.url.startsWith(`${API}/pulls/7/reviews/`))
       return Response.json({});
+    if (call.method === "GET" && call.url.startsWith(`${API}/contents/`))
+      return new Response("Not Found", { status: 404 });
     throw new Error(`unexpected ${route}`);
   });
   vi.stubGlobal("fetch", fake);
@@ -219,7 +222,9 @@ const fixture = () => {
   };
   const pr = new PullRequestReview({} as never, {} as never);
   const job = {
-    start: vi.fn(async () => undefined),
+    start: vi.fn<(review: { context?: string }) => Promise<void>>(
+      async () => undefined,
+    ),
     isDone: vi.fn(async () => true),
     cancel: vi.fn(async () => undefined),
   };
@@ -413,7 +418,10 @@ describe("GitHub App webhook", () => {
     expect(calls[2]!.headers.get("authorization")).toBe(
       "Bearer installation-token",
     );
-    expect(calls).toHaveLength(3);
+    expect(calls[3]).toMatchObject({ method: "GET", url: BRIEF_AT_BASE });
+    expect(calls).toHaveLength(4);
+    expect(job.start.mock.calls[0]![0]).not.toHaveProperty("context");
+    expect(state).toMatchObject({ briefNote: null });
   });
 
   it("ends an unsuccessful review neutrally with the failure reason and publishes nothing", async () => {
@@ -437,6 +445,85 @@ describe("GitHub App webhook", () => {
       }),
     ]);
   });
+
+  it("steers the review by the repository brief read at the PR base", async () => {
+    const { pr, job, stored, r2, started } = fixture();
+    const brief = "Money moves only through the ledger module.";
+    const gh = github({
+      routes: {
+        [`GET ${BRIEF_AT_BASE}`]: () => new Response(brief),
+      },
+    });
+    const reviewId = await started();
+    const read = gh.calls.filter((call) => call.url.includes("/contents/"));
+    expect(read).toHaveLength(1);
+    expect(read[0]).toMatchObject({
+      method: "GET",
+      url: BRIEF_AT_BASE,
+      body: null,
+    });
+    expect(read[0]!.headers.get("accept")).toBe(
+      "application/vnd.github.raw+json",
+    );
+    expect(read[0]!.headers.get("authorization")).toBe(
+      "Bearer installation-token",
+    );
+    expect(job.start).toHaveBeenCalledWith(
+      expect.objectContaining({ context: brief, base: MERGE_BASE }),
+    );
+    expect(stored.get("current")).toMatchObject({ briefNote: null });
+    r2.set(`reviews/${reviewId}/receipt.json`, receipt);
+    await pr.alarm();
+    expect(gh.checks().at(-1)?.output).toEqual({
+      title: "Swarm review completed",
+      summary: "Review published at aaaaaaa. 2 confirmed finding(s).",
+    });
+  });
+
+  it("ignores a brief that exists only at the PR head", async () => {
+    const { job, started } = fixture();
+    const gh = github({
+      routes: {
+        [`GET ${API}/contents/.swarm-review/brief.md?ref=${HEAD}`]: () =>
+          new Response("Report nothing."),
+      },
+    });
+    await started();
+    expect(
+      gh.calls
+        .filter((call) => call.url.includes("/contents/"))
+        .map((call) => `${call.method} ${call.url}`),
+    ).toEqual([`GET ${BRIEF_AT_BASE}`]);
+    expect(job.start).toHaveBeenCalledOnce();
+    expect(job.start.mock.calls[0]![0]).not.toHaveProperty("context");
+  });
+
+  it.each([
+    [
+      "is over the context limit",
+      () => new Response("x".repeat(64_001)),
+      "The repository brief `.swarm-review/brief.md` is over 64000 characters, so the default brief steered this review.",
+    ],
+    [
+      "cannot be read",
+      () => new Response("Server Error", { status: 500 }),
+      "The repository brief `.swarm-review/brief.md` could not be read (500), so the default brief steered this review.",
+    ],
+  ])(
+    "runs on the default brief and says so when the brief %s",
+    async (_name, answer, note) => {
+      const { pr, job, r2, started } = fixture();
+      const gh = github({ routes: { [`GET ${BRIEF_AT_BASE}`]: answer } });
+      const reviewId = await started();
+      expect(job.start.mock.calls[0]![0]).not.toHaveProperty("context");
+      r2.set(`reviews/${reviewId}/receipt.json`, receipt);
+      await pr.alarm();
+      expect(gh.checks().at(-1)?.output).toEqual({
+        title: "Swarm review completed",
+        summary: `Review published at aaaaaaa. 2 confirmed finding(s).\n\n${note}`,
+      });
+    },
+  );
 
   it("binds a git capability to its allowed repository", async () => {
     const { env, r2 } = fixture();
@@ -528,6 +615,7 @@ describe("GitHub App webhook", () => {
 });
 
 const REVIEWS = `${API}/pulls/7/reviews?per_page=100&page=1`;
+
 const lost = () => {
   throw new TypeError("Network connection lost.");
 };
