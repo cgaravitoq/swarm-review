@@ -76,6 +76,7 @@ const PROBE_SESSIONS_KEY = "probeSessions";
 const MODEL_SEALS_KEY = "modelSeals";
 const COMMAND_SEQUENCE_KEY = "commandSequence";
 const REVIEW_DEADLINE_MS = 8 * 60_000;
+const REVIEW_ENGINE_MARGIN_MS = 90_000;
 const REVIEW_FAMILIES = {
   "workers-ai": {
     provider: "cloudflare-workers-ai",
@@ -490,6 +491,7 @@ const ARTIFACTS = [
   "install.log",
 ] as const;
 const RPC_TIMEOUT_MS = 60_000;
+const REVIEW_SESSION_CLEAR_MS = 5_000;
 
 const json = (body: unknown, status = 200) =>
   new Response(JSON.stringify(body), {
@@ -721,15 +723,19 @@ const failedReviewStatus = (
   review: CloudReview,
   reason: string,
   engine: EngineFailure | null,
+  observed: Record<string, unknown> | null,
 ) => ({
+  ...observed,
   phase: "failed",
-  reviewers: Object.entries(REVIEW_FAMILIES).map(([family, { model }]) => ({
-    family,
-    model,
-    state: "unobserved",
-  })),
-  candidates: 0,
-  verified: 0,
+  reviewers:
+    observed?.["reviewers"] ??
+    Object.entries(REVIEW_FAMILIES).map(([family, { model }]) => ({
+      family,
+      model,
+      state: "unobserved",
+    })),
+  candidates: observed?.["candidates"] ?? 0,
+  verified: observed?.["verified"] ?? 0,
   deadlineAt: review.deadlineAt,
   reason,
   ...(engine ? { engine } : {}),
@@ -742,24 +748,32 @@ async function finishReview(
   receipt: unknown,
   engine: EngineFailure | null = null,
 ) {
+  const status = await env.PROBE_RESULTS.get(
+    reviewKey(review.reviewId, "status"),
+  );
+  const observed = status ? await status.json<Record<string, unknown>>() : null;
   await putReviewJson(
     env,
     review.reviewId,
     "status",
-    failedReviewStatus(review, reason, engine),
+    failedReviewStatus(review, reason, engine, observed),
   );
+  const existingReceipt = await env.PROBE_RESULTS.head(
+    reviewKey(review.reviewId, "receipt"),
+  );
+  if (existingReceipt) return;
+  if (receipt !== null) {
+    await putReviewJson(env, review.reviewId, "receipt", receipt);
+    return;
+  }
   await putReviewJson(env, review.reviewId, "receipt", {
-    ...(typeof receipt === "object" && receipt !== null
-      ? receipt
-      : {
-          swarmId: review.reviewId,
-          requested: {
-            head: review.head,
-            base: review.base,
-            pullRequest: review.pr,
-          },
-          findings: [],
-        }),
+    swarmId: review.reviewId,
+    requested: {
+      head: review.head,
+      base: review.base,
+      pullRequest: review.pr,
+    },
+    findings: [],
     status: "failed",
     failure: {
       stage: reason === "deadline" ? "deadline" : "cloud_review",
@@ -775,8 +789,19 @@ const reviewRemaining = (review: CloudReview) => {
   return remaining;
 };
 
+const reviewWorkingRemaining = (review: CloudReview) => {
+  const remaining =
+    reviewRemaining(review) - RPC_TIMEOUT_MS - REVIEW_SESSION_CLEAR_MS;
+  if (remaining <= 0) throw new Error("deadline");
+  return remaining;
+};
+
 const reviewStep = <T>(review: CloudReview, label: string, work: Promise<T>) =>
-  bounded(label, work, Math.min(reviewRemaining(review), RPC_TIMEOUT_MS));
+  bounded(
+    label,
+    work,
+    Math.min(reviewWorkingRemaining(review), RPC_TIMEOUT_MS),
+  );
 
 async function runCloudReview(env: ReviewPiEnv, review: CloudReview) {
   const sandbox = getSandbox(env.REVIEW_SANDBOX, review.reviewId);
@@ -828,7 +853,11 @@ async function runCloudReview(env: ReviewPiEnv, review: CloudReview) {
     );
     if (cloned.exitCode !== 0) throw new Error("clone_failed");
 
-    const laneModels = await readArtifact(sandbox, PI_MODELS_PATH);
+    const laneModels = await reviewStep(
+      review,
+      "review models file",
+      readArtifact(sandbox, PI_MODELS_PATH),
+    );
     if (!laneModels.exists || laneModels.truncated)
       throw new Error("models_unavailable");
     const capability = await modelCapability(
@@ -945,6 +974,10 @@ async function runCloudReview(env: ReviewPiEnv, review: CloudReview) {
       sandbox.exec(targetChownCommand(directory)),
     );
 
+    const engineSeconds = Math.floor(
+      (reviewRemaining(review) - REVIEW_ENGINE_MARGIN_MS) / 1000,
+    );
+    if (engineSeconds < 1) throw new Error("deadline");
     const args = [
       REVIEW_ENGINE,
       "--hybrid",
@@ -961,7 +994,7 @@ async function runCloudReview(env: ReviewPiEnv, review: CloudReview) {
       "--lanes",
       `${directory}/lanes.json`,
       "--total-timeout",
-      String(Math.max(1, Math.floor(reviewRemaining(review) / 1000))),
+      String(engineSeconds),
       "--out",
       `${directory}/out`,
     ];
@@ -979,9 +1012,10 @@ async function runCloudReview(env: ReviewPiEnv, review: CloudReview) {
         "review engine status",
         process.getStatus(),
       );
-      const statusFile = await readArtifact(
-        sandbox,
-        `${directory}/out/status.json`,
+      const statusFile = await reviewStep(
+        review,
+        "review status file",
+        readArtifact(sandbox, `${directory}/out/status.json`),
       );
       if (statusFile.exists && !statusFile.truncated) {
         await putReviewJson(
@@ -996,7 +1030,7 @@ async function runCloudReview(env: ReviewPiEnv, review: CloudReview) {
         break;
       }
       await new Promise((wake) =>
-        setTimeout(wake, Math.min(5_000, reviewRemaining(review))),
+        setTimeout(wake, Math.min(5_000, reviewWorkingRemaining(review))),
       );
     }
     if (terminalStatus !== "completed") {
@@ -1013,9 +1047,10 @@ async function runCloudReview(env: ReviewPiEnv, review: CloudReview) {
       };
       throw new Error("engine_failed");
     }
-    const finalStatus = await readArtifact(
-      sandbox,
-      `${directory}/out/status.json`,
+    const finalStatus = await reviewStep(
+      review,
+      "review final status",
+      readArtifact(sandbox, `${directory}/out/status.json`),
     );
     if (!finalStatus.exists || finalStatus.truncated)
       throw new Error("status_unavailable");
@@ -1025,7 +1060,11 @@ async function runCloudReview(env: ReviewPiEnv, review: CloudReview) {
       "status",
       JSON.parse(finalStatus.content),
     );
-    const output = await readArtifact(sandbox, `${directory}/out/receipt.json`);
+    const output = await reviewStep(
+      review,
+      "review receipt",
+      readArtifact(sandbox, `${directory}/out/receipt.json`),
+    );
     if (!output.exists || output.truncated)
       throw new Error("receipt_unavailable");
     receipt = JSON.parse(output.content);
@@ -1036,7 +1075,11 @@ async function runCloudReview(env: ReviewPiEnv, review: CloudReview) {
         ? "deadline"
         : messageOf(error);
   } finally {
-    await sandbox.clearProbeSessions().catch(() => undefined);
+    await bounded(
+      "review clear sessions",
+      sandbox.clearProbeSessions(),
+      REVIEW_SESSION_CLEAR_MS,
+    ).catch(() => undefined);
     const shutdown = await destroySandbox(sandbox);
     if (!shutdown.acknowledged) reason = `destroy_failed: ${shutdown.error}`;
     if (reason) await finishReview(env, review, reason, receipt, engineFailure);
