@@ -13,6 +13,7 @@
 
 import { readdir, readFile } from "node:fs/promises";
 import { dirname, join } from "node:path";
+import { GitHubRequestError } from "./github-app";
 
 export const REVIEW_EVENT = "COMMENT" as const;
 export const REVIEW_SIDE = "RIGHT" as const;
@@ -696,7 +697,10 @@ export async function fetchPullRevisions(
     { headers: githubHeaders(token, "application/vnd.github+json") },
   );
   if (!response.ok) {
-    throw new Error(`GitHub pull request request failed: ${response.status}`);
+    throw new GitHubRequestError(
+      `GitHub pull request request failed: ${response.status}`,
+      response.status,
+    );
   }
   return (await response.json()) as {
     state: string;
@@ -718,7 +722,10 @@ export async function fetchMergeBase(
     { headers: githubHeaders(token, "application/vnd.github+json") },
   );
   if (!response.ok) {
-    throw new Error(`GitHub three-dot compare failed: ${response.status}`);
+    throw new GitHubRequestError(
+      `GitHub three-dot compare failed: ${response.status}`,
+      response.status,
+    );
   }
   const compared = (await response.json()) as {
     merge_base_commit: { sha: string };
@@ -738,7 +745,10 @@ export async function fetchIsAncestor(
     { headers: githubHeaders(token, "application/vnd.github+json") },
   );
   if (!response.ok) {
-    throw new Error(`GitHub three-dot compare failed: ${response.status}`);
+    throw new GitHubRequestError(
+      `GitHub three-dot compare failed: ${response.status}`,
+      response.status,
+    );
   }
   const compared = (await response.json()) as { status: string };
   return compared.status === "ahead" || compared.status === "identical";
@@ -756,7 +766,10 @@ export async function fetchThreeDotDiff(
     { headers: githubHeaders(token, "application/vnd.github.v3.diff") },
   );
   if (!response.ok) {
-    throw new Error(`GitHub three-dot diff request failed: ${response.status}`);
+    throw new GitHubRequestError(
+      `GitHub three-dot diff request failed: ${response.status}`,
+      response.status,
+    );
   }
   return response.text();
 }
@@ -779,7 +792,10 @@ async function githubPages<T>(
       { headers: githubHeaders(token, "application/vnd.github+json") },
     );
     if (!response.ok) {
-      throw new Error(`GitHub ${what} request failed: ${response.status}`);
+      throw new GitHubRequestError(
+        `GitHub ${what} request failed: ${response.status}`,
+        response.status,
+      );
     }
     const batch = (await response.json()) as T[];
     entries.push(...batch);
@@ -878,8 +894,9 @@ export async function postReview(
   );
   const text = await response.text();
   if (!response.ok) {
-    throw new Error(
+    throw new GitHubRequestError(
       `GitHub review request failed: ${response.status}: ${text}`,
+      response.status,
     );
   }
   return JSON.parse(text) as { id: number; html_url: string };
@@ -905,8 +922,9 @@ export async function updateReviewBody(
     },
   );
   if (!response.ok) {
-    throw new Error(
+    throw new GitHubRequestError(
       `GitHub review update failed: ${response.status}: ${await response.text()}`,
+      response.status,
     );
   }
 }
@@ -1176,8 +1194,9 @@ export async function postIssueComment(
     },
   );
   if (!response.ok) {
-    throw new Error(
+    throw new GitHubRequestError(
       `GitHub comment request failed: ${response.status}: ${await response.text()}`,
+      response.status,
     );
   }
 }
@@ -1200,8 +1219,9 @@ export async function updateIssueComment(
     },
   );
   if (!response.ok) {
-    throw new Error(
+    throw new GitHubRequestError(
       `GitHub comment update failed: ${response.status}: ${await response.text()}`,
+      response.status,
     );
   }
 }
@@ -1219,8 +1239,9 @@ export async function deleteIssueComment(
     },
   );
   if (!response.ok) {
-    throw new Error(
+    throw new GitHubRequestError(
       `GitHub comment delete failed: ${response.status}: ${await response.text()}`,
+      response.status,
     );
   }
 }
@@ -1239,7 +1260,10 @@ export async function fetchViewerLogin(token: string) {
     body: JSON.stringify({ query: "query { viewer { login } }" }),
   });
   if (!response.ok) {
-    throw new Error(`GitHub viewer request failed: ${response.status}`);
+    throw new GitHubRequestError(
+      `GitHub viewer request failed: ${response.status}`,
+      response.status,
+    );
   }
   const parsed = (await response.json()) as {
     data?: { viewer?: { login?: unknown } | null } | null;

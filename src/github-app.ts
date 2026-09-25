@@ -8,6 +8,15 @@ const headers = (authorization: string) => ({
   "x-github-api-version": "2022-11-28",
 });
 
+export class GitHubRequestError extends Error {
+  constructor(
+    message: string,
+    readonly status: number,
+  ) {
+    super(message);
+  }
+}
+
 export type PullRequestEvent = {
   repository: string;
   number: number;
@@ -153,7 +162,11 @@ export async function installationToken(
       }),
     },
   );
-  if (!response.ok) throw new Error(`installation_token_${response.status}`);
+  if (!response.ok)
+    throw new GitHubRequestError(
+      `installation_token_${response.status}`,
+      response.status,
+    );
   const value: unknown = await response.json();
   if (
     typeof value !== "object" ||
@@ -190,7 +203,11 @@ export async function createCheck(
       },
     }),
   });
-  if (!response.ok) throw new Error(`create_check_${response.status}`);
+  if (!response.ok)
+    throw new GitHubRequestError(
+      `create_check_${response.status}`,
+      response.status,
+    );
   const value: unknown = await response.json();
   const id = (value as { id?: unknown })?.id;
   if (!Number.isSafeInteger(id)) throw new Error("invalid_check_run");
@@ -223,5 +240,9 @@ export async function completeCheck(
       }),
     },
   );
-  if (!response.ok) throw new Error(`update_check_${response.status}`);
+  if (!response.ok)
+    throw new GitHubRequestError(
+      `update_check_${response.status}`,
+      response.status,
+    );
 }
