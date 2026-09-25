@@ -112,8 +112,10 @@ export type SwarmReceipt = {
     /** The run dir this lane's artifacts sit in, one per launch. */
     runId?: string;
     role: string;
+    family?: string;
     model: string | null;
     status: string;
+    stopReason?: string | null;
     /** What the lane was pointed at; a reviewer lane names its angle. */
     focus?: string;
     blockerReason?: string | null;

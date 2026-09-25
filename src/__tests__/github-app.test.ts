@@ -461,7 +461,8 @@ describe("GitHub App webhook", () => {
         conclusion: "neutral",
         output: {
           title: "Swarm review could not complete",
-          summary: "Review could not complete: deadline.",
+          summary:
+            "Review could not complete: deadline.\n\nThe receipt names no lanes.",
         },
       }),
     ]);
@@ -625,6 +626,83 @@ describe("GitHub App webhook", () => {
       phase: "running",
       progress: "Phase: `reviewing`.",
     });
+  });
+
+  it("names each lane of a partial review in the final summary", async () => {
+    const { pr, r2, started } = fixture();
+    const gh = github();
+    const reviewId = await started();
+    r2.set(`reviews/${reviewId}/receipt.json`, {
+      ...receipt,
+      status: "partial",
+      lanes: [
+        {
+          laneId: "reviewer-1",
+          role: "reviewer",
+          family: "workers-ai",
+          model: "@cf/deepseek-ai/deepseek-v4-flash-0731",
+          status: "completed",
+          stopReason: "stop",
+          error: null,
+        },
+        {
+          laneId: "reviewer-2",
+          role: "reviewer",
+          family: "openai-codex",
+          model: "gpt-6-luna",
+          status: "cancelled",
+          stopReason: "review deadline",
+          error: "cut at `deadline` <b>",
+        },
+      ],
+    });
+    await pr.alarm();
+    expect(gh.posts()).toHaveLength(1);
+    expect(gh.checks()).toEqual([
+      expect.objectContaining({
+        conclusion: "success",
+        output: {
+          title: "Swarm review completed",
+          summary: [
+            "Review published at aaaaaaa. 2 confirmed finding(s).",
+            "",
+            "- `reviewer` `workers-ai` `@cf/deepseek-ai/deepseek-v4-flash-0731`: `completed`, stop reason `stop`",
+            "- `reviewer` `openai-codex` `gpt-6-luna`: `cancelled`, stop reason `review deadline`, error `cut at 'deadline' ‹b>`",
+          ].join("\n"),
+        },
+      }),
+    ]);
+  });
+
+  it("names each lane of a failed receipt and its failure", async () => {
+    const { pr, r2, started } = fixture();
+    const gh = github();
+    const reviewId = await started();
+    r2.set(`reviews/${reviewId}/receipt.json`, {
+      status: "failed",
+      failure: { stage: "cloud_review", message: "engine_failed" },
+      lanes: [
+        {
+          role: "reviewer",
+          family: "claude-code",
+          model: "claude-opus-5-5",
+          status: "failed",
+          stopReason: null,
+          error: "provider refused",
+        },
+      ],
+    });
+    await pr.alarm();
+    expect(gh.checks()).toEqual([
+      expect.objectContaining({
+        conclusion: "neutral",
+        output: {
+          title: "Swarm review could not complete",
+          summary:
+            "Review could not complete: engine_failed.\n\n- `reviewer` `claude-code` `claude-opus-5-5`: `failed`, error `provider refused`",
+        },
+      }),
+    ]);
   });
 
   it("binds a git capability to its allowed repository", async () => {

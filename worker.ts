@@ -140,6 +140,17 @@ const plain = (value: unknown) =>
     .replaceAll("`", "'")
     .replaceAll("<", "‹")}\``;
 
+const laneSummary = (receipt: SwarmReceipt) => {
+  const lanes = Array.isArray(receipt.lanes) ? receipt.lanes : [];
+  if (lanes.length === 0) return "The receipt names no lanes.";
+  return lanes
+    .map((lane) => {
+      const error = lane.error ?? lane.contractError ?? lane.blockerReason;
+      return `- ${plain(lane.role)} ${plain(lane.family)} ${plain(lane.model)}: ${plain(lane.status)}${lane.stopReason ? `, stop reason ${plain(lane.stopReason)}` : ""}${error ? `, error ${plain(error)}` : ""}`;
+    })
+    .join("\n");
+};
+
 const SUPERSEDED_SUMMARY = "A newer pull request event superseded this review.";
 
 const refusedForGood = (error: unknown) =>
@@ -368,12 +379,20 @@ export class PullRequestReview extends DurableObject<ReviewPiEnv> {
           token,
           state,
           "neutral",
-          `Review could not complete: ${receipt.failure?.message ?? "unknown reason"}.`,
+          `Review could not complete: ${receipt.failure?.message ?? `receipt status ${plain(receipt.status)}`}.\n\n${laneSummary(receipt)}`,
         );
         return false;
       }
       const published = await this.publish(token, state, receipt);
-      if (published) await this.finish(token, state, ...published);
+      if (published)
+        await this.finish(
+          token,
+          state,
+          published[0],
+          receipt.status === "partial"
+            ? `${published[1]}\n\n${laneSummary(receipt)}`
+            : published[1],
+        );
       return false;
     } catch (error) {
       if (!refusedForGood(error)) return retryAfter(error);
