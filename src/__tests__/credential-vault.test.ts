@@ -92,6 +92,42 @@ describe("credential vault", () => {
     ]);
   });
 
+  it("refreshes a pair that has not been refreshed for 8 days before it expires", async () => {
+    const current = jwt(Math.floor(Date.now() / 1000) + 3600, "current");
+    const next = jwt(Math.floor(Date.now() / 1000) + 7200, "new");
+    const { vault, values } = setup();
+    await vault.seed("openai-codex", {
+      ...auth(current),
+      last_refresh: new Date(Date.now() - 9 * 24 * 60 * 60_000).toISOString(),
+    });
+    const upstream = vi.fn<typeof fetch>(async (input, init) => {
+      expect(String(input)).toBe("https://auth.openai.com/oauth/token");
+      expect(init?.method).toBe("POST");
+      expect(new Headers(init?.headers).get("content-type")).toBe(
+        "application/json",
+      );
+      expect(JSON.parse(String(init?.body))).toEqual({
+        client_id: "app_EMoamEEZ73f0CkXaXp7hrann",
+        grant_type: "refresh_token",
+        refresh_token: "fake-refresh-old",
+      });
+      return Response.json({
+        access_token: next,
+        refresh_token: "fake-refresh-new",
+      });
+    });
+    vi.stubGlobal("fetch", upstream);
+    expect(await vault.credential("openai-codex")).toEqual({
+      authorization: `Bearer ${next}`,
+      accountId: "fake-account",
+    });
+    expect(upstream).toHaveBeenCalledOnce();
+    expect(values.get("openai-codex")).toMatchObject({
+      accessToken: next,
+      refreshToken: "fake-refresh-new",
+    });
+  });
+
   it("keeps the previous pair when refresh fails and names the failure", async () => {
     const old = jwt(Math.floor(Date.now() / 1000) + 60, "old");
     const { vault, values } = setup();
