@@ -14,6 +14,7 @@ type Stage =
   | "runner check"
   | "account lookup"
   | "registry login"
+  | "engine bundle"
   | "image pull"
   | "image build"
   | "image push"
@@ -177,7 +178,7 @@ export async function main(env: Env = process.env): Promise<void> {
         runEnv,
         `${required(env, "GITHUB_TOKEN")}\n`,
       );
-      stage = "image pull";
+      stage = "engine bundle";
       await run(
         "bun",
         [
@@ -190,6 +191,7 @@ export async function main(env: Env = process.env): Promise<void> {
         ],
         runEnv,
       );
+      stage = "image pull";
       const image = imageReference(
         repository,
         await imageTagFromFiles(
