@@ -6,11 +6,8 @@
   "name": "swarm-review",
   "main": "worker.ts",
   "compatibility_date": "2026-08-30",
-  // The repository every lane clones, as a clone URL. It is deliberately not
-  // set here: a Worker deployed without it refuses every run that needs an
-  // upstream with `target_repository_unset`, rather than silently reviewing the
-  // wrong repository. Set it with `wrangler deploy --var TARGET_REPOSITORY:<url>`
-  // or in the deployment's own configuration.
+  // Comma-separated allowed clone URLs, deliberately unset here. A Worker
+  // without the allowlist refuses every run. Set it at deployment.
   "compatibility_flags": ["nodejs_compat"],
   "observability": { "enabled": true },
   "r2_buckets": [
@@ -20,6 +17,7 @@
     "bindings": [
       { "name": "REVIEW_SANDBOX", "class_name": "ReviewSandbox" },
       { "name": "REVIEW_JOBS", "class_name": "ReviewJob" },
+      { "name": "PULL_REQUEST_REVIEWS", "class_name": "PullRequestReview" },
       { "name": "CREDENTIAL_VAULT", "class_name": "CredentialVaultObject" },
       { "name": "CODEX_RELAY", "class_name": "CodexRelaySandbox" }
     ]
@@ -28,7 +26,8 @@
     { "tag": "v1", "new_sqlite_classes": ["ReviewSandbox"] },
     { "tag": "v2", "new_sqlite_classes": ["CredentialVaultObject"] },
     { "tag": "v3", "new_sqlite_classes": ["CodexRelaySandbox"] },
-    { "tag": "v4", "new_sqlite_classes": ["ReviewJob"] }
+    { "tag": "v4", "new_sqlite_classes": ["ReviewJob"] },
+    { "tag": "v5", "new_sqlite_classes": ["PullRequestReview"] }
   ],
   "containers": [
     {

@@ -61,7 +61,7 @@ export const targetCheckout = (argv: string[]) => {
  * The target names a directory on this host to read manifests out of; wrangler
  * has no idea what it is, and passing it through fails the deploy. Everything
  * else is forwarded, which is how the repository a Worker serves is set:
- * `bun run deploy --target <checkout> --var TARGET_REPOSITORY:<clone url>`.
+ * `bun run deploy --target <checkout> --var TARGET_REPOSITORIES:<clone urls>`.
  */
 export const deployArguments = (argv: string[]) => {
   const flag = argv.indexOf("--target");

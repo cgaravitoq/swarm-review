@@ -105,11 +105,11 @@ Two things are yours to supply, and neither is in the source.
 The default brief carries only the framing that a reviewer is not a contributor, and says nothing about the tree.
 A brief written for one repository is wrong for the next one, so the repository being reviewed is the right place to keep it.
 
-**A target.** A deployed Worker clones through its own read-only Git proxy, and `TARGET_REPOSITORY` names the repository it serves.
+**A target.** A deployed Worker clones through its own read-only Git proxy, and `TARGET_REPOSITORIES` lists the clone URLs it may serve, separated by commas.
 It is deliberately unset in `wrangler.jsonc`: a Worker deployed without it refuses every run that needs an upstream instead of silently reviewing the wrong tree.
 
 ```sh
-bun run deploy --target /path/to/checkout --var TARGET_REPOSITORY:https://github.com/owner/name.git
+bun run deploy --target /path/to/checkout --var TARGET_REPOSITORIES:https://github.com/owner/name.git
 ```
 
 `--target` is read locally, to bake the target's lockfile into the image; every other flag goes to `wrangler deploy`.
@@ -152,7 +152,7 @@ The relay uses direct HTTPS because intercepted HTTPS returns a Worker-side 403 
 ## Cloud review
 
 The authenticated `POST /reviews` route accepts `{repository, pr, head, base, context?}` and returns `202 {reviewId}` after recording the initial status in R2 and scheduling a Durable Object alarm.
-The repository must match the deployed Worker's `TARGET_REPOSITORY`.
+The repository must be in the deployed Worker's `TARGET_REPOSITORIES` allowlist.
 The alarm uses one fresh Sandbox, clones the exact PR head through the read-only Git proxy, and runs the hybrid engine as `review-target` without installing the checkout's dependencies.
 Each reviewer and verifier family gets a separate capped model-proxy session.
 The deadline is eight minutes from admission; the engine has a shorter deadline so the Worker can store its partial receipt, including verified findings and cut lanes, before destroying the Sandbox.
@@ -161,6 +161,13 @@ If the engine produces no receipt, a failed or expired review records a failed r
 
 The deployment needs `WORKERS_AI_ACCOUNT_ID` and `WORKERS_AI_API_KEY` as Worker bindings, plus configured `openai-codex` and `claude-code` vault credentials.
 The deploy script bundles `src/swarm.ts` into the generated image context and supplies `IMAGE_SOURCE_HASHES` to the Worker, so the image fingerprint gate checks the engine before any model request.
+
+The GitHub App sends signed `pull_request` webhooks to `POST /github/webhook`.
+The Worker accepts `opened`, `reopened`, and `ready_for_review` for non-draft PRs authored by an owner, member, or collaborator in the allowlist.
+One Durable Object per PR deduplicates delivery IDs, starts the same cloud review after the webhook response, and publishes an advisory `swarm-review` check on the PR head.
+It completes with `success` and a finding count when the review finishes, or `neutral` with the failure reason.
+Set `GITHUB_APP_ID`, `GITHUB_APP_PRIVATE_KEY` (PKCS#8 PEM), and `GITHUB_WEBHOOK_SECRET` as Worker secrets before installing the App.
+The App installation token is restricted to the event's repository and replaces the read token for that review's git proxy requests.
 
 ## Operator probe
 
