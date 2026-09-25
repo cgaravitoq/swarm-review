@@ -43,6 +43,26 @@ describe("the image's Pi", () => {
     expect(dockerfile).toContain('"@cgaravitoq/pi-claude-code-auth@2.5.2"');
   });
 
+  // claude-code is a custom provider: models.json is its whole catalog, so a
+  // model the Worker names and the file lacks fails as an unknown model.
+  it("serves every claude-code model the Worker names", async () => {
+    const worker = await readFile(
+      fileURLToPath(new URL("../../worker.ts", import.meta.url)),
+      "utf8",
+    );
+    const named = [
+      ...worker.matchAll(/provider: "claude-code", model: "([^"]+)"/g),
+    ].map(([, model]) => model);
+    const models = JSON.parse(await containerFile("models.json")) as {
+      providers: Record<string, { models?: { id: string }[] }>;
+    };
+    const served = models.providers["claude-code"]?.models?.map(
+      (model) => model.id,
+    );
+    expect(named).toEqual(["claude-opus-5-5", "claude-opus-5"]);
+    for (const model of named) expect(served).toContain(model);
+  });
+
   it("defines gpt-6-luna in full, since Pi 0.85.1 has no built-in entry to override", async () => {
     const models = JSON.parse(await containerFile("models.json")) as {
       providers: Record<string, { models?: { id: string; api?: string }[] }>;
