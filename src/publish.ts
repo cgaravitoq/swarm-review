@@ -112,8 +112,10 @@ export type SwarmReceipt = {
     /** The run dir this lane's artifacts sit in, one per launch. */
     runId?: string;
     role: string;
+    family?: string;
     model: string | null;
     status: string;
+    stopReason?: string | null;
     /** What the lane was pointed at; a reviewer lane names its angle. */
     focus?: string;
     blockerReason?: string | null;
@@ -699,7 +701,7 @@ export async function fetchPullRevisions(
   if (!response.ok) {
     throw new GitHubRequestError(
       `GitHub pull request request failed: ${response.status}`,
-      response.status,
+      response,
     );
   }
   return (await response.json()) as {
@@ -724,7 +726,7 @@ export async function fetchMergeBase(
   if (!response.ok) {
     throw new GitHubRequestError(
       `GitHub three-dot compare failed: ${response.status}`,
-      response.status,
+      response,
     );
   }
   const compared = (await response.json()) as {
@@ -747,7 +749,7 @@ export async function fetchIsAncestor(
   if (!response.ok) {
     throw new GitHubRequestError(
       `GitHub three-dot compare failed: ${response.status}`,
-      response.status,
+      response,
     );
   }
   const compared = (await response.json()) as { status: string };
@@ -768,7 +770,7 @@ export async function fetchThreeDotDiff(
   if (!response.ok) {
     throw new GitHubRequestError(
       `GitHub three-dot diff request failed: ${response.status}`,
-      response.status,
+      response,
     );
   }
   return response.text();
@@ -794,7 +796,7 @@ async function githubPages<T>(
     if (!response.ok) {
       throw new GitHubRequestError(
         `GitHub ${what} request failed: ${response.status}`,
-        response.status,
+        response,
       );
     }
     const batch = (await response.json()) as T[];
@@ -896,7 +898,7 @@ export async function postReview(
   if (!response.ok) {
     throw new GitHubRequestError(
       `GitHub review request failed: ${response.status}: ${text}`,
-      response.status,
+      response,
     );
   }
   return JSON.parse(text) as { id: number; html_url: string };
@@ -924,7 +926,7 @@ export async function updateReviewBody(
   if (!response.ok) {
     throw new GitHubRequestError(
       `GitHub review update failed: ${response.status}: ${await response.text()}`,
-      response.status,
+      response,
     );
   }
 }
@@ -1196,7 +1198,7 @@ export async function postIssueComment(
   if (!response.ok) {
     throw new GitHubRequestError(
       `GitHub comment request failed: ${response.status}: ${await response.text()}`,
-      response.status,
+      response,
     );
   }
 }
@@ -1221,7 +1223,7 @@ export async function updateIssueComment(
   if (!response.ok) {
     throw new GitHubRequestError(
       `GitHub comment update failed: ${response.status}: ${await response.text()}`,
-      response.status,
+      response,
     );
   }
 }
@@ -1241,7 +1243,7 @@ export async function deleteIssueComment(
   if (!response.ok) {
     throw new GitHubRequestError(
       `GitHub comment delete failed: ${response.status}: ${await response.text()}`,
-      response.status,
+      response,
     );
   }
 }
@@ -1262,7 +1264,7 @@ export async function fetchViewerLogin(token: string) {
   if (!response.ok) {
     throw new GitHubRequestError(
       `GitHub viewer request failed: ${response.status}`,
-      response.status,
+      response,
     );
   }
   const parsed = (await response.json()) as {

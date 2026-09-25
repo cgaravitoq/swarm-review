@@ -64,7 +64,7 @@ For cloud runs without a caller bearer, `CREDENTIAL_VAULT` holds the Worker's su
 **The container cannot write to a repository.** `git-proxy.ts` forwards `git-upload-pack` and the ref advertisement, and nothing else.
 A push has no path through it even with the capability in hand.
 
-**A deployed Worker serves exactly one repository.** `TARGET_REPOSITORY` is unset in `wrangler.jsonc` on purpose, and a Worker deployed without it refuses every run rather than falling back.
+**A deployed Worker serves only the repositories it lists.** `TARGET_REPOSITORIES` is unset in `wrangler.jsonc` on purpose, and a Worker deployed without it refuses every run rather than falling back.
 Do not give it a default.
 
 **The image and the SDK move together.** The `cloudflare/sandbox` tag in `container/Dockerfile` must equal `@cloudflare/sandbox` in `package.json`.

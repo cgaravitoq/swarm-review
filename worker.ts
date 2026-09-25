@@ -26,6 +26,8 @@ import {
   openPull,
   type PullRequestEvent,
   pullRequestEvent,
+  readBrief,
+  updateCheck,
   verifyWebhook,
 } from "./src/github-app";
 import {
@@ -127,12 +129,39 @@ type AppReview = {
   acceptedAt: number;
   phase: "pending" | "running" | "publishing" | "done";
   outcome: string | null;
+  briefNote: string | null;
+  progress: string | null;
+};
+
+const plain = (value: unknown) =>
+  `\`${String(value ?? "none")
+    .replace(/\s+/g, " ")
+    .slice(0, 160)
+    .replaceAll("`", "'")
+    .replaceAll("<", "‹")}\``;
+
+const laneSummary = (receipt: SwarmReceipt) => {
+  const lanes = Array.isArray(receipt.lanes) ? receipt.lanes : [];
+  if (lanes.length === 0) return "The receipt names no lanes.";
+  return lanes
+    .map((lane: (typeof lanes)[number] | null) => {
+      const error = lane?.error ?? lane?.contractError ?? lane?.blockerReason;
+      return `- ${plain(lane?.role)} ${plain(lane?.family)} ${plain(lane?.model)}: ${plain(lane?.status)}${lane?.stopReason ? `, stop reason ${plain(lane.stopReason)}` : ""}${error ? `, error ${plain(error)}` : ""}`;
+    })
+    .join("\n");
 };
 
 const SUPERSEDED_SUMMARY = "A newer pull request event superseded this review.";
 
 const refusedForGood = (error: unknown) =>
-  error instanceof GitHubRequestError && [403, 404, 422].includes(error.status);
+  error instanceof GitHubRequestError &&
+  error.retryAt === null &&
+  [403, 404, 422].includes(error.status);
+
+const retryAfter = (error: unknown) =>
+  error instanceof GitHubRequestError && error.retryAt !== null
+    ? error.retryAt
+    : true;
 
 export class PullRequestReview extends DurableObject<ReviewPiEnv> {
   async accept(event: PullRequestEvent, delivery: string, origin: string) {
@@ -155,6 +184,8 @@ export class PullRequestReview extends DurableObject<ReviewPiEnv> {
       acceptedAt: Date.now(),
       phase: "pending",
       outcome: null,
+      briefNote: null,
+      progress: null,
     };
     await this.ctx.storage.put("current", state);
     await this.ctx.storage.setAlarm(Date.now());
@@ -172,19 +203,26 @@ export class PullRequestReview extends DurableObject<ReviewPiEnv> {
   }
 
   override async alarm() {
-    let retry = false;
+    let wakeAt = 0;
     for (const step of [
       () => this.retireSuperseded(),
       () => this.offerReviews(),
       () => this.advance(),
     ]) {
+      let retry: boolean | number;
       try {
-        retry = (await step()) || retry;
-      } catch {
-        retry = true;
+        retry = await step();
+      } catch (error) {
+        retry = retryAfter(error);
       }
+      if (retry !== false)
+        wakeAt = Math.max(
+          wakeAt,
+          Date.now() + 15_000,
+          retry === true ? 0 : retry,
+        );
     }
-    if (retry) await this.ctx.storage.setAlarm(Date.now() + 15_000);
+    if (wakeAt) await this.ctx.storage.setAlarm(wakeAt);
   }
 
   private token(event: PullRequestEvent) {
@@ -252,7 +290,7 @@ export class PullRequestReview extends DurableObject<ReviewPiEnv> {
     return left.length > 0;
   }
 
-  private async advance() {
+  private async advance(): Promise<boolean | number> {
     const state = await this.ctx.storage.get<AppReview>("current");
     if (!state || state.phase === "done") return false;
     try {
@@ -282,12 +320,15 @@ export class PullRequestReview extends DurableObject<ReviewPiEnv> {
           repository,
           installationId: state.event.installationId,
         });
+        const brief = await readBrief(token, repository, state.event.base);
+        state.briefNote = brief.note ?? null;
         await startReview(this.env, {
           reviewId,
           repository,
           pr: state.event.number,
           head: state.event.head,
           base: state.mergeBase,
+          ...(brief.context ? { context: brief.context } : {}),
           origin: state.origin,
           deadlineAt: new Date(Date.now() + REVIEW_DEADLINE_MS).toISOString(),
         });
@@ -306,8 +347,10 @@ export class PullRequestReview extends DurableObject<ReviewPiEnv> {
           !receiptObject ||
           !(await this.env.REVIEW_JOBS.getByName(state.reviewId!).isDone())
         ) {
-          if (Date.now() <= state.acceptedAt + REVIEW_DEADLINE_MS + 120_000)
+          if (Date.now() <= state.acceptedAt + REVIEW_DEADLINE_MS + 120_000) {
+            await this.reportProgress(token, state);
             return true;
+          }
           await this.finish(
             token,
             state,
@@ -319,26 +362,93 @@ export class PullRequestReview extends DurableObject<ReviewPiEnv> {
         state.phase = "publishing";
         if (!(await this.save(state))) return false;
       }
-      const receipt = await receiptObject!.json<SwarmReceipt>();
+      const receipt = await receiptObject!
+        .json<SwarmReceipt | null>()
+        .catch(() => null);
+      if (typeof receipt !== "object" || receipt === null) {
+        await this.finish(
+          token,
+          state,
+          "neutral",
+          "Review not published: the receipt is not a JSON object.",
+        );
+        return false;
+      }
       if (receipt.status !== "completed" && receipt.status !== "partial") {
         await this.finish(
           token,
           state,
           "neutral",
-          `Review could not complete: ${receipt.failure?.message ?? "unknown reason"}.`,
+          `Review could not complete: ${receipt.failure?.message ?? `receipt status ${plain(receipt.status)}`}.\n\n${laneSummary(receipt)}`,
         );
         return false;
       }
       const published = await this.publish(token, state, receipt);
-      if (published) await this.finish(token, state, ...published);
+      if (published)
+        await this.finish(
+          token,
+          state,
+          published[0],
+          receipt.status === "partial"
+            ? `${published[1]}\n\n${laneSummary(receipt)}`
+            : published[1],
+        );
       return false;
     } catch (error) {
-      if (!refusedForGood(error)) return true;
-      state.phase = "done";
-      state.outcome = messageOf(error);
-      await this.save(state);
+      if (!refusedForGood(error)) return retryAfter(error);
+      if (state.checkRunId === null) {
+        state.phase = "done";
+        state.outcome = messageOf(error);
+        await this.save(state);
+        return false;
+      }
+      try {
+        await this.finish(
+          await this.token(state.event),
+          state,
+          "neutral",
+          `Review could not complete: ${messageOf(error)}.`,
+        );
+      } catch (completion) {
+        if (!refusedForGood(completion)) return retryAfter(completion);
+        state.phase = "done";
+        state.outcome = messageOf(error);
+        await this.save(state);
+      }
       return false;
     }
+  }
+
+  private async reportProgress(token: string, state: AppReview) {
+    const status = await (
+      await this.env.PROBE_RESULTS.get(reviewKey(state.reviewId!, "status"))
+    )
+      ?.json<Record<string, unknown> | null>()
+      .catch(() => null);
+    if (typeof status !== "object" || status === null) return;
+    const reviewers = Array.isArray(status["reviewers"])
+      ? (status["reviewers"] as (Record<string, unknown> | null)[])
+      : [];
+    const progress = [
+      `Phase: ${plain(status["phase"])}.`,
+      ...reviewers.map(
+        (reviewer) =>
+          `- ${plain(reviewer?.["family"])} ${plain(reviewer?.["model"])}: ${plain(reviewer?.["state"])}`,
+      ),
+    ].join("\n");
+    if (progress === state.progress) return;
+    try {
+      await updateCheck(
+        token,
+        state.event.repository,
+        state.checkRunId!,
+        state.briefNote ? `${progress}\n\n${state.briefNote}` : progress,
+      );
+    } catch {
+      return;
+    }
+    state.progress = progress;
+    await this.save(state);
   }
 
   private async publish(
@@ -348,8 +458,17 @@ export class PullRequestReview extends DurableObject<ReviewPiEnv> {
   ): Promise<["success" | "neutral", string] | null> {
     const { repository, number } = state.event;
     const expected = { head: state.event.head, mergeBase: state.mergeBase! };
+    let confirmed: number;
     try {
       assertPublishableReceipt(receipt, expected);
+      buildReview(receipt, new Map(), repository);
+      confirmed = receipt.findings.filter(
+        (finding) => finding.status === "confirmed",
+      ).length;
+    } catch (error) {
+      return ["neutral", `Review not published: ${messageOf(error)}.`];
+    }
+    try {
       const validated = await revalidatePullRequest(
         repository,
         number,
@@ -357,9 +476,6 @@ export class PullRequestReview extends DurableObject<ReviewPiEnv> {
         expected,
         true,
       );
-      const confirmed = receipt.findings.filter(
-        (finding) => finding.status === "confirmed",
-      ).length;
       const summary = `Review published at ${expected.head.slice(0, 7)}. ${confirmed} confirmed finding(s).`;
       if (alreadyPublished(validated.reviews, receipt.swarmId, expected.head))
         return ["success", summary];
@@ -416,7 +532,7 @@ export class PullRequestReview extends DurableObject<ReviewPiEnv> {
       state.event.repository,
       state.checkRunId!,
       conclusion,
-      summary,
+      state.briefNote ? `${summary}\n\n${state.briefNote}` : summary,
     );
     state.phase = "done";
     state.outcome = summary;

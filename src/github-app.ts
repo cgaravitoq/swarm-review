@@ -9,12 +9,25 @@ const headers = (authorization: string) => ({
 });
 
 export class GitHubRequestError extends Error {
-  constructor(
-    message: string,
-    readonly status: number,
-  ) {
+  readonly status: number;
+  readonly retryAt: number | null;
+  constructor(message: string, response: Response) {
     super(message);
+    this.status = response.status;
+    this.retryAt = rateLimitedUntil(response, message);
   }
+}
+
+function rateLimitedUntil(response: Response, message: string) {
+  if (response.status !== 403 && response.status !== 429) return null;
+  const retryAfter = Number(response.headers.get("retry-after") ?? Number.NaN);
+  if (Number.isFinite(retryAfter)) return Date.now() + retryAfter * 1000;
+  const reset = Number(response.headers.get("x-ratelimit-reset") ?? Number.NaN);
+  if (response.headers.get("x-ratelimit-remaining") === "0")
+    return Number.isFinite(reset) ? reset * 1000 : Date.now() + 60_000;
+  return response.status === 429 || /rate limit/i.test(message)
+    ? Date.now() + 60_000
+    : null;
 }
 
 export type PullRequestEvent = {
@@ -191,10 +204,7 @@ export async function openPull(
     headers: headers(token),
   });
   if (!response.ok)
-    throw new GitHubRequestError(
-      `fetch_pull_${response.status}`,
-      response.status,
-    );
+    throw new GitHubRequestError(`fetch_pull_${response.status}`, response);
   const pull: unknown = await response.json();
   return (pull as { state?: unknown } | null)?.state === "open"
     ? reviewablePull(repository, number, pull, installationId)
@@ -254,7 +264,7 @@ export async function installationToken(
   if (!response.ok)
     throw new GitHubRequestError(
       `installation_token_${response.status}`,
-      response.status,
+      response,
     );
   const value: unknown = await response.json();
   if (
@@ -293,10 +303,7 @@ export async function createCheck(
     }),
   });
   if (!response.ok)
-    throw new GitHubRequestError(
-      `create_check_${response.status}`,
-      response.status,
-    );
+    throw new GitHubRequestError(`create_check_${response.status}`, response);
   const value: unknown = await response.json();
   const id = (value as { id?: unknown })?.id;
   if (!Number.isSafeInteger(id)) throw new Error("invalid_check_run");
@@ -331,10 +338,7 @@ export async function offerCheck(
     }),
   });
   if (!response.ok)
-    throw new GitHubRequestError(
-      `offer_check_${response.status}`,
-      response.status,
-    );
+    throw new GitHubRequestError(`offer_check_${response.status}`, response);
 }
 
 export async function completeCheck(
@@ -364,8 +368,58 @@ export async function completeCheck(
     },
   );
   if (!response.ok)
-    throw new GitHubRequestError(
-      `update_check_${response.status}`,
-      response.status,
+    throw new GitHubRequestError(`update_check_${response.status}`, response);
+}
+
+export const BRIEF_PATH = ".swarm-review/brief.md";
+export const BRIEF_MAX_CHARS = 64_000;
+
+export async function readBrief(
+  token: string,
+  repository: string,
+  base: string,
+): Promise<{ context?: string; note?: string }> {
+  const unused = (why: string) => ({
+    note: `The repository brief \`${BRIEF_PATH}\` ${why}, so the default brief steered this review.`,
+  });
+  try {
+    const response = await fetch(
+      `${api}/repos/${repository}/contents/${BRIEF_PATH}?ref=${base}`,
+      {
+        headers: {
+          ...headers(token),
+          accept: "application/vnd.github.raw+json",
+        },
+      },
     );
+    if (response.status === 404) return {};
+    if (!response.ok) return unused(`could not be read (${response.status})`);
+    const context = await response.text();
+    return context.length > BRIEF_MAX_CHARS
+      ? unused(`is over ${BRIEF_MAX_CHARS} characters`)
+      : { context };
+  } catch {
+    return unused("could not be read");
+  }
+}
+
+export async function updateCheck(
+  token: string,
+  repository: string,
+  checkRunId: number,
+  summary: string,
+): Promise<void> {
+  const response = await fetch(
+    `${api}/repos/${repository}/check-runs/${checkRunId}`,
+    {
+      method: "PATCH",
+      headers: headers(token),
+      body: JSON.stringify({
+        status: "in_progress",
+        output: { title: "Swarm review in progress", summary },
+      }),
+    },
+  );
+  if (!response.ok)
+    throw new GitHubRequestError(`update_check_${response.status}`, response);
 }
