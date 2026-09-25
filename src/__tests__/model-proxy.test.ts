@@ -308,6 +308,7 @@ describe("model proxy", () => {
       true,
       null,
       "review-pi-handle",
+      { httpStatus: 502, reason: "codex_relay_failed" },
     );
   });
 
@@ -339,6 +340,7 @@ describe("model proxy", () => {
           true,
           null,
           "review-pi-handle",
+          { httpStatus: 502, reason },
         );
       }
     }

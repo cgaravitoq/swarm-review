@@ -56,6 +56,9 @@ export type ModelTotals = {
   outputUnobserved?: number;
 };
 
+/** What the upstream answered, or the Worker's own reason when it refused. */
+export type ModelOutcome = { httpStatus: number | null; reason: string | null };
+
 export type ModelSession = {
   handle: string;
   upstreamBaseUrl: string;
@@ -66,6 +69,7 @@ export type ModelSession = {
   totals: ModelTotals;
   /** Set once an attempt failed the way a client repeats; the next one is a retry. */
   retryPending?: boolean;
+  lastOutcome?: ModelOutcome;
 };
 
 const hex = (buffer: ArrayBuffer) =>
@@ -292,7 +296,8 @@ export async function proxyModelFetch(
     usage: ModelUsage | null,
     retryable: boolean,
     seal: string | null,
-    handle?: string,
+    handle: string,
+    outcome: ModelOutcome,
   ) => Promise<void>,
   vaultCredential?: (
     provider: string,
@@ -385,30 +390,36 @@ export async function proxyModelFetch(
       upstream = await forward(credential.authorization, credential.accountId);
     }
   } catch (error) {
-    await recordAttempt(runId, null, true, null, handle);
-    if (error instanceof Error && error.message.startsWith("codex_relay_")) {
-      return jsonError(502, error.message);
-    }
-    if (provider) {
-      const reason =
-        error instanceof Error && error.message.startsWith("credential_")
-          ? error.message
-          : "credential_failed";
-      return jsonError(502, reason);
-    }
+    const message = error instanceof Error ? error.message : "";
+    const reason = message.startsWith("codex_relay_")
+      ? message
+      : provider
+        ? message.startsWith("credential_")
+          ? message
+          : "credential_failed"
+        : null;
+    await recordAttempt(runId, null, true, null, handle, {
+      httpStatus: reason ? 502 : null,
+      reason: reason ?? "upstream_fetch_failed",
+    });
+    if (reason) return jsonError(502, reason);
     throw error;
   }
   if (provider && upstream.status === 401) {
     await upstream.body?.cancel();
-    await recordAttempt(runId, null, false, null, handle);
+    await recordAttempt(runId, null, false, null, handle, {
+      httpStatus: 502,
+      reason: "credential_upstream_unauthorized",
+    });
     return jsonError(502, "credential_upstream_unauthorized");
   }
   const retryable = retryableFailure(upstream.status);
+  const outcome = { httpStatus: upstream.status, reason: null };
   const responseHeaders = new Headers(upstream.headers);
   responseHeaders.delete("content-encoding");
   responseHeaders.delete("content-length");
   if (!upstream.body) {
-    await recordAttempt(runId, null, retryable, null, handle);
+    await recordAttempt(runId, null, retryable, null, handle, outcome);
     return new Response(null, {
       status: upstream.status,
       headers: responseHeaders,
@@ -434,6 +445,7 @@ export async function proxyModelFetch(
         retryable,
         sealer.seal(),
         handle,
+        outcome,
       );
     },
   });

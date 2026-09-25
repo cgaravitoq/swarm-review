@@ -245,7 +245,15 @@ describe("operator probe", () => {
   });
 
   const setup = (
-    failure?: "cold" | "clone" | "claude" | "relay" | "session" | "pi-exit",
+    failure?:
+      | "cold"
+      | "clone"
+      | "claude"
+      | "cap"
+      | "relay"
+      | "codex-400"
+      | "session"
+      | "pi-exit",
   ) => {
     const files = new Map<string, string>([
       ["/opt/review/pi-config/models.json", laneModelsJson],
@@ -310,6 +318,10 @@ describe("operator probe", () => {
           family: "openai-codex",
         });
         if (failure === "relay") throw new Error("relay unavailable");
+        if (failure === "codex-400")
+          return new Response(JSON.stringify({ detail: "Unsupported model" }), {
+            status: 400,
+          });
         return new Response(
           JSON.stringify({
             status: "completed",
@@ -345,7 +357,7 @@ describe("operator probe", () => {
         "Bearer fake-claude-code-bearer",
       );
       expect(body).toEqual({ model: "claude-opus-5", family: "claude-code" });
-      return failure === "claude"
+      return failure === "claude" || failure === "cap"
         ? new Response("upstream failure", { status: 503 })
         : new Response("{}");
     });
@@ -368,18 +380,52 @@ describe("operator probe", () => {
         const configured = JSON.parse(
           files.get(`${directory}/models.json`) ?? "{}",
         ).providers[provider];
-        const response = await handler.fetch(
-          new Request(`${configured.baseUrl}${PI_PATHS.get(family)}`, {
-            method: "POST",
-            headers: {
-              authorization: `Bearer ${configured.apiKey}`,
-              "content-type": "application/json",
-            },
-            body: JSON.stringify({ model, family }),
-          }),
-          probeEnv,
+        const url = `${configured.baseUrl}${PI_PATHS.get(family)}`;
+        const authorization = `Bearer ${configured.apiKey}`;
+        // Pi retries a retryable assistant error unless its agent dir's
+        // settings turn retries off, and its openai-codex transport tries a
+        // WebSocket before the streamed POST.
+        const settings = JSON.parse(
+          files.get(`${directory}/settings.json`) ?? "{}",
         );
-        const text = await response.text();
+        const retries =
+          failure === "cap" && family === "claude-code"
+            ? 3
+            : (settings.retry?.enabled ?? true)
+              ? (settings.retry?.maxRetries ?? 3)
+              : 0;
+        let response: Response;
+        let text: string;
+        let attempt = 0;
+        do {
+          if (family === "openai-codex") {
+            await (
+              await handler.fetch(
+                new Request(url, {
+                  method: "GET",
+                  headers: { authorization, upgrade: "websocket" },
+                }),
+                probeEnv,
+              )
+            ).text();
+          }
+          response = await handler.fetch(
+            new Request(url, {
+              method: "POST",
+              headers: {
+                authorization,
+                "content-type": "application/json",
+              },
+              body: JSON.stringify({ model, family }),
+            }),
+            probeEnv,
+          );
+          text = await response.text();
+          attempt += 1;
+        } while (
+          attempt <= retries &&
+          (response.status === 429 || response.status >= 500)
+        );
         files.set(
           `${directory}/events.jsonl`,
           piEvents(
@@ -469,6 +515,7 @@ describe("operator probe", () => {
     expect(fixture.relay.containerFetch).toHaveBeenCalledOnce();
     expect(fixture.vault.credential.mock.calls.map((call) => call[0])).toEqual([
       "openai-codex",
+      "openai-codex",
       "claude-code",
     ]);
     const piCommands = fixture.exec.mock.calls
@@ -506,6 +553,11 @@ describe("operator probe", () => {
         ...lane[provider],
         apiKey,
         baseUrl: `https://review.invalid/model/${body.runId}/${capability}`,
+      });
+      expect(
+        JSON.parse(fixture.files.get(`${directory}/settings.json`) ?? ""),
+      ).toEqual({
+        retry: { enabled: false, provider: { maxRetries: 0 } },
       });
       handles.push(apiKey);
     }
@@ -560,6 +612,8 @@ describe("operator probe", () => {
       expect(phase.status).toBe("ok");
       expect(phase.durationMs).toBeGreaterThan(0);
     }
+    for (const family of Object.values(receipt.models))
+      expect(family).toMatchObject({ httpStatus: 200, reason: null });
     expect(raw).not.toContain("fake-workers-bearer");
     expect(raw).not.toContain("fake-openai-codex-bearer");
     expect(JSON.stringify([...fixture.files.values()])).not.toContain(
@@ -638,7 +692,15 @@ describe("operator probe", () => {
     ).toBe("probe-handle");
   });
 
-  it.each(["cold", "clone", "claude", "relay", "session"] as const)(
+  it.each([
+    "cold",
+    "clone",
+    "claude",
+    "cap",
+    "relay",
+    "codex-400",
+    "session",
+  ] as const)(
     "destroys after %s failure and records the failed phase",
     async (failure) => {
       const fixture = setup(failure);
@@ -668,7 +730,11 @@ describe("operator probe", () => {
           status: "failed",
           phase: "git_clone",
         });
+      const anthropicAttempts = fixture.direct.mock.calls.filter((call) =>
+        String(call[0]).startsWith("https://api.anthropic.com/"),
+      ).length;
       if (failure === "claude") {
+        expect(anthropicAttempts).toBe(1);
         expect(receipt.models["claude-code"]).toMatchObject({
           status: "failed",
           phase: "model_request",
@@ -678,12 +744,23 @@ describe("operator probe", () => {
         expect(receipt.models["workers-ai"].status).toBe("ok");
         expect(receipt.models["openai-codex"].status).toBe("ok");
       }
-      if (failure === "relay") {
+      if (failure === "cap") {
+        expect(anthropicAttempts).toBe(2);
+        expect(receipt.models["claude-code"]).toMatchObject({
+          status: "failed",
+          phase: "model_request",
+          httpStatus: 429,
+          reason: "max_requests",
+        });
+      }
+      if (failure === "relay" || failure === "codex-400") {
+        expect(fixture.relay.containerFetch).toHaveBeenCalledOnce();
         expect(receipt.models["openai-codex"]).toMatchObject({
           status: "failed",
           phase: "model_request",
-          httpStatus: null,
-          reason: "model_error",
+          ...(failure === "relay"
+            ? { httpStatus: 502, reason: "codex_relay_failed" }
+            : { httpStatus: 400, reason: "model_error" }),
         });
         expect(receipt.models["workers-ai"].status).toBe("ok");
         expect(receipt.models["claude-code"].status).toBe("ok");

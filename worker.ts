@@ -38,6 +38,7 @@ import {
 } from "./src/isolation";
 import {
   emptyModelTotals,
+  type ModelOutcome,
   type ModelSession,
   type ModelUsage,
   modelCapability,
@@ -89,6 +90,11 @@ export class ReviewSandbox extends Sandbox<ReviewPiEnv> {
     await this.ctx.storage.put(PROBE_SESSIONS_KEY, sessions);
   }
 
+  async probeOutcome(handle: string) {
+    const { session } = await this.sessionFor(handle);
+    return session?.lastOutcome ?? null;
+  }
+
   async clearProbeSessions() {
     await this.ctx.storage.delete(PROBE_SESSIONS_KEY);
   }
@@ -118,7 +124,13 @@ export class ReviewSandbox extends Sandbox<ReviewPiEnv> {
       session.caps,
       session.retryPending === true,
     );
-    if (refusal) return { ok: false as const, reason: refusal };
+    if (refusal) {
+      if (probes) {
+        session.lastOutcome = { httpStatus: 429, reason: refusal };
+        await this.ctx.storage.put(PROBE_SESSIONS_KEY, probes);
+      }
+      return { ok: false as const, reason: refusal };
+    }
     session.retryPending = false;
     if (probes) await this.ctx.storage.put(PROBE_SESSIONS_KEY, probes);
     else await this.ctx.storage.put(MODEL_SESSION_KEY, session);
@@ -129,7 +141,8 @@ export class ReviewSandbox extends Sandbox<ReviewPiEnv> {
     usage: ModelUsage | null,
     retryable: boolean,
     seal: string | null,
-    handle?: string,
+    handle: string,
+    outcome: ModelOutcome,
   ) {
     const { session, probes } = await this.sessionFor(handle);
     if (!session) return;
@@ -147,9 +160,12 @@ export class ReviewSandbox extends Sandbox<ReviewPiEnv> {
     }
     if (session.totals.unended !== undefined) session.totals.unended -= 1;
     session.retryPending = retryable;
-    if (probes) await this.ctx.storage.put(PROBE_SESSIONS_KEY, probes);
-    else await this.ctx.storage.put(MODEL_SESSION_KEY, session);
-    if (probes) return;
+    if (probes) {
+      session.lastOutcome = outcome;
+      await this.ctx.storage.put(PROBE_SESSIONS_KEY, probes);
+      return;
+    }
+    await this.ctx.storage.put(MODEL_SESSION_KEY, session);
     await this.ctx.storage.put(MODEL_SEALS_KEY, [
       ...((await this.modelSeals()) ?? []),
       seal,
@@ -358,8 +374,12 @@ const elapsed = (start: number) => {
 
 // Pi sends a lane's whole request, tools and system prompt included, so the
 // probe spends a lane's caps. Two requests cover Pi's openai-codex transport,
-// which tries a WebSocket before it falls back to a streamed POST.
+// which tries a WebSocket before it falls back to a streamed POST; Pi's own
+// retries are off, so a retry never spends the slot that names the failure.
 const probeCaps = { ...SESSION_CAPS.t1b, maxRequests: 2 };
+const PI_PROBE_SETTINGS = JSON.stringify({
+  retry: { enabled: false, provider: { maxRetries: 0 } },
+});
 
 const PI_PROBE_FAMILIES = {
   "workers-ai": {
@@ -391,11 +411,9 @@ const piProbeCommand = (
   return `cd ${posixQuote(directory)} && ${asTarget} env HOME=/home/review-target PI_OFFLINE=1 PI_SKIP_VERSION_CHECK=1 ${account}PI_CODING_AGENT_DIR=${posixQuote(directory)} timeout -k 5 ${PI_PROBE_SECONDS} pi --provider ${posixQuote(provider)} --model ${posixQuote(model)} --thinking high --mode json --print --no-session --no-extensions --no-skills --no-prompt-templates --approve${extension} -- ${posixQuote("Reply with exactly pong and nothing else.")} < /dev/null > events.jsonl 2> pi.stderr`;
 };
 
-// The same reading `validate_review_events` gives a lane's stream, plus the
-// HTTP status Pi puts at the head of a provider error message.
+// The same reading `validate_review_events` gives a lane's stream.
 const PI_SUMMARY = `([.[] | select(.type == "turn_end")] | last | .message) as $m
 | {stopReason: ($m.stopReason // null),
-   httpStatus: (($m.errorMessage // "") | (capture("^(?<code>[1-5][0-9][0-9])\\\\b").code | tonumber)? // null),
    hasFinal: (([.[] | select(.type == "agent_end")] | last | (.messages // [])
      | map(select(.role == "assistant")) | last | (.content // [])
      | map(select(.type == "text") | .text) | join("\\n") | test("\\\\S")) // false)}`;
@@ -412,10 +430,6 @@ const parsePiSummary = (stdout: string) => {
       stopReason:
         typeof summary["stopReason"] === "string"
           ? summary["stopReason"]
-          : null,
-      httpStatus:
-        typeof summary["httpStatus"] === "number"
-          ? summary["httpStatus"]
           : null,
       hasFinal: summary["hasFinal"] === true,
     };
@@ -628,6 +642,13 @@ async function operatorProbe(
               ),
             );
             await bounded(
+              "probe pi settings",
+              sandbox.writeFile(
+                `${piDirectory}/settings.json`,
+                PI_PROBE_SETTINGS,
+              ),
+            );
+            await bounded(
               "probe pi ownership",
               sandbox.exec(targetChownCommand(piDirectory)),
             );
@@ -637,12 +658,16 @@ async function operatorProbe(
               sandbox.exec(piProbeCommand(piDirectory, family, accountId)),
               (PI_PROBE_SECONDS + 15) * 1000,
             );
+            const observed = await bounded(
+              "probe outcome",
+              sandbox.probeOutcome(handles[family]),
+            );
             if (pi.exitCode !== 0) {
               models[family] = {
                 status: "failed",
                 ...elapsed(start),
                 phase,
-                httpStatus: null,
+                httpStatus: observed?.httpStatus ?? null,
                 reason:
                   pi.exitCode === 124 || pi.exitCode === 137
                     ? "pi_timeout"
@@ -666,22 +691,21 @@ async function operatorProbe(
               };
               continue;
             }
-            const reason =
-              outcome.stopReason === "error" || outcome.stopReason === "aborted"
-                ? "model_error"
-                : outcome.stopReason !== "stop"
-                  ? "incomplete_result"
-                  : outcome.hasFinal
-                    ? null
-                    : "empty_result";
+            const refused =
+              outcome.stopReason === "error" ||
+              outcome.stopReason === "aborted";
+            const reason = refused
+              ? (observed?.reason ?? "model_error")
+              : outcome.stopReason !== "stop"
+                ? "incomplete_result"
+                : outcome.hasFinal
+                  ? null
+                  : "empty_result";
             models[family] = {
               status: reason ? "failed" : "ok",
               ...elapsed(start),
-              phase:
-                reason === "model_error"
-                  ? "model_request"
-                  : "response_interpret",
-              httpStatus: outcome.httpStatus,
+              phase: refused ? "model_request" : "response_interpret",
+              httpStatus: observed?.httpStatus ?? null,
               reason,
             };
           } catch {
@@ -782,12 +806,13 @@ export default {
           getSandbox(env.REVIEW_SANDBOX, runId).openModelSession(handle),
         async (runId, handle) =>
           getSandbox(env.REVIEW_SANDBOX, runId).consumeModelAttempt(handle),
-        async (runId, usage, retryable, seal, handle) =>
+        async (runId, usage, retryable, seal, handle, outcome) =>
           getSandbox(env.REVIEW_SANDBOX, runId).recordModelAttempt(
             usage,
             retryable,
             seal,
             handle,
+            outcome,
           ),
         (provider, rejectedAccessToken) =>
           env.CREDENTIAL_VAULT.getByName("worker").credential(
