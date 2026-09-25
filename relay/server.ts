@@ -23,6 +23,9 @@ export function createCodexRelayHandler(fetchUpstream: typeof fetch = fetch) {
     const headers = new Headers(request.headers);
     headers.delete("host");
     headers.delete("content-length");
+    for (const name of Array.from(headers.keys())) {
+      if (name.startsWith("cf-")) headers.delete(name);
+    }
     let response: Response;
     try {
       response = await fetchUpstream(UPSTREAM, {
