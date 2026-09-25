@@ -438,8 +438,11 @@ describe("operator probe", () => {
     };
   };
 
-  it("runs exactly one request per family through the model proxy and stores a timed R2 receipt", async () => {
+  it("runs Pi once per family through the model proxy and stores a timed R2 receipt", async () => {
     const fixture = setup();
+    const logs = (["log", "info", "warn", "error", "debug"] as const).map(
+      (method) => vi.spyOn(console, method),
+    );
     const response = await handler.fetch(
       authorized("https://review.invalid/probe", {
         method: "POST",
@@ -447,6 +450,14 @@ describe("operator probe", () => {
       }),
       fixture.probeEnv,
     );
+    const logged = JSON.stringify(logs.map((log) => log.mock.calls));
+    for (const log of logs) log.mockRestore();
+    for (const bearer of [
+      "fake-workers-bearer",
+      "fake-openai-codex-bearer",
+      "fake-claude-code-bearer",
+    ])
+      expect(logged).not.toContain(bearer);
     expect(response.status).toBe(200);
     const body = (await response.json()) as { runId: string };
     expect(body).toEqual({
@@ -507,9 +518,13 @@ describe("operator probe", () => {
       ],
     ).toEqual({ chatgpt_account_id: "review-pi" });
     expect(handles[2]).toMatch(/^review-pi-[0-9a-f-]{36}$/);
-    expect(
-      fixture.exec.mock.calls.find((call) => call[0].includes("git -c"))?.[0],
-    ).toContain("clone --depth 1 --no-tags");
+    const cloneCommand = fixture.exec.mock.calls.find((call) =>
+      call[0].includes("git -c"),
+    )?.[0];
+    expect(cloneCommand).toMatch(
+      /^setpriv --reuid=1102 --regid=1102 --clear-groups git /,
+    );
+    expect(cloneCommand).toContain("clone --depth 1 --no-tags");
     expect(fixture.object.put).toHaveBeenCalledOnce();
     const [key, raw] = fixture.object.put.mock.calls[0] ?? [];
     expect(key).toBe(`probes/${body.runId}.json`);
@@ -554,7 +569,73 @@ describe("operator probe", () => {
       "fake-workers-bearer",
     );
     expect(fixture.stored.has("probeSessions")).toBe(false);
+    expect(fixture.stored.get("modelSeals")).toBeUndefined();
     expect(fixture.destroy).toHaveBeenCalledOnce();
+  });
+
+  it("records a family whose Pi exits nonzero without hiding the families after it", async () => {
+    const fixture = setup("pi-exit");
+    await handler.fetch(
+      authorized("https://review.invalid/probe", {
+        method: "POST",
+        body: JSON.stringify(input()),
+      }),
+      fixture.probeEnv,
+    );
+    const receipt = JSON.parse(fixture.object.put.mock.calls[0]?.[1] ?? "");
+    expect(receipt.models["workers-ai"]).toMatchObject({
+      status: "failed",
+      phase: "model_request",
+      httpStatus: null,
+      reason: "pi_exit",
+    });
+    expect(receipt.models["openai-codex"].status).toBe("ok");
+    expect(receipt.models["claude-code"].status).toBe("ok");
+    expect(fixture.destroy).toHaveBeenCalledOnce();
+  });
+
+  it("refuses to overwrite an existing receipt before starting a Sandbox", async () => {
+    const fixture = setup();
+    fixture.object.head.mockResolvedValueOnce({} as never);
+    const response = await handler.fetch(
+      authorized("https://review.invalid/probe", {
+        method: "POST",
+        body: JSON.stringify(input()),
+      }),
+      fixture.probeEnv,
+    );
+    expect(response.status).toBe(409);
+    expect(await response.json()).toEqual({ error: "probe_exists" });
+    expect(fixture.exec).not.toHaveBeenCalled();
+    expect(fixture.object.put).not.toHaveBeenCalled();
+    expect(fixture.destroy).not.toHaveBeenCalled();
+  });
+
+  it("keeps probe sessions apart from a run's own model session", async () => {
+    const fixture = setup();
+    const probe = {
+      handle: "probe-handle",
+      upstreamBaseUrl: "https://api.anthropic.com",
+      credentialProvider: "claude-code",
+      caps: {
+        maxRequests: 1,
+        maxRetriesPerRequest: 0,
+        maxCumulativeInputTokens: 1,
+        maxCumulativeOutputTokens: 1,
+        maxRequestBytes: 1,
+      },
+      totals: emptyModelTotals(),
+    };
+    await fixture.sandbox.putModelSession({ ...probe, handle: "run" });
+    await fixture.sandbox.putProbeSessions({ "probe-handle": probe });
+    expect(await fixture.sandbox.openModelSession("run")).toBeNull();
+    expect(await fixture.sandbox.consumeModelAttempt("run")).toEqual({
+      ok: false,
+      reason: "no_session",
+    });
+    expect(
+      (await fixture.sandbox.openModelSession("probe-handle"))?.handle,
+    ).toBe("probe-handle");
   });
 
   it.each(["cold", "clone", "claude", "relay", "session"] as const)(
