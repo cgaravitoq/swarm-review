@@ -356,6 +356,28 @@ describe("model proxy", () => {
     error.mockRestore();
   });
 
+  it("drops the encoding headers of a body the relay's fetch already decoded", async () => {
+    const response = await createCodexRelayHandler(
+      async () =>
+        new Response("decoded answer", {
+          headers: {
+            "content-encoding": "gzip",
+            "content-length": "3",
+            "content-type": "text/event-stream",
+          },
+        }),
+    )(
+      new Request("http://relay/codex/responses", {
+        method: "POST",
+        body: "{}",
+      }),
+    );
+    expect(response.headers.has("content-encoding")).toBe(false);
+    expect(response.headers.has("content-length")).toBe(false);
+    expect(response.headers.get("content-type")).toBe("text/event-stream");
+    expect(await response.text()).toBe("decoded answer");
+  });
+
   it("leaves other upstreams on the direct fetch path", async () => {
     const url = await proxyTarget("direct-run");
     const direct = vi.fn<typeof fetch>(async () => new Response("direct"));

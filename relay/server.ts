@@ -38,7 +38,14 @@ export function createCodexRelayHandler(fetchUpstream: typeof fetch = fetch) {
         { status: 502 },
       );
     }
-    return new Response(response.body, response);
+    const responseHeaders = new Headers(response.headers);
+    responseHeaders.delete("content-encoding");
+    responseHeaders.delete("content-length");
+    return new Response(response.body, {
+      status: response.status,
+      statusText: response.statusText,
+      headers: responseHeaders,
+    });
   };
 }
 
