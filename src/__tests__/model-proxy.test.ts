@@ -164,11 +164,170 @@ describe("model proxy", () => {
       runId,
       { input: 4, output: 2 },
       false,
-      null,
+      createHash("sha256").update("pong").digest("hex"),
       "review-pi-handle",
       { httpStatus: 200, reason: null },
     );
     expect(containerFetch).toHaveBeenCalledOnce();
+  });
+
+  it.each([
+    {
+      name: "cancel after response.completed",
+      stopAfterFirst: true,
+      firstIsTerminal: true,
+    },
+    {
+      name: "cancel before response.completed",
+      stopAfterFirst: true,
+      firstIsTerminal: false,
+    },
+    {
+      name: "read through response.completed",
+      stopAfterFirst: false,
+      firstIsTerminal: false,
+    },
+  ])(
+    "records a Codex stream when readers $name",
+    async ({ stopAfterFirst, firstIsTerminal }) => {
+      const runId = "codex-terminal-run";
+      const capability = await modelCapability(runId, "control-secret");
+      const url = new URL(
+        `https://review.invalid/model/${runId}/${capability}/codex/responses`,
+      );
+      const delta =
+        'data: {"type":"response.output_text.delta","output_index":0,"delta":"pong"}\n\n';
+      const terminal =
+        'data: {"type":"response.completed","response":{"usage":{"input_tokens":4,"output_tokens":2}}}\n\n';
+      const frames = firstIsTerminal ? [delta + terminal] : [delta, terminal];
+      const upstream = vi.fn<typeof fetch>(async (input, init) => {
+        expect(String(input)).toBe("https://api.x.ai/v1/codex/responses");
+        expect(init?.method).toBe("POST");
+        expect(new Headers(init?.headers).get("authorization")).toBe(
+          "Bearer real-secret",
+        );
+        expect(await new Response(init?.body).text()).toBe("{}");
+        let index = 0;
+        return new Response(
+          new ReadableStream<Uint8Array>({
+            pull(controller) {
+              const frame = frames[index++];
+              if (frame === undefined) controller.close();
+              else controller.enqueue(new TextEncoder().encode(frame));
+            },
+          }),
+          { headers: { "content-type": "text/event-stream" } },
+        );
+      });
+      vi.stubGlobal("fetch", upstream);
+      const recorded = vi.fn(async () => undefined);
+      const response = await proxyModelFetch(
+        new Request(url, {
+          method: "POST",
+          headers: { authorization: "Bearer review-pi-handle" },
+          body: "{}",
+        }),
+        url,
+        "control-secret",
+        sessionOpener(),
+        sessionConsumer(),
+        recorded,
+      );
+      if (stopAfterFirst) {
+        const reader = response.body?.getReader();
+        expect(new TextDecoder().decode((await reader?.read())?.value)).toBe(
+          frames[0],
+        );
+        await reader?.cancel();
+      } else {
+        expect(await response.text()).toBe(delta + terminal);
+      }
+      expect(recorded).toHaveBeenCalledOnce();
+      expect(recorded).toHaveBeenCalledWith(
+        runId,
+        stopAfterFirst && !firstIsTerminal
+          ? { input: null, output: null }
+          : { input: 4, output: 2 },
+        false,
+        stopAfterFirst && !firstIsTerminal
+          ? null
+          : createHash("sha256").update("pong").digest("hex"),
+        "review-pi-handle",
+        { httpStatus: 200, reason: null },
+      );
+      expect(upstream).toHaveBeenCalledOnce();
+    },
+  );
+
+  it.each([
+    {
+      name: "Anthropic message_stop",
+      body: `${[
+        'data: {"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}',
+        'data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"pong"}}',
+        'data: {"type":"message_delta","usage":{"input_tokens":4,"output_tokens":2}}',
+        'data: {"type":"message_stop"}',
+      ].join("\n\n")}\n\n`,
+      complete: true,
+    },
+    {
+      name: "Anthropic message_delta before message_stop",
+      body: `${[
+        'data: {"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}',
+        'data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"pong"}}',
+        'data: {"type":"message_delta","usage":{"input_tokens":4,"output_tokens":2}}',
+      ].join("\n\n")}\n\n`,
+      complete: false,
+    },
+    {
+      name: "chat [DONE]",
+      body: `${[
+        'data: {"choices":[{"delta":{"content":"pong"}}],"usage":{"prompt_tokens":4,"completion_tokens":2}}',
+        "data: [DONE]",
+      ].join("\n\n")}\n\n`,
+      complete: true,
+    },
+  ])("records a stream cancelled after $name", async ({ body, complete }) => {
+    const url = await proxyTarget("other-terminal-run");
+    vi.stubGlobal(
+      "fetch",
+      vi.fn<typeof fetch>(async (input, init) => {
+        expect(String(input)).toBe("https://api.x.ai/v1/chat/completions");
+        expect(init?.method).toBe("POST");
+        expect(new Headers(init?.headers).get("authorization")).toBe(
+          "Bearer real-secret",
+        );
+        expect(await new Response(init?.body).text()).toBe("{}");
+        return new Response(body, {
+          headers: { "content-type": "text/event-stream" },
+        });
+      }),
+    );
+    const recorded = vi.fn(async () => undefined);
+    const response = await proxyModelFetch(
+      new Request(url, {
+        method: "POST",
+        headers: { authorization: "Bearer review-pi-handle" },
+        body: "{}",
+      }),
+      url,
+      "control-secret",
+      sessionOpener(),
+      sessionConsumer(),
+      recorded,
+    );
+    const reader = response.body?.getReader();
+    expect(new TextDecoder().decode((await reader?.read())?.value)).toBe(body);
+    await reader?.cancel();
+    expect(recorded).toHaveBeenCalledOnce();
+    expect(recorded).toHaveBeenCalledWith(
+      "other-terminal-run",
+      complete ? { input: 4, output: 2 } : { input: null, output: null },
+      false,
+      complete ? createHash("sha256").update("pong").digest("hex") : null,
+      "review-pi-handle",
+      { httpStatus: 200, reason: null },
+    );
   });
 
   it("observes a streamed response's status before its normal end and records it once", async () => {
