@@ -71,7 +71,7 @@ const event = (data) => process.stdout.write(JSON.stringify(data) + "\\n");
 if ((process.env.PI_HANG === "cap" || process.env.PI_HANG === "time") && !reportTurn) {
   setInterval(() => {
     event({type:"turn_start"});
-    event({type:"turn_end",message:{stopReason:"tool_use",usage:{input:1,output:1,totalTokens:2}}});
+    event({type:"turn_end",message:{stopReason:"toolUse",usage:{input:1,output:1,totalTokens:2}}});
   }, process.env.PI_HANG === "time" ? 300 : 20);
 } else if (process.env.PI_HANG === "error") {
   event({type:"turn_start"});

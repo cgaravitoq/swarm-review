@@ -231,7 +231,7 @@ function runPi(input: {
             usage.totalTokens += totalTokens;
           }
         }
-        if (!reportTurn && turns >= turnCap && stopReason === "tool_use")
+        if (!reportTurn && turns >= turnCap && stopReason === "toolUse")
           requestReport();
       }
       if (event["type"] === "turn_start" && reportTurn && turns > turnCap)
