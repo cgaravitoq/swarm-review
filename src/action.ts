@@ -178,6 +178,18 @@ export async function main(env: Env = process.env): Promise<void> {
         `${required(env, "GITHUB_TOKEN")}\n`,
       );
       stage = "image pull";
+      await run(
+        "bun",
+        [
+          "build",
+          join(actionPath, "src", "swarm.ts"),
+          "--target",
+          "bun",
+          "--outfile",
+          join(actionPath, "container", "context", "swarm.js"),
+        ],
+        runEnv,
+      );
       const image = imageReference(
         repository,
         await imageTagFromFiles(
