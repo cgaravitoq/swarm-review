@@ -37,6 +37,7 @@ import {
   parseBridgeCommand,
   parseCloudRunRequest,
   posixQuote,
+  RUN_ID_PATTERN,
   TARGET_UID,
   targetCanaryCommand,
   targetChownCommand,
@@ -1468,6 +1469,7 @@ export default {
         return json({ error: "target_repository_unset" }, 400);
       }
       const runId = request.headers.get("x-review-run") ?? "";
+      if (!RUN_ID_PATTERN.test(runId)) return json({ error: "forbidden" }, 403);
       const metadata = runId.startsWith("review-")
         ? await env.PROBE_RESULTS.get(reviewKey(runId, "git"))
         : null;

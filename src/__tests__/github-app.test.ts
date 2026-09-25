@@ -349,6 +349,28 @@ describe("GitHub App webhook", () => {
     expect(upstream).not.toHaveBeenCalled();
   });
 
+  it("refuses a malformed run header before it names an R2 key", async () => {
+    const { env } = fixture();
+    const upstream = vi.fn();
+    vi.stubGlobal("fetch", upstream);
+    const runId = "review-x/../../other";
+    const capability = await gitCapability(
+      runId,
+      "control-secret",
+      "acme/demo",
+    );
+    const response = await worker.fetch(
+      new Request(
+        `https://review.invalid/git/${capability}/info/refs?service=git-upload-pack`,
+        { headers: { "x-review-run": runId } },
+      ),
+      env as never,
+    );
+    expect(response.status).toBe(403);
+    expect(env.PROBE_RESULTS.get).not.toHaveBeenCalled();
+    expect(upstream).not.toHaveBeenCalled();
+  });
+
   it("uses the repository-scoped installation token for the App run's git fetch", async () => {
     const { env, r2 } = fixture();
     r2.set("reviews/review-app/git.json", {
