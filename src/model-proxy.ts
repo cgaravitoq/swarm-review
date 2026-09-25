@@ -365,6 +365,9 @@ export async function proxyModelFetch(
     }
   } catch (error) {
     await recordAttempt(runId, null, true, null);
+    if (error instanceof Error && error.message.startsWith("codex_relay_")) {
+      return jsonError(502, error.message);
+    }
     if (provider) {
       const reason =
         error instanceof Error && error.message.startsWith("credential_")

@@ -148,12 +148,212 @@ describe("model proxy", () => {
     expect(sandbox.startProcess).toHaveBeenCalledTimes(2);
     expect(process.waitForPort).toHaveBeenCalledWith(CODEX_RELAY_PORT, {
       mode: "tcp",
+      timeout: expect.any(Number),
     });
     expect(containerFetch.mock.calls[0]?.[0]).toBe(
       "http://codex-relay/codex/responses",
     );
     expect(direct).not.toHaveBeenCalled();
     expect(recorded).toHaveBeenCalledTimes(1);
+  });
+
+  it("converges concurrent cold attempts on the one relay that binds", async () => {
+    const command = "/usr/local/bun/bin/bun /opt/relay/server.ts";
+    type FakeProcess = {
+      id: string;
+      status: string;
+      command: string;
+      waitForPort: () => Promise<void>;
+    };
+    const processes: FakeProcess[] = [];
+    let bound: string | undefined;
+    const sandbox = {
+      listProcesses: vi.fn(async () => [...processes]),
+      getProcess: vi.fn(
+        async (id: string) => processes.find((p) => p.id === id) ?? null,
+      ),
+      startProcess: vi.fn(async (started: string) => {
+        const process: FakeProcess = {
+          id: `relay-${processes.length}`,
+          status: "running",
+          command: started,
+          waitForPort: async () => {
+            await Promise.resolve();
+            bound ??= process.id;
+            if (bound !== process.id) {
+              process.status = "failed";
+              throw new Error("process exited before ready");
+            }
+          },
+        };
+        processes.push(process);
+        return process;
+      }),
+      containerFetch: vi.fn(async () => new Response("done")),
+    };
+    const relay = createCodexRelayTransport(
+      {} as Parameters<typeof createCodexRelayTransport>[0],
+      () => sandbox,
+    );
+    const responses = await Promise.all(
+      [1, 2, 3].map(() => relay(CODEX_UPSTREAM, { method: "POST" })),
+    );
+    expect(sandbox.startProcess.mock.calls.length).toBeGreaterThan(1);
+    expect(sandbox.startProcess).toHaveBeenCalledWith(command);
+    expect(
+      await Promise.all(responses.map((response) => response.text())),
+    ).toEqual(["done", "done", "done"]);
+    expect(
+      processes.filter((process) => process.status === "running"),
+    ).toHaveLength(1);
+    expect(sandbox.containerFetch).toHaveBeenCalledTimes(3);
+  });
+
+  it("reuses a warm relay without starting another", async () => {
+    const process = {
+      id: "relay-process",
+      status: "running",
+      command: "/usr/local/bun/bin/bun /opt/relay/server.ts",
+      waitForPort: vi.fn(async () => undefined),
+    };
+    const sandbox = {
+      listProcesses: vi.fn(async () => [process]),
+      getProcess: vi.fn(async () => process),
+      startProcess: vi.fn(async () => process),
+      containerFetch: vi.fn(async () => new Response("done")),
+    };
+    const relay = createCodexRelayTransport(
+      {} as Parameters<typeof createCodexRelayTransport>[0],
+      () => sandbox,
+    );
+    const response = await relay(CODEX_UPSTREAM, { method: "POST" });
+    expect(await response.text()).toBe("done");
+    expect(sandbox.startProcess).not.toHaveBeenCalled();
+    expect(sandbox.getProcess).toHaveBeenCalledWith("relay-process");
+    expect(process.waitForPort).toHaveBeenCalledTimes(1);
+  });
+
+  const codexProxy = async (
+    relay: typeof fetch | undefined,
+    credentialProvider?: "openai-codex",
+  ) => {
+    const runId = "relay-failure-run";
+    const capability = await modelCapability(runId, "control-secret");
+    const url = new URL(
+      `https://review.invalid/model/${runId}/${capability}/codex/responses`,
+    );
+    const recorded = vi.fn(async () => undefined);
+    const response = await proxyModelFetch(
+      new Request(url, {
+        method: "POST",
+        headers: { authorization: "Bearer review-pi-handle" },
+        body: "{}",
+      }),
+      url,
+      "control-secret",
+      async () => ({
+        handle: "review-pi-handle",
+        caps: capsFor(),
+        upstreamBaseUrl: "https://chatgpt.com/backend-api",
+      }),
+      async () => ({
+        ok: true as const,
+        session: {
+          handle: "review-pi-handle",
+          upstreamBaseUrl: "https://chatgpt.com/backend-api",
+          upstreamAuthorization: "Bearer fake-carried",
+          ...(credentialProvider && { credentialProvider }),
+          caps: capsFor(),
+          totals: emptyModelTotals(),
+        },
+      }),
+      recorded,
+      async () => ({ authorization: "Bearer fake-vault" }),
+      relay,
+    );
+    return { response, recorded, runId };
+  };
+
+  it("bounds the wait for a relay that never opens its port", async () => {
+    const process = {
+      id: "relay-process",
+      status: "running",
+      command: "/usr/local/bun/bin/bun /opt/relay/server.ts",
+      waitForPort: vi.fn(
+        (_port: number, options: { timeout?: number }) =>
+          new Promise<void>((_resolve, reject) => {
+            if (options.timeout !== undefined) {
+              reject(new Error("process ready timeout"));
+            }
+          }),
+      ),
+    };
+    const relay = createCodexRelayTransport(
+      {} as Parameters<typeof createCodexRelayTransport>[0],
+      () => ({
+        listProcesses: async () => [],
+        getProcess: async () => process,
+        startProcess: async () => process,
+        containerFetch: async () => new Response("unreachable"),
+      }),
+    );
+    const { response, recorded, runId } = await codexProxy(relay);
+    expect(response.status).toBe(502);
+    expect(await response.json()).toEqual({
+      error: { type: "review_pi_model", reason: "codex_relay_failed" },
+    });
+    expect(recorded).toHaveBeenCalledWith(runId, null, true, null);
+  });
+
+  it("names the relay in every relay failure, vault or carried bearer", async () => {
+    const failing = createCodexRelayTransport(
+      {} as Parameters<typeof createCodexRelayTransport>[0],
+      () => ({
+        listProcesses: async () => [],
+        getProcess: async () => null,
+        startProcess: async () => {
+          throw new Error("container unavailable");
+        },
+        containerFetch: async () => new Response("unreachable"),
+      }),
+    );
+    for (const provider of ["openai-codex", undefined] as const) {
+      for (const [relay, reason] of [
+        [failing, "codex_relay_failed"],
+        [undefined, "codex_relay_unconfigured"],
+      ] as const) {
+        const { response, recorded, runId } = await codexProxy(relay, provider);
+        expect(response.status).toBe(502);
+        expect(await response.json()).toEqual({
+          error: { type: "review_pi_model", reason },
+        });
+        expect(recorded).toHaveBeenCalledWith(runId, null, true, null);
+      }
+    }
+  });
+
+  it("answers an upstream throw inside the relay as the relay's own 502", async () => {
+    const log = vi.spyOn(console, "log").mockImplementation(() => undefined);
+    const error = vi
+      .spyOn(console, "error")
+      .mockImplementation(() => undefined);
+    const response = await createCodexRelayHandler(async () => {
+      throw new Error("upstream reset with Bearer fake-token");
+    })(
+      new Request("http://relay/codex/responses", {
+        method: "POST",
+        headers: { authorization: "Bearer fake-token" },
+        body: "{}",
+      }),
+    );
+    expect(response.status).toBe(502);
+    expect(await response.json()).toEqual({
+      error: { type: "codex_relay", reason: "upstream_failed" },
+    });
+    expect(log).not.toHaveBeenCalled();
+    expect(error).not.toHaveBeenCalled();
+    log.mockRestore();
+    error.mockRestore();
   });
 
   it("leaves other upstreams on the direct fetch path", async () => {

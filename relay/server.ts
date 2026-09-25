@@ -2,6 +2,7 @@ declare const Bun: {
   serve(input: {
     hostname: string;
     port: number;
+    development: boolean;
     fetch(request: Request): Promise<Response>;
   }): void;
 };
@@ -22,13 +23,21 @@ export function createCodexRelayHandler(fetchUpstream: typeof fetch = fetch) {
     const headers = new Headers(request.headers);
     headers.delete("host");
     headers.delete("content-length");
-    const response = await fetchUpstream(UPSTREAM, {
-      method: "POST",
-      headers,
-      body: request.body,
-      duplex: "half",
-      redirect: "manual",
-    } as RequestInit);
+    let response: Response;
+    try {
+      response = await fetchUpstream(UPSTREAM, {
+        method: "POST",
+        headers,
+        body: request.body,
+        duplex: "half",
+        redirect: "manual",
+      } as RequestInit);
+    } catch {
+      return Response.json(
+        { error: { type: "codex_relay", reason: "upstream_failed" } },
+        { status: 502 },
+      );
+    }
     return new Response(response.body, response);
   };
 }
@@ -37,6 +46,7 @@ if (import.meta.main) {
   Bun.serve({
     hostname: "0.0.0.0",
     port: 3211,
+    development: false,
     fetch: createCodexRelayHandler(),
   });
 }

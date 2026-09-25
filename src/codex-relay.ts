@@ -1,6 +1,8 @@
 export const CODEX_RELAY_ID = "swarm-review-codex-egress";
 export const CODEX_RELAY_PORT = 3211;
 export const CODEX_UPSTREAM = "https://chatgpt.com/backend-api/codex/responses";
+const CODEX_RELAY_COMMAND = "/usr/local/bun/bin/bun /opt/relay/server.ts";
+const CODEX_RELAY_READY_MS = 30_000;
 
 type SandboxSdk = typeof import("@cloudflare/sandbox");
 type RelayNamespace = Parameters<SandboxSdk["getSandbox"]>[0];
@@ -8,7 +10,10 @@ type RelayProcess = {
   id: string;
   status: string;
   command: string;
-  waitForPort(port: number, options: { mode: "tcp" }): Promise<void>;
+  waitForPort(
+    port: number,
+    options: { mode: "tcp"; timeout: number },
+  ): Promise<void>;
 };
 type RelaySandbox = {
   listProcesses(): Promise<RelayProcess[]>;
@@ -38,19 +43,37 @@ export function createCodexRelayTransport(
     if (String(input) !== CODEX_UPSTREAM || init?.method !== "POST") {
       return new Response(null, { status: 404 });
     }
-    const sandbox = await factory(namespace, CODEX_RELAY_ID);
-    const command = "/usr/local/bun/bin/bun /opt/relay/server.ts";
-    const running = (await sandbox.listProcesses()).find(
-      (process) => process.status === "running" && process.command === command,
-    );
-    const process =
-      (running && (await sandbox.getProcess(running.id))) ??
-      (await sandbox.startProcess(command));
-    await process.waitForPort(CODEX_RELAY_PORT, { mode: "tcp" });
-    return sandbox.containerFetch(
-      "http://codex-relay/codex/responses",
-      init,
-      CODEX_RELAY_PORT,
-    );
+    try {
+      const sandbox = await factory(namespace, CODEX_RELAY_ID);
+      const relays = async () =>
+        (await sandbox.listProcesses()).filter(
+          (process) =>
+            process.status === "running" &&
+            process.command === CODEX_RELAY_COMMAND,
+        );
+      const ready = (processes: RelayProcess[]) =>
+        Promise.any(
+          processes.map((process) =>
+            process.waitForPort(CODEX_RELAY_PORT, {
+              mode: "tcp",
+              timeout: CODEX_RELAY_READY_MS,
+            }),
+          ),
+        );
+      const [running] = await relays();
+      const process =
+        (running && (await sandbox.getProcess(running.id))) ??
+        (await sandbox.startProcess(CODEX_RELAY_COMMAND));
+      // Concurrent cold attempts each start a relay and all but one exit on
+      // the bound port, so a start that never gets ready waits on the winner.
+      await ready([process]).catch(async () => ready(await relays()));
+      return await sandbox.containerFetch(
+        "http://codex-relay/codex/responses",
+        init,
+        CODEX_RELAY_PORT,
+      );
+    } catch {
+      throw new Error("codex_relay_failed");
+    }
   };
 }
