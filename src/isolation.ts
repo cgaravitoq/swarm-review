@@ -220,7 +220,7 @@ export function interpretControlApiProbe(httpStatus: number, body: string) {
   return { escaped: false as const, uid, reason: "contained" };
 }
 
-export function parseBrokerConfig(value: unknown) {
+export function parseBrokerConfig(value: unknown, credentialProvider?: string) {
   if (typeof value !== "object" || value === null || Array.isArray(value)) {
     throw new Error("broker config missing");
   }
@@ -267,14 +267,28 @@ export function parseBrokerConfig(value: unknown) {
   if (!config["upstreamBaseUrl"].startsWith("https://")) {
     throw new Error("broker upstream must be https");
   }
-  if (
-    !isNonEmptyString(config["upstreamAuthorization"]) ||
-    !config["upstreamAuthorization"].startsWith("Bearer ")
+  const authorization = config["upstreamAuthorization"];
+  if (authorization === undefined && credentialProvider !== undefined) {
+    const upstream =
+      credentialProvider === "openai-codex"
+        ? "https://chatgpt.com/backend-api"
+        : "https://api.anthropic.com";
+    if (
+      config["upstreamBaseUrl"] !== upstream ||
+      config["upstreamAccountId"] !== undefined
+    ) {
+      throw new Error("vault upstream mismatch");
+    }
+  } else if (
+    !isNonEmptyString(authorization) ||
+    !authorization.startsWith("Bearer ")
   ) {
     throw new Error("broker authorization missing");
   }
-  const bearer = config["upstreamAuthorization"].slice("Bearer ".length);
-  if (!bearer || config["handle"].includes(bearer)) {
+  const bearer = isNonEmptyString(authorization)
+    ? authorization.slice("Bearer ".length)
+    : null;
+  if (bearer !== null && (!bearer || config["handle"].includes(bearer))) {
     throw new Error("broker handle must not carry the bearer");
   }
   if (config["ledgerPath"] !== BROKER_LEDGER) {
@@ -285,7 +299,9 @@ export function parseBrokerConfig(value: unknown) {
     port: BROKER_PORT,
     handle: config["handle"],
     upstreamBaseUrl: config["upstreamBaseUrl"],
-    upstreamAuthorization: config["upstreamAuthorization"],
+    ...(bearer !== null
+      ? { upstreamAuthorization: authorization as string }
+      : {}),
     ...(isNonEmptyString(accountId) ? { upstreamAccountId: accountId } : {}),
     caps,
     ledgerPath: BROKER_LEDGER,
@@ -370,15 +386,25 @@ export function parseCloudRunRequest(value: unknown) {
   }
   const request = value as Record<string, unknown>;
   const job = parseCloudJob(request["job"]);
-  const broker = parseBrokerConfig(request["broker"]);
+  const brokerInput = request["broker"];
+  const vaultProvider =
+    (job.provider === "openai-codex" || job.provider === "claude-code") &&
+    typeof brokerInput === "object" &&
+    brokerInput !== null &&
+    !Array.isArray(brokerInput) &&
+    (brokerInput as Record<string, unknown>)["upstreamAuthorization"] ===
+      undefined
+      ? job.provider
+      : undefined;
+  const broker = parseBrokerConfig(brokerInput, vaultProvider);
   if (typeof request["modelsJson"] !== "string") {
     throw new Error("modelsJson missing");
   }
-  const bearer = broker.upstreamAuthorization.slice("Bearer ".length);
-  if (JSON.stringify(job).includes(bearer)) {
+  const bearer = broker.upstreamAuthorization?.slice("Bearer ".length);
+  if (bearer && JSON.stringify(job).includes(bearer)) {
     throw new Error("job must not carry the model bearer");
   }
-  if (request["modelsJson"].includes(bearer)) {
+  if (bearer && request["modelsJson"].includes(bearer)) {
     throw new Error("models.json must not carry the model bearer");
   }
   const canaryRequest = request["canaryRequest"];
@@ -408,6 +434,7 @@ export function parseCloudRunRequest(value: unknown) {
   return {
     job,
     broker,
+    credentialProvider: vaultProvider,
     modelsJson: request["modelsJson"],
     canary: request["canary"] === true,
     ...(parsedCanary ? { canaryRequest: parsedCanary } : {}),

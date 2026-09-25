@@ -2,11 +2,14 @@
  * Disposable review-Pi control Worker.
  *
  * One sandbox per run, keyed by `runId`. The Worker is a control plane: git
- * and model bytes leave through run-scoped proxies. The provider bearer and
- * usage counters live in this Durable Object, never in any container uid.
+ * and model bytes leave through run-scoped proxies. Usage counters live in the
+ * run's Durable Object; a caller bearer lives there, and Worker credentials
+ * live in the vault. Neither reaches a container uid.
  */
 
+import { DurableObject } from "cloudflare:workers";
 import { getSandbox, Sandbox } from "@cloudflare/sandbox";
+import { CredentialVault } from "./src/credential-vault";
 import { gitCapability, proxyGitFetch } from "./src/git-proxy";
 import {
   assertCloudRunId,
@@ -54,6 +57,25 @@ import {
 const MODEL_SESSION_KEY = "modelSession";
 const MODEL_SEALS_KEY = "modelSeals";
 const COMMAND_SEQUENCE_KEY = "commandSequence";
+
+export class CredentialVaultObject extends DurableObject<unknown> {
+  private readonly vault: CredentialVault;
+
+  constructor(state: DurableObjectState, env: unknown) {
+    super(state, env);
+    this.vault = new CredentialVault(state.storage);
+  }
+
+  seed(provider: string, value: unknown) {
+    return this.vault.seed(provider, value);
+  }
+  status() {
+    return this.vault.status();
+  }
+  credential(provider: string, rejectedAccessToken?: string) {
+    return this.vault.credential(provider, rejectedAccessToken);
+  }
+}
 
 export class ReviewSandbox extends Sandbox<ReviewPiEnv> {
   async putModelSession(session: ModelSession) {
@@ -146,6 +168,7 @@ type ReviewPiEnv = Record<
   "REVIEW_SANDBOX",
   DurableObjectNamespace<ReviewSandbox>
 > &
+  Record<"CREDENTIAL_VAULT", DurableObjectNamespace<CredentialVaultObject>> &
   Record<"CONTROL_SECRET" | "GITHUB_READ_TOKEN", string> & {
     /** https clone URL the run's containers fetch through the Git proxy. */
     TARGET_REPOSITORY?: string;
@@ -298,6 +321,11 @@ export default {
             retryable,
             seal,
           ),
+        (provider, rejectedAccessToken) =>
+          env.CREDENTIAL_VAULT.getByName("worker").credential(
+            provider,
+            rejectedAccessToken,
+          ),
       );
     }
 
@@ -307,6 +335,34 @@ export default {
 
     const url = url0;
     const segments = url.pathname.split("/").filter(Boolean);
+
+    if (segments[0] === "credentials") {
+      const vault = env.CREDENTIAL_VAULT.getByName("worker");
+      if (request.method === "GET" && segments.length === 1) {
+        return json({ credentials: await vault.status() });
+      }
+      if (request.method === "PUT" && segments.length === 2) {
+        try {
+          await vault.seed(segments[1] ?? "", await request.json());
+          return json({ provider: segments[1], stored: true });
+        } catch (error) {
+          const reason =
+            error instanceof Error &&
+            [
+              "invalid_credential",
+              "invalid_codex_access_token",
+              "unsupported_provider",
+            ].includes(error.message)
+              ? error.message
+              : "credential_store_failed";
+          return json(
+            { error: reason },
+            reason === "unsupported_provider" ? 404 : 400,
+          );
+        }
+      }
+      return json({ error: "not_found" }, 404);
+    }
 
     if (segments[0] !== "runs" || segments.length < 1) {
       return json({ error: "not_found" }, 404);
@@ -336,6 +392,17 @@ export default {
         );
       } catch (error) {
         return json({ error: "invalid_run", detail: messageOf(error) }, 400);
+      }
+      if (parsed.credentialProvider) {
+        const credentials =
+          await env.CREDENTIAL_VAULT.getByName("worker").status();
+        if (
+          !credentials.some(
+            (entry) => entry.provider === parsed.credentialProvider,
+          )
+        ) {
+          return json({ error: "credential_unconfigured" }, 400);
+        }
       }
       const job = {
         ...parsed.job,
@@ -378,7 +445,12 @@ export default {
           sandbox.putModelSession({
             handle: parsed.broker.handle,
             upstreamBaseUrl: parsed.broker.upstreamBaseUrl,
-            upstreamAuthorization: parsed.broker.upstreamAuthorization,
+            ...(parsed.broker.upstreamAuthorization
+              ? { upstreamAuthorization: parsed.broker.upstreamAuthorization }
+              : {}),
+            ...(parsed.credentialProvider
+              ? { credentialProvider: parsed.credentialProvider }
+              : {}),
             ...(parsed.broker.upstreamAccountId
               ? { upstreamAccountId: parsed.broker.upstreamAccountId }
               : {}),
