@@ -1206,10 +1206,6 @@ export async function updateIssueComment(
   }
 }
 
-/**
- * The login the token acts as. REST's `/user` refuses an installation token,
- * while GraphQL's viewer answers for it and for a personal token alike.
- */
 export async function deleteIssueComment(
   repo: string,
   commentId: number,
@@ -1229,6 +1225,10 @@ export async function deleteIssueComment(
   }
 }
 
+/**
+ * The login the token acts as. REST's `/user` refuses an installation token,
+ * while GraphQL's viewer answers for it and for a personal token alike.
+ */
 export async function fetchViewerLogin(token: string) {
   const response = await fetch("https://api.github.com/graphql", {
     method: "POST",
