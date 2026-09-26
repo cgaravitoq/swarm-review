@@ -955,6 +955,7 @@ async function destroySandbox(sandbox: ReturnType<typeof getSandbox>) {
 async function readArtifact(
   sandbox: ReturnType<typeof getSandbox>,
   path: string,
+  limit = MAX_ARTIFACT_BYTES,
 ) {
   const quoted = posixQuote(path);
   const size = await bounded(
@@ -966,15 +967,53 @@ async function readArtifact(
     return { path, exists: false as const };
   const head = await bounded(
     `artifact read ${path}`,
-    sandbox.exec(`head -c ${MAX_ARTIFACT_BYTES} ${quoted}`),
+    sandbox.exec(`head -c ${limit} ${quoted}`),
   );
   return {
     path,
     exists: true as const,
     bytes,
-    truncated: bytes > MAX_ARTIFACT_BYTES,
+    truncated: bytes > limit,
     content: head.stdout,
   };
+}
+
+const EVIDENCE_FILE_BYTES = 2_000_000;
+const EVIDENCE_MS = 60_000;
+const EVIDENCE_NAME = /^[a-z0-9-]+\.jsonl$/;
+const evidenceKey = (reviewId: string, name = "") =>
+  `evidence/${reviewId}/${name}`;
+
+async function storeEvidence(
+  env: ReviewPiEnv,
+  sandbox: ReturnType<typeof getSandbox>,
+  reviewId: string,
+  redact: (text: string) => string,
+) {
+  const lanes = `${runDir(reviewId)}/out/lanes`;
+  const listing = await sandbox.exec(
+    `ls -1 ${posixQuote(lanes)} 2>/dev/null || true`,
+  );
+  for (const name of listing.stdout
+    .split("\n")
+    .filter((name) => EVIDENCE_NAME.test(name))) {
+    const file = await readArtifact(
+      sandbox,
+      `${lanes}/${name}`,
+      EVIDENCE_FILE_BYTES,
+    );
+    if (!file.exists) continue;
+    await env.PROBE_RESULTS.put(
+      evidenceKey(reviewId, name),
+      redact(file.content),
+      {
+        customMetadata: {
+          bytes: String(file.bytes),
+          truncated: String(file.truncated),
+        },
+      },
+    );
+  }
 }
 
 const readArtifacts = (
@@ -1261,6 +1300,7 @@ async function runCloudReview(env: ReviewPiEnv, review: CloudReview) {
   let reason: string | null = null;
   let receipt: Record<string, unknown> | null = null;
   let failureDetail: FailureDetail | null = null;
+  let engineStarted = false;
   try {
     reviewRemaining(review);
     if (!env.WORKERS_AI_API_KEY || !env.WORKERS_AI_ACCOUNT_ID) {
@@ -1479,6 +1519,7 @@ async function runCloudReview(env: ReviewPiEnv, review: CloudReview) {
     ];
     if (review.context) args.push("--context", `${directory}/context.txt`);
     const command = `cd ${posixQuote(clone)} && ${asTarget} env -i HOME=/home/review-target PATH=/usr/local/bun/bin:/usr/local/bin:/usr/bin:/bin bun ${args.map(posixQuote).join(" ")}`;
+    engineStarted = true;
     const process = await reviewStep(
       review,
       "review engine",
@@ -1556,6 +1597,12 @@ async function runCloudReview(env: ReviewPiEnv, review: CloudReview) {
         ? "deadline"
         : messageOf(error);
   } finally {
+    if (engineStarted)
+      await bounded(
+        "review evidence",
+        storeEvidence(env, sandbox, review.reviewId, redact),
+        EVIDENCE_MS,
+      ).catch(() => undefined);
     await bounded(
       "review clear sessions",
       sandbox.clearProbeSessions(),
@@ -2183,6 +2230,41 @@ export default {
       return json({
         status: await status.json(),
         ...(receipt ? { receipt: await receipt.json() } : {}),
+      });
+    }
+
+    if (
+      segments[0] === "reviews" &&
+      segments[2] === "evidence" &&
+      request.method === "GET" &&
+      segments.length <= 4
+    ) {
+      let reviewId: string;
+      try {
+        reviewId = assertCloudRunId(segments[1] ?? "");
+      } catch {
+        return json({ error: "not_found" }, 404);
+      }
+      const name = segments[3];
+      if (name === undefined) {
+        const listed = await env.PROBE_RESULTS.list({
+          prefix: evidenceKey(reviewId),
+          include: ["customMetadata"],
+        });
+        return json({
+          files: listed.objects.map((object) => ({
+            name: object.key.slice(evidenceKey(reviewId).length),
+            bytes: object.size,
+            truncated: object.customMetadata?.["truncated"] === "true",
+          })),
+        });
+      }
+      const object = EVIDENCE_NAME.test(name)
+        ? await env.PROBE_RESULTS.get(evidenceKey(reviewId, name))
+        : null;
+      if (!object) return json({ error: "not_found" }, 404);
+      return new Response(object.body, {
+        headers: { "content-type": "application/x-ndjson" },
       });
     }
 
