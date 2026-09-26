@@ -477,6 +477,26 @@ describe("GitHub App webhook", () => {
     ]);
   });
 
+  it("ends a failure summary whose reason is already a sentence with one period", async () => {
+    const { r2, pr, started } = fixture();
+    const gh = github();
+    const reviewId = await started();
+    r2.set(`reviews/${reviewId}/receipt.json`, {
+      status: "failed",
+      failure: { message: "engine_failed: the provider refused." },
+    });
+    await pr.alarm();
+    expect(gh.checks()).toEqual([
+      expect.objectContaining({
+        output: {
+          title: "Swarm review could not complete",
+          summary:
+            "Review could not complete: engine_failed: the provider refused.\n\nThe receipt names no lanes.",
+        },
+      }),
+    ]);
+  });
+
   it("steers the review by the repository brief read at the PR base", async () => {
     const { pr, job, stored, r2, started } = fixture();
     const brief = "Money moves only through the ledger module.";
