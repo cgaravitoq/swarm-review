@@ -1188,6 +1188,21 @@ const lost = () => {
 };
 
 describe("App review publication", () => {
+  it("names the cloud review behind the check in the completed check's external_id", async () => {
+    const { pr, r2, started } = fixture();
+    const gh = github();
+    const reviewId = await started();
+    r2.set(`reviews/${reviewId}/receipt.json`, receipt);
+    await pr.alarm();
+    expect(gh.checks()).toEqual([
+      expect.objectContaining({
+        url: `${API}/check-runs/99`,
+        external_id: reviewId,
+        conclusion: "success",
+      }),
+    ]);
+  });
+
   it("posts one review at the reviewed commit with inline comments on commentable lines and the marker", async () => {
     const { r2, pr, stored, storage, started } = fixture();
     const gh = github();

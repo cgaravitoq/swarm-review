@@ -203,6 +203,19 @@ A rate-limited 403 or 429 is retried after the reset GitHub names instead.
 Set `GITHUB_APP_ID`, `GITHUB_APP_PRIVATE_KEY` (PKCS#8 PEM), and `GITHUB_WEBHOOK_SECRET` as Worker secrets before installing the App.
 The App installation token is restricted to the event's repository and replaces the read token for that review's git proxy requests.
 
+Every reviewer and verifier lane keeps its Pi session as evidence.
+Once the engine has started, the Worker stores each lane's transcript at `evidence/<reviewId>/<lane>.jsonl` in the same bucket, redacted of the run's credentials and cut at 2 MB, whether the review completed or not.
+`GET /reviews/<reviewId>/evidence` lists the files with their size and whether they were cut, and `GET /reviews/<reviewId>/evidence/<file>` returns one; both need the control secret.
+A completed App check carries its review id in `external_id`, so the download script takes either the id or the pull request:
+
+```sh
+bun run scripts/evidence.ts "$WORKER_ORIGIN" <reviewId> <dir>
+bun run scripts/evidence.ts "$WORKER_ORIGIN" <owner/name>#<pr> <dir>
+```
+
+The pull request form reads the `swarm-review` check on the PR's current head with `GITHUB_TOKEN`, `GH_TOKEN` or `gh auth token`, and the script exits 1 when the review has no evidence.
+The transcripts carry the reviewed code, so the deploy script adds an `evidence-30-days` lifecycle rule to the bucket when it is missing, and its Cloudflare credential needs R2 edit access.
+
 ## Operator probe
 
 The authenticated `POST /probe` route starts one fresh review Sandbox, measures its first image fingerprint command, clones the configured repository with `--depth 1` through the read-only git proxy, and runs Pi once per model family as the target user.

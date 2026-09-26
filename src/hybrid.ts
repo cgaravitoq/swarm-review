@@ -1,6 +1,12 @@
 import { type ChildProcess, execFileSync, spawn } from "node:child_process";
 import { randomUUID } from "node:crypto";
-import { mkdtempSync, rmSync } from "node:fs";
+import {
+  mkdtempSync,
+  readdirSync,
+  readFileSync,
+  rmSync,
+  writeFileSync,
+} from "node:fs";
 import { mkdir, readFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
@@ -118,6 +124,7 @@ function runPi(input: {
   deadlineAt: number;
   cutReason: string;
   children: Set<ChildProcess>;
+  evidence: string;
 }): Promise<LaneResult> {
   return new Promise((resolveResult) => {
     const sessionDir = mkdtempSync(join(tmpdir(), "hybrid-pi-"));
@@ -186,6 +193,16 @@ function runPi(input: {
       complete = true;
       clearTimeout(timer);
       clearTimeout(reportTimer);
+      const sessions = readdirSync(sessionDir)
+        .filter((name) => name.endsWith(".jsonl"))
+        .sort();
+      if (sessions.length > 0)
+        writeFileSync(
+          input.evidence,
+          sessions
+            .map((name) => readFileSync(join(sessionDir, name), "utf8"))
+            .join(""),
+        );
       rmSync(sessionDir, { recursive: true, force: true });
       const status = cut
         ? "cut"
@@ -398,7 +415,7 @@ export async function runHybrid(argv: string[]) {
   };
   process.on("SIGINT", stop);
   process.on("SIGTERM", stop);
-  await mkdir(out, { recursive: true });
+  await mkdir(join(out, "lanes"), { recursive: true });
   const changedFiles = execFileSync(
     "git",
     ["-C", source, "diff", "--name-only", `${base}...${head}`],
@@ -481,6 +498,7 @@ export async function runHybrid(argv: string[]) {
           deadlineAt: reviewDeadlineAt,
           cutReason: "review deadline",
           children,
+          evidence: join(out, "lanes", `${reviewerLaneId(index)}.jsonl`),
         });
         reviewerOutcomes.push({ family: lane.family, status: result.status });
         const parsed =
@@ -606,6 +624,7 @@ export async function runHybrid(argv: string[]) {
           deadlineAt: Math.min(Date.now() + 120_000, deadlineAt),
           cutReason: "deadline",
           children,
+          evidence: join(out, "lanes", `verifier-${candidate.id}.jsonl`),
         });
         const parsed =
           result.status === "completed"

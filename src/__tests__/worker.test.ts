@@ -10,7 +10,9 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { verificationsPerFamily } from "../../prompts/hybrid";
 import {
   deployArguments,
+  EVIDENCE_RULE,
   imageBuildArguments,
+  lifecycleRuleNames,
   targetCheckout,
 } from "../../scripts/deploy";
 import { main } from "../../scripts/probe";
@@ -182,14 +184,36 @@ describe("cloud reviews", () => {
       ],
     ]);
     const r2 = new Map<string, unknown>();
+    const metadata = new Map<string, Record<string, string> | undefined>();
     const object = {
-      put: vi.fn(async (key: string, value: string) => {
-        r2.set(key, JSON.parse(value));
-      }),
+      put: vi.fn(
+        async (
+          key: string,
+          value: string,
+          options?: { customMetadata?: Record<string, string> },
+        ) => {
+          r2.set(key, key.startsWith("evidence/") ? value : JSON.parse(value));
+          metadata.set(key, options?.customMetadata);
+        },
+      ),
       get: vi.fn(async (key: string) =>
-        r2.has(key) ? { json: async () => r2.get(key) } : null,
+        r2.has(key)
+          ? {
+              json: async () => r2.get(key),
+              body: new Response(String(r2.get(key))).body,
+            }
+          : null,
       ),
       head: vi.fn(async (key: string) => (r2.has(key) ? { key } : null)),
+      list: vi.fn(async ({ prefix }: { prefix: string }) => ({
+        objects: [...r2.keys()]
+          .filter((key) => key.startsWith(prefix))
+          .map((key) => ({
+            key,
+            size: String(r2.get(key)).length,
+            customMetadata: metadata.get(key),
+          })),
+      })),
     };
     const stored = new Map<string, unknown>();
     const storage = {
@@ -284,7 +308,21 @@ describe("cloud reviews", () => {
         }
         if (command.startsWith("head -c")) {
           const file = command.match(/'([^']+)'/)?.[1] ?? "";
-          return { stdout: files.get(file) ?? "", exitCode: 0 };
+          const limit = Number(command.split(" ")[2]);
+          return {
+            stdout: (files.get(file) ?? "").slice(0, limit),
+            exitCode: 0,
+          };
+        }
+        if (command.startsWith("ls -1")) {
+          const directory = `${command.match(/'([^']+)'/)?.[1] ?? ""}/`;
+          return {
+            stdout: [...files.keys()]
+              .filter((file) => file.startsWith(directory))
+              .map((file) => file.slice(directory.length))
+              .join("\n"),
+            exitCode: 0,
+          };
         }
         return { stdout: "", exitCode: 0 };
       }),
@@ -621,6 +659,86 @@ describe("cloud reviews", () => {
     expect(receipt.failure.engine.stderr).toContain("[redacted]");
     for (const secret of leak.secrets)
       expect(JSON.stringify(receipt)).not.toContain(secret);
+  });
+
+  it("stores each lane's transcript redacted under evidence and serves it behind the control secret", async () => {
+    const fixture = setup();
+    const response = await post(fixture.reviewEnv);
+    const { reviewId } = (await response.json()) as { reviewId: string };
+    let leak = { readable: "", secrets: [] as string[] };
+    const answer = fixture.sandbox.startProcess.getMockImplementation()!;
+    fixture.sandbox.startProcess.mockImplementationOnce(async (command) => {
+      leak = await leakedCredentials(fixture, reviewId);
+      const lanes = `/workspace/runs/${reviewId}/out/lanes`;
+      fixture.files.set(
+        `${lanes}/reviewer-1.jsonl`,
+        `${JSON.stringify({ type: "message", text: leak.readable })}\n`,
+      );
+      fixture.files.set(`${lanes}/verifier-c1.jsonl`, "x".repeat(2_000_001));
+      fixture.files.set(`${lanes}/notes.txt`, "not a transcript");
+      return answer(command);
+    });
+    await fixture.job.alarm();
+
+    const kept = fixture.r2.get(
+      `evidence/${reviewId}/reviewer-1.jsonl`,
+    ) as string;
+    expect(kept).toContain("[redacted]");
+    for (const secret of leak.secrets) expect(kept).not.toContain(secret);
+    expect(
+      (fixture.r2.get(`evidence/${reviewId}/verifier-c1.jsonl`) as string)
+        .length,
+    ).toBe(2_000_000);
+    expect(fixture.r2.has(`evidence/${reviewId}/notes.txt`)).toBe(false);
+
+    const listed = await handler.fetch(
+      authorized(`https://review.invalid/reviews/${reviewId}/evidence`),
+      fixture.reviewEnv,
+    );
+    expect(await listed.json()).toEqual({
+      files: [
+        { name: "reviewer-1.jsonl", bytes: kept.length, truncated: false },
+        { name: "verifier-c1.jsonl", bytes: 2_000_000, truncated: true },
+      ],
+    });
+    const served = await handler.fetch(
+      authorized(
+        `https://review.invalid/reviews/${reviewId}/evidence/reviewer-1.jsonl`,
+      ),
+      fixture.reviewEnv,
+    );
+    expect(served.headers.get("content-type")).toBe("application/x-ndjson");
+    expect(await served.text()).toBe(kept);
+    for (const refused of [
+      authorized(
+        `https://review.invalid/reviews/${reviewId}/evidence/receipt.json`,
+      ),
+      authorized("https://review.invalid/reviews/-not-a-run/evidence"),
+    ]) {
+      const answered = await handler.fetch(refused, fixture.reviewEnv);
+      expect(answered.status).toBe(404);
+    }
+    const anonymous = await handler.fetch(
+      new Request(`https://review.invalid/reviews/${reviewId}/evidence`),
+      fixture.reviewEnv,
+    );
+    expect(anonymous.status).toBe(401);
+  });
+
+  it("looks for no evidence in a review whose engine never started", async () => {
+    const fixture = setup("fingerprint");
+    await post(fixture.reviewEnv);
+    await fixture.job.alarm();
+    const commands = fixture.sandbox.exec.mock.calls.map(
+      ([command]) => command,
+    );
+    expect(commands.some((command) => command.includes("sha256sum"))).toBe(
+      true,
+    );
+    expect(commands.some((command) => command.startsWith("ls -1"))).toBe(false);
+    expect(
+      [...fixture.r2.keys()].some((key) => key.startsWith("evidence/")),
+    ).toBe(false);
   });
 
   it("keeps the git capability out of the failure a sandbox error names", async () => {
@@ -2807,6 +2925,22 @@ describe("deployed container image", () => {
         "--image-only",
       ]),
     ).toEqual([]);
+  });
+
+  it("finds the evidence rule in wrangler's own lifecycle listing", () => {
+    const listing = readFileSync(
+      path.join(import.meta.dirname, "wrangler-r2-lifecycle-list.txt"),
+      "utf8",
+    );
+    expect(lifecycleRuleNames(listing)).toEqual([
+      "Default Multipart Abort Rule",
+      EVIDENCE_RULE,
+    ]);
+    expect(
+      lifecycleRuleNames(
+        listing.slice(0, listing.indexOf("\nname:     evidence")),
+      ),
+    ).toEqual(["Default Multipart Abort Rule"]);
   });
 
   it("builds the computed image reference for the lane platform", () => {
