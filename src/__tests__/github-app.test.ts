@@ -829,7 +829,7 @@ describe("GitHub App webhook", () => {
   it.each([
     "interrupted",
     "destroy_failed",
-    "destroy_failed: Durable Object reset because its code was updated.",
+    "Durable Object reset because its code was updated; destroy_failed: Durable Object reset because its code was updated.",
     "Durable Object reset because its code was updated.",
     "image source /opt/review/review-run.sh differs from the host's copy: expected 1, observed 2",
   ])(
@@ -895,7 +895,7 @@ describe("GitHub App webhook", () => {
       failure: {
         stage: "cloud_review",
         message:
-          "destroy_failed: Durable Object reset because its code was updated.",
+          "Durable Object reset because its code was updated; destroy_failed: Durable Object reset because its code was updated.",
       },
     });
     destroy.mockRejectedValueOnce(new Error("busy"));
@@ -907,7 +907,7 @@ describe("GitHub App webhook", () => {
         output: {
           title: "Swarm review could not complete",
           summary:
-            "Review could not complete: destroy_failed: Durable Object reset because its code was updated. Not retried, because its sandbox could not be stopped: busy.\n\nThe receipt names no lanes.",
+            "Review could not complete: Durable Object reset because its code was updated; destroy_failed: Durable Object reset because its code was updated. Not retried, because its sandbox could not be stopped: busy.\n\nThe receipt names no lanes.",
         },
       }),
     ]);
@@ -923,7 +923,7 @@ describe("GitHub App webhook", () => {
       failure: {
         stage: "cloud_review",
         message:
-          "destroy_failed: Durable Object reset because its code was updated.",
+          "Durable Object reset because its code was updated; destroy_failed: Durable Object reset because its code was updated.",
       },
     });
     await pr.alarm();
@@ -938,7 +938,7 @@ describe("GitHub App webhook", () => {
         output: {
           title: "Swarm review completed",
           summary:
-            "Review published at aaaaaaa. 2 confirmed finding(s).\n\nRetried once: the first attempt ended with `destroy_failed: Durable Object reset because its code was updated.`.",
+            "Review published at aaaaaaa. 2 confirmed finding(s).\n\nRetried once: the first attempt ended with `Durable Object reset because its code was updated; destroy_failed: Durable Object reset because its code was updated.`.",
         },
       }),
     ]);
