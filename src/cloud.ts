@@ -140,6 +140,12 @@ export async function runCloud(argv: string[], io: CloudIo = defaultIo) {
     }),
     signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
   }).catch((error: unknown) => error as Error);
+  // Only a request that timed out may have reached the Worker; one that could
+  // not connect started nothing.
+  if (submitted instanceof Error && submitted.name !== "TimeoutError") {
+    print(`cloud review not submitted: ${submitted.message}`);
+    return 1;
+  }
   if (submitted instanceof Error) {
     print(
       `cloud review ${reviewId}: submit unanswered (${submitted.message}); following it in case the Worker started it`,
