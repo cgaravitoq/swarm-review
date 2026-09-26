@@ -4,6 +4,7 @@ import { fetchMergeBase, fetchPullRevisions } from "./publish";
 import { githubToken } from "./swarm";
 
 const POLL_MS = 15_000;
+const REQUEST_TIMEOUT_MS = 30_000;
 const DEADLINE_MARGIN_MS = 60_000;
 const UNOBSERVED_DEADLINE_MS = 10 * 60_000;
 const MAX_CONTEXT_CHARS = 64_000;
@@ -50,7 +51,9 @@ const requiredEnv = (name: string) => {
 };
 
 async function readBody(response: Response) {
-  const text = await response.text();
+  const text = await response
+    .text()
+    .catch((error: unknown) => `unreadable body: ${(error as Error).message}`);
   try {
     return JSON.parse(text) as unknown;
   } catch {
@@ -133,7 +136,12 @@ export async function runCloud(argv: string[], io: CloudIo = defaultIo) {
       base,
       ...(context === undefined ? {} : { context }),
     }),
-  });
+    signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
+  }).catch((error: unknown) => error as Error);
+  if (submitted instanceof Error) {
+    print(`cloud review not submitted: ${submitted.message}`);
+    return 1;
+  }
   const accepted = await readBody(submitted);
   const reviewId =
     typeof accepted === "object" && accepted !== null
@@ -151,7 +159,7 @@ export async function runCloud(argv: string[], io: CloudIo = defaultIo) {
   while (io.now() <= deadline) {
     const response = await fetch(
       `${origin}/reviews/${encodeURIComponent(reviewId)}`,
-      { headers },
+      { headers, signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS) },
     ).catch((error: unknown) => error as Error);
     if (response instanceof Error) {
       print(`cloud review ${reviewId}: poll failed: ${response.message}`);
