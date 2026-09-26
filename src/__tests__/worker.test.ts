@@ -363,7 +363,7 @@ describe("cloud reviews", () => {
       ...requestBody,
       origin: "https://review.invalid",
       deadlineAt: new Date(Date.now() + 13 * 60_000).toISOString(),
-      deep: true,
+      tier: "deep-review",
     });
     await fixture.job.alarm();
     const lanes = JSON.parse(

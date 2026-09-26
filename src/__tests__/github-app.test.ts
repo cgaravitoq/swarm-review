@@ -2066,10 +2066,10 @@ describe("Checks tab", () => {
     await pr.alarm();
     const [standard, deep] = job.start.mock.calls.map(
       ([review]) =>
-        review as { deep?: boolean; deadlineAt: string; reviewId: string },
+        review as { tier?: string; deadlineAt: string; reviewId: string },
     );
-    expect(standard).not.toHaveProperty("deep");
-    expect(deep).toMatchObject({ deep: true });
+    expect(standard).not.toHaveProperty("tier");
+    expect(deep).toMatchObject({ tier: "deep-review" });
     const deadline = Date.parse(deep!.deadlineAt);
     expect(deadline - before).toBeGreaterThanOrEqual(13 * 60_000);
     expect(deadline - Date.now()).toBeLessThanOrEqual(13 * 60_000);

@@ -128,6 +128,14 @@ const VERIFIER_ORDER: readonly string[] = [
   "claude-code",
   "workers-ai",
 ];
+const REVIEW_TIERS = {
+  standard: { families: REVIEW_FAMILIES, deadlineMs: REVIEW_DEADLINE_MS },
+  "deep-review": {
+    families: DEEP_REVIEW_FAMILIES,
+    deadlineMs: DEEP_REVIEW_DEADLINE_MS,
+  },
+};
+type ReviewTier = keyof typeof REVIEW_TIERS;
 // One handle serves every candidate its family rules on, each a lane of its
 // own, so it carries one lane's budget per candidate the engine may hand it.
 const VERIFIER_CAPS = {
@@ -148,7 +156,7 @@ type CloudReview = {
   context?: string;
   origin: string;
   deadlineAt: string;
-  deep?: boolean;
+  tier?: ReviewTier;
 };
 
 type AppReview = {
@@ -170,7 +178,7 @@ type AppReview = {
   completionRetryAt?: number;
   shadow?: boolean;
   configNote?: string | null;
-  deep?: boolean;
+  tier?: ReviewTier;
 };
 
 const plain = (value: unknown) =>
@@ -216,7 +224,7 @@ const lostToPlatform = (message: unknown): message is string =>
 const withNotes = (state: AppReview, text: string) =>
   [
     text,
-    state.deep &&
+    state.tier === "deep-review" &&
       "Deep review: each family's deepest model, with up to 13 minutes.",
     state.retriedAfter &&
       `Retried once: the first attempt ended with ${plain(state.retriedAfter)}.`,
@@ -231,7 +239,7 @@ export class PullRequestReview extends DurableObject<ReviewPiEnv> {
     event: PullRequestEvent,
     delivery: string,
     origin: string,
-    deep = false,
+    tier?: ReviewTier,
   ) {
     if (await this.ctx.storage.get(`delivery:${delivery}`)) return false;
     await this.ctx.storage.put(`delivery:${delivery}`, true);
@@ -254,7 +262,7 @@ export class PullRequestReview extends DurableObject<ReviewPiEnv> {
       outcome: null,
       briefNote: null,
       progress: null,
-      ...(deep ? { deep } : {}),
+      ...(tier ? { tier } : {}),
     };
     await this.ctx.storage.put("current", state);
     await this.ctx.storage.setAlarm(Date.now());
@@ -393,9 +401,7 @@ export class PullRequestReview extends DurableObject<ReviewPiEnv> {
   private async advance(): Promise<boolean | number> {
     const state = await this.ctx.storage.get<AppReview>("current");
     if (!state || state.phase === "done") return false;
-    const deadlineMs = state.deep
-      ? DEEP_REVIEW_DEADLINE_MS
-      : REVIEW_DEADLINE_MS;
+    const { deadlineMs } = REVIEW_TIERS[state.tier ?? "standard"];
     try {
       const token = await this.token(state.event);
       const { repository } = state.event;
@@ -439,7 +445,7 @@ export class PullRequestReview extends DurableObject<ReviewPiEnv> {
           ...(brief.context ? { context: brief.context } : {}),
           origin: state.origin,
           deadlineAt: new Date(Date.now() + deadlineMs).toISOString(),
-          ...(state.deep ? { deep: true } : {}),
+          ...(state.tier ? { tier: state.tier } : {}),
         });
         state.phase = "running";
         if (!(await this.save(state))) return false;
@@ -1404,7 +1410,7 @@ async function runCloudReview(env: ReviewPiEnv, review: CloudReview) {
       review.reviewId,
       capability,
     );
-    const families = review.deep ? DEEP_REVIEW_FAMILIES : REVIEW_FAMILIES;
+    const { families } = REVIEW_TIERS[review.tier ?? "standard"];
     const handles = Object.fromEntries(
       Object.keys(families).flatMap((family) => [
         [
@@ -2063,7 +2069,12 @@ export default {
         });
       const accepted = await env.PULL_REQUEST_REVIEWS.getByName(
         `${event.repository.toLowerCase()}#${event.number}`,
-      ).accept(event, delivery, url0.origin, rerun.deep);
+      ).accept(
+        event,
+        delivery,
+        url0.origin,
+        rerun.deep ? "deep-review" : undefined,
+      );
       return json({ accepted }, 202);
     }
     if (url0.pathname.startsWith("/git/")) {
