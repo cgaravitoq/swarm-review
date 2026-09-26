@@ -2113,13 +2113,25 @@ export default {
           !/^[0-9a-f]{40}$/.test(input["base"]) ||
           (input["context"] !== undefined &&
             (typeof input["context"] !== "string" ||
-              input["context"].length > 64_000))
+              input["context"].length > 64_000)) ||
+          (input["reviewId"] !== undefined &&
+            (typeof input["reviewId"] !== "string" ||
+              !/^review-[0-9a-f]{8}(-[0-9a-f]{4}){3}-[0-9a-f]{12}$/.test(
+                input["reviewId"],
+              )))
         )
           throw new Error();
       } catch {
         return json({ error: "invalid_review" }, 400);
       }
-      const reviewId = assertCloudRunId(`review-${crypto.randomUUID()}`);
+      // A client that names the id can follow a review whose 202 it never
+      // received, instead of starting a second one.
+      const reviewId = assertCloudRunId(
+        (input["reviewId"] as string | undefined) ??
+          `review-${crypto.randomUUID()}`,
+      );
+      if (await env.PROBE_RESULTS.head(reviewKey(reviewId, "git")))
+        return json({ error: "review_exists" }, 409);
       const review: CloudReview = {
         reviewId,
         repository: input["repository"] as string,
