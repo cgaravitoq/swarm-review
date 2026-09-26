@@ -201,6 +201,12 @@ Review and Re-run on that check start a new generation if its commit is still th
 Every completed check, and the neutral check a push gets, also offers Deep review, which starts a new generation the same way with DeepSeek V4 Pro, GPT-6 Astra and Claude Fable 5.1 as the three families and a 13-minute deadline instead of 8.
 A review runs inside one Durable Object alarm, which Cloudflare stops after 15 minutes, so the deep deadline leaves room for the transcripts and teardown, and the check still completes within 15 minutes of the click.
 Re-run on a deep review's check starts a standard one; Deep review is the button that repeats it.
+With `TYPESAFE_API_KEY` set as a Worker secret, the App asks Jev, TypeSafe's System One model, how deeply to review each pull request before its review starts.
+Jev sees the pull request's title, its description cut at 4 000 characters, and each changed file's path with its lines added and removed, up to 300 files, and never a patch or a file's contents.
+Light runs DeepSeek V4 Flash and GPT-6 Luna at low reasoning, standard runs the three families as a Worker without the key does, and deep runs the three at high reasoning for up to 13 minutes with Claude Opus ruling on candidates first.
+A light review has two families, so a candidate both of them report has no family left to verify it and stays unverified.
+A pick under 0.55 confidence, a Jev that does not answer, and metadata that cannot be read each run a standard review, and a rate-limited read waits out the reset; the check says which tier ran and why.
+Deep review on the check never asks Jev, and a Worker without the key never calls TypeSafe.
 A 403, 404, or 422 from GitHub ends that generation's retries, completes its check with the reason, and does not block later generations.
 A rate-limited 403 or 429 is retried after the reset GitHub names instead.
 Set `GITHUB_APP_ID`, `GITHUB_APP_PRIVATE_KEY` (PKCS#8 PEM), and `GITHUB_WEBHOOK_SECRET` as Worker secrets before installing the App.
