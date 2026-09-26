@@ -269,7 +269,11 @@ describe("cloud reviews", () => {
             exitCode: 0,
           };
         if (command.includes(" clone --depth 1"))
-          return { stdout: "", exitCode: failure === "clone" ? 1 : 0 };
+          return {
+            stdout: "",
+            stderr: "",
+            exitCode: failure === "clone" ? 1 : 0,
+          };
         if (command.startsWith("stat -c")) {
           const file = command.match(/'([^']+)'/)?.[1] ?? "";
           return {
@@ -442,6 +446,227 @@ describe("cloud reviews", () => {
       engine,
     });
     expect(fixture.sandbox.destroy).toHaveBeenCalledOnce();
+  });
+
+  const upstreamWithPull = async (
+    root: string,
+    options: { pushPull: boolean; unrelatedBase: boolean },
+  ) => {
+    const upstream = path.join(root, "upstream.git");
+    const source = path.join(root, "source");
+    const git = (...args: string[]) => {
+      const result = spawnSync("git", args, { encoding: "utf8" });
+      expect(result.status, result.stderr).toBe(0);
+      return result.stdout.trim();
+    };
+    git("init", "--bare", "-q", upstream);
+    git("init", "-q", "-b", "main", source);
+    git("-C", source, "config", "user.name", "Test");
+    git("-C", source, "config", "user.email", "test@invalid");
+    await writeFile(path.join(source, "file.txt"), "base\n");
+    git("-C", source, "add", "file.txt");
+    git("-C", source, "commit", "-qm", "base");
+    const fork = git("-C", source, "rev-parse", "HEAD");
+    git("-C", source, "remote", "add", "origin", upstream);
+    git("-C", source, "push", "-q", "origin", "main");
+    git("-C", upstream, "symbolic-ref", "HEAD", "refs/heads/main");
+    await writeFile(path.join(source, "file.txt"), "base\nhead\n");
+    git("-C", source, "commit", "-qam", "head");
+    const head = git("-C", source, "rev-parse", "HEAD");
+    if (options.pushPull)
+      git("-C", source, "push", "-q", "origin", "HEAD:refs/pull/17/head");
+    if (!options.unrelatedBase) return { upstream, head, base: fork };
+    git("-C", source, "checkout", "-q", "--orphan", "unrelated");
+    git("-C", source, "commit", "-q", "--allow-empty", "-m", "unrelated");
+    git("-C", source, "push", "-q", "origin", "unrelated");
+    return {
+      upstream,
+      head,
+      base: git("-C", source, "rev-parse", "HEAD"),
+    };
+  };
+
+  const runCloneThroughShell = (
+    fixture: ReturnType<typeof setup>,
+    upstreamUrl: string,
+    checkout: string,
+  ) => {
+    const fake = fixture.sandbox.exec.getMockImplementation();
+    if (!fake) throw new Error("the sandbox exec fake is missing");
+    const outputs: string[] = [];
+    fixture.sandbox.exec.mockImplementation(async (command: string) => {
+      if (!command.includes(" clone --depth 1")) return fake(command);
+      const local = command
+        .replaceAll(
+          `setpriv --reuid=${TARGET_UID} --regid=${TARGET_UID} --clear-groups `,
+          "",
+        )
+        .replace(/https:\/\/review\.invalid\/git\/[^']+/, upstreamUrl)
+        .replace(/\/workspace\/runs\/[^/']+\/clone/g, checkout);
+      const result = spawnSync("sh", ["-c", local], {
+        encoding: "utf8",
+        timeout: 20_000,
+      });
+      outputs.push(result.stdout);
+      return {
+        stdout: result.stdout,
+        stderr: result.stderr,
+        exitCode: result.status ?? -1,
+      };
+    });
+    return outputs;
+  };
+
+  it.each([
+    {
+      step: "clone",
+      exitCode: 128,
+      pushPull: true,
+      unrelatedBase: false,
+      missingRemote: true,
+    },
+    { step: "fetch_head", exitCode: 128, pushPull: false },
+    { step: "head_mismatch", exitCode: 128, head: "c".repeat(40) },
+    { step: "fetch_base", exitCode: 128, base: "d".repeat(40) },
+    { step: "merge_base", exitCode: 1, unrelatedBase: true },
+  ])(
+    "records a clone that fails at $step with its exit code and stderr tail",
+    async (scenario) => {
+      const root = await mkdtemp(path.join(tmpdir(), "review-clone-"));
+      try {
+        const upstream = await upstreamWithPull(root, {
+          pushPull: scenario.pushPull ?? true,
+          unrelatedBase: scenario.unrelatedBase ?? false,
+        });
+        const fixture = setup();
+        runCloneThroughShell(
+          fixture,
+          pathToFileURL(
+            scenario.missingRemote
+              ? path.join(root, "missing.git")
+              : upstream.upstream,
+          ).href,
+          path.join(root, "checkout"),
+        );
+        const response = await post(fixture.reviewEnv, {
+          ...requestBody,
+          head: scenario.head ?? upstream.head,
+          base: scenario.base ?? upstream.base,
+        });
+        const { reviewId } = (await response.json()) as { reviewId: string };
+        await fixture.job.alarm();
+        const receipt = fixture.r2.get(`reviews/${reviewId}/receipt.json`) as {
+          failure: { clone: { stderr: string } };
+        };
+        const clone = {
+          step: scenario.step,
+          exitCode: scenario.exitCode,
+          stderr: receipt.failure.clone.stderr,
+        };
+        expect(receipt).toMatchObject({
+          status: "failed",
+          failure: { stage: "cloud_review", message: "clone_failed", clone },
+        });
+        expect(clone.stderr.length).toBeGreaterThan(0);
+        if (scenario.step !== "head_mismatch" && scenario.step !== "merge_base")
+          expect(clone.stderr).toMatch(/fatal:/);
+        expect(fixture.r2.get(`reviews/${reviewId}/status.json`)).toMatchObject(
+          {
+            phase: "failed",
+            reason: "clone_failed",
+            clone,
+          },
+        );
+        expect(fixture.sandbox.startProcess).not.toHaveBeenCalled();
+      } finally {
+        await rm(root, { recursive: true, force: true });
+      }
+    },
+  );
+
+  it("records a clone that passes every step and adds nothing to its receipt or status", async () => {
+    const root = await mkdtemp(path.join(tmpdir(), "review-clone-"));
+    try {
+      const upstream = await upstreamWithPull(root, {
+        pushPull: true,
+        unrelatedBase: false,
+      });
+      const fixture = setup();
+      const outputs = runCloneThroughShell(
+        fixture,
+        pathToFileURL(upstream.upstream).href,
+        path.join(root, "checkout"),
+      );
+      const response = await post(fixture.reviewEnv, {
+        ...requestBody,
+        head: upstream.head,
+        base: upstream.base,
+      });
+      const { reviewId } = (await response.json()) as { reviewId: string };
+      await fixture.job.alarm();
+      expect(outputs).toEqual([
+        "clone\nfetch_head\nhead_mismatch\nfetch_base\nmerge_base\n",
+      ]);
+      expect(fixture.r2.get(`reviews/${reviewId}/receipt.json`)).toEqual({
+        swarmId: "test",
+        status: "completed",
+        findings: [],
+      });
+      expect(fixture.r2.get(`reviews/${reviewId}/status.json`)).toEqual({
+        phase: "done",
+        reviewers: [],
+        candidates: 0,
+        verified: 0,
+        deadlineAt: "test",
+      });
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it("redacts the git capability and run header from a failed clone's stderr before storing it", async () => {
+    const fixture = setup();
+    const fake = fixture.sandbox.exec.getMockImplementation();
+    if (!fake) throw new Error("the sandbox exec fake is missing");
+    fixture.sandbox.exec.mockImplementation(async (command: string) => {
+      if (!command.includes(" clone --depth 1")) return fake(command);
+      const remote = command.match(
+        /'(https:\/\/review\.invalid\/git\/[^']+)'/,
+      )?.[1];
+      const capability = remote?.split("/").at(-1);
+      const header = command.match(/x-review-run: ([^']+)'/)?.[1];
+      return {
+        stdout: "clone\n",
+        stderr: `${"x".repeat(10_000)}\nfatal: unable to access '${remote}/': The requested URL returned error: 503\n> GET /git/${capability}/info/refs?service=git-upload-pack HTTP/1.1\n> x-review-run: ${header}\n`,
+        exitCode: 128,
+      };
+    });
+    const response = await post(fixture.reviewEnv);
+    const { reviewId } = (await response.json()) as { reviewId: string };
+    await fixture.job.alarm();
+    const capability = await gitCapability(
+      reviewId,
+      env.CONTROL_SECRET,
+      requestBody.repository,
+    );
+    const receipt = fixture.r2.get(`reviews/${reviewId}/receipt.json`) as {
+      failure: { clone: { stderr: string } };
+    };
+    const status = fixture.r2.get(`reviews/${reviewId}/status.json`);
+    const stderr = receipt.failure.clone.stderr;
+    expect(stderr).toHaveLength(4096);
+    expect(stderr).toMatch(
+      /fatal: unable to access '\[redacted\]\/': The requested URL returned error: 503\n> GET \/git\/\[redacted\]\/info\/refs\?service=git-upload-pack HTTP\/1\.1\n> x-review-run: \[redacted\]\n$/,
+    );
+    expect(stderr).not.toContain(reviewId);
+    expect(receipt.failure.clone).toEqual({
+      step: "clone",
+      exitCode: 128,
+      stderr,
+    });
+    expect(status).toMatchObject({ clone: receipt.failure.clone });
+    for (const stored of [receipt, status])
+      expect(JSON.stringify(stored)).not.toContain(capability);
   });
 
   it("cuts an expired review before the engine and records the deadline", async () => {
