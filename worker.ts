@@ -1245,11 +1245,9 @@ const failedReviewStatus = (
   phase: "failed",
   reviewers:
     observed?.["reviewers"] ??
-    Object.entries(REVIEW_FAMILIES).map(([family, { model }]) => ({
-      family,
-      model,
-      state: "unobserved",
-    })),
+    Object.entries(REVIEW_TIERS[review.tier ?? "standard"].families).map(
+      ([family, { model }]) => ({ family, model, state: "unobserved" }),
+    ),
   candidates: observed?.["candidates"] ?? 0,
   verified: observed?.["verified"] ?? 0,
   deadlineAt: review.deadlineAt,
