@@ -164,6 +164,17 @@ The deadline is eight minutes from admission; the engine has a shorter deadline 
 If the engine produces no receipt, a failed or expired review records a failed receipt; failure status retains the last observed reviewer states.
 `GET /reviews/<reviewId>` returns `{status, receipt?}` from `reviews/<reviewId>/status.json` and `reviews/<reviewId>/receipt.json` in the Worker's R2 bucket.
 
+An operator runs one from the CLI with `WORKER_ORIGIN` and `CONTROL_SECRET` exported, since neither is ever a flag:
+
+```sh
+bun src/swarm.ts --cloud --repo <owner/name> --pr <n> --out <dir> [--context <brief.md>]
+```
+
+It resolves the PR's head and the merge base of its base and head with `GITHUB_TOKEN`, `GH_TOKEN` or `gh auth token`, or takes explicit full SHAs from `--head` and `--base`.
+It submits the review, polls every 15 seconds, prints one line whenever the phase, a reviewer's state, the candidates or the verified count change, and writes the latest `status.json` and the `receipt.json` to `--out`.
+It exits 0 on a completed receipt, and 1 on a partial or failed receipt, a refused submission, or no receipt a minute past the status's `deadlineAt`.
+`--cloud` cannot be combined with `--sandbox`, `--orca`, `--worker` or `--hybrid`.
+
 The deployment needs `WORKERS_AI_ACCOUNT_ID` and `WORKERS_AI_API_KEY` as Worker bindings, plus configured `openai-codex` and `claude-code` vault credentials.
 The deploy script bundles `src/swarm.ts` into the generated image context and supplies `IMAGE_SOURCE_HASHES` to the Worker, so the image fingerprint gate checks the engine before any model request.
 
