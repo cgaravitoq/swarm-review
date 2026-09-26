@@ -183,6 +183,23 @@ describe("read-only Git proxy", () => {
     );
   });
 
+  it("hands git a rate limit on the credential without resending", async () => {
+    const upstream = vi.fn<typeof fetch>(() =>
+      Promise.resolve(
+        new Response("rate limited", {
+          status: 429,
+          headers: { "x-github-request-id": "30D6:1B6C4B:78CFDF1:7307658" },
+        }),
+      ),
+    );
+    vi.stubGlobal("fetch", upstream);
+
+    const response = await uploadPack("run-5");
+
+    expect(response.status).toBe(429);
+    expect(upstream).toHaveBeenCalledTimes(1);
+  });
+
   it("hands git GitHub's rate limit once every attempt was refused", async () => {
     const upstream = vi.fn<typeof fetch>(() =>
       Promise.resolve(edgeRateLimit()),
