@@ -18,6 +18,24 @@
           }
         },
         {
+          "id": "claude-fable-5-1",
+          "reasoning": true,
+          "input": ["text", "image"],
+          "contextWindow": 1000000,
+          "maxTokens": 128000,
+          "cost": {
+            "input": 10,
+            "output": 50,
+            "cacheRead": 0.25,
+            "cacheWrite": 12.5
+          },
+          "thinkingLevelMap": {
+            "off": null,
+            "xhigh": "xhigh",
+            "max": "max"
+          }
+        },
+        {
           "id": "claude-opus-5",
           "reasoning": true,
           "input": ["text", "image"],
@@ -88,6 +106,16 @@
     "cloudflare-workers-ai": {
       "modelOverrides": {
         "@cf/deepseek-ai/deepseek-v4-flash-0731": {
+          "contextWindow": 1048576,
+          "maxTokens": 65536,
+          "compat": {
+            "thinkingFormat": "chat-template",
+            "chatTemplateKwargs": {
+              "thinking": { "$var": "thinking.enabled" }
+            }
+          }
+        },
+        "@cf/deepseek-ai/deepseek-v4-pro-0813": {
           "contextWindow": 1048576,
           "maxTokens": 65536,
           "compat": {
