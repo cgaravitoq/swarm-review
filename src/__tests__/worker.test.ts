@@ -357,12 +357,40 @@ describe("cloud reviews", () => {
       }[];
       verifiers: unknown[];
     };
-    expect(parsed.reviewers.map((lane) => lane.family)).toEqual([
-      "workers-ai",
-      "openai-codex",
-      "claude-code",
-    ]);
-    expect(parsed.verifiers).toHaveLength(3);
+    const lane = (
+      family: string,
+      provider: string,
+      model: string,
+      role: string,
+    ) => ({
+      family,
+      provider,
+      model,
+      piDir: `/workspace/runs/${reviewId}/pi-${family}-${role}`,
+      extensions:
+        family === "claude-code"
+          ? ["/opt/review/extensions/claude-code-provider.js"]
+          : [],
+      env:
+        family === "workers-ai"
+          ? { CLOUDFLARE_ACCOUNT_ID: "fake-account" }
+          : {},
+    });
+    const deepseek = (role: string) =>
+      lane(
+        "workers-ai",
+        "cloudflare-workers-ai",
+        "@cf/deepseek-ai/deepseek-v4-flash-0731",
+        role,
+      );
+    const luna = (role: string) =>
+      lane("openai-codex", "openai-codex", "gpt-6-luna", role);
+    const opus = (role: string) =>
+      lane("claude-code", "claude-code", "claude-opus-5-5", role);
+    expect(parsed).toEqual({
+      reviewers: [deepseek, luna, opus].map((family) => family("reviewer")),
+      verifiers: [luna, opus, deepseek].map((family) => family("verifier")),
+    });
     expect(lanes?.[1]).not.toContain("fake-workers-bearer");
     expect(parsed.reviewers[0]?.env).toEqual({
       CLOUDFLARE_ACCOUNT_ID: "fake-account",
