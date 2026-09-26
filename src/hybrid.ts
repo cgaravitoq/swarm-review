@@ -36,6 +36,7 @@ import {
 } from "./swarm";
 
 type Family = "workers-ai" | "openai-codex" | "claude-code";
+const THINKING = ["minimal", "low", "medium", "high", "xhigh"] as const;
 type Lane = {
   family: Family;
   provider: string;
@@ -43,6 +44,7 @@ type Lane = {
   piDir: string;
   extensions: string[];
   env: Record<string, string>;
+  thinking?: (typeof THINKING)[number];
 };
 type LaneResult = {
   status: "completed" | "failed" | "cut";
@@ -73,6 +75,7 @@ function parseLane(value: unknown): Lane {
   if (!lane) throw new Error("invalid lane");
   const family = lane["family"];
   const env = record(lane["env"]);
+  const thinking = THINKING.find((level) => level === lane["thinking"]);
   if (
     (family !== "workers-ai" &&
       family !== "openai-codex" &&
@@ -83,7 +86,8 @@ function parseLane(value: unknown): Lane {
     !Array.isArray(lane["extensions"]) ||
     !lane["extensions"].every((entry) => typeof entry === "string") ||
     !env ||
-    !Object.values(env).every((entry) => typeof entry === "string")
+    !Object.values(env).every((entry) => typeof entry === "string") ||
+    (lane["thinking"] !== undefined && !thinking)
   )
     throw new Error("invalid lane config");
   return {
@@ -93,6 +97,7 @@ function parseLane(value: unknown): Lane {
     piDir: lane["piDir"],
     extensions: lane["extensions"] as string[],
     env: env as Record<string, string>,
+    ...(thinking ? { thinking } : {}),
   };
 }
 
@@ -315,7 +320,13 @@ function runPi(input: {
           ...args,
           ...(reportTurn
             ? ["--no-tools", "--thinking", "off"]
-            : ["--tools", tools]),
+            : [
+                "--tools",
+                tools,
+                ...(input.lane.thinking
+                  ? ["--thinking", input.lane.thinking]
+                  : []),
+              ]),
         ],
         {
           cwd: input.source,
