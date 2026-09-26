@@ -383,6 +383,27 @@ describe("cloud reviews", () => {
     ]);
   });
 
+  it("names a failed deep review's own models as its unobserved reviewers", async () => {
+    const fixture = setup("clone");
+    const reviewId = "review-deep-failed";
+    await fixture.job.start({
+      reviewId,
+      ...requestBody,
+      origin: "https://review.invalid",
+      deadlineAt: new Date(Date.now() + 13 * 60_000).toISOString(),
+      tier: "deep-review",
+    });
+    await fixture.job.alarm();
+    expect(fixture.r2.get(`reviews/${reviewId}/status.json`)).toMatchObject({
+      phase: "failed",
+      reviewers: [
+        "@cf/deepseek-ai/deepseek-v4-pro-0813",
+        "gpt-6-astra",
+        "claude-fable-5-1",
+      ].map((model) => ({ model, state: "unobserved" })),
+    });
+  });
+
   it("accepts immediately, runs the engine as uid 1102 with broker handles, and stores R2 state and receipt", async () => {
     const fixture = setup();
     const response = await post(fixture.reviewEnv);
