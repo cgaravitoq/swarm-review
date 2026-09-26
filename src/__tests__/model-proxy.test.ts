@@ -340,7 +340,7 @@ describe("model proxy", () => {
       );
       expect(await new Response(init?.body).text()).toBe("{}");
       return new Response(
-        'data: {"choices":[{"delta":{"content":"pong"}}],"usage":{"prompt_tokens":3,"completion_tokens":1}}\n\n',
+        'data: {"choices":[{"delta":{"content":"pong"}}],"usage":{"prompt_tokens":3,"completion_tokens":1}}\n\ndata: [DONE]\n\n',
         { status: 200, headers: { "content-type": "text/event-stream" } },
       );
     });
