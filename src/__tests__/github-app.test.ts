@@ -1575,6 +1575,18 @@ const checkRun = (overrides: Record<string, unknown> = {}) => ({
   ...overrides,
 });
 
+const checkSuite = (overrides: Record<string, unknown> = {}) => ({
+  action: "rerequested",
+  check_suite: {
+    head_sha: HEAD,
+    app: { id: 123 },
+    pull_requests: [{ number: 7, head: { sha: HEAD }, base: { sha: BASE } }],
+  },
+  repository: { full_name: "acme/demo" },
+  installation: { id: 42 },
+  ...overrides,
+});
+
 describe("Checks tab", () => {
   it("answers a push with a neutral check offering Review and starts no review", async () => {
     const { env, pr, stored, job, started } = fixture();
@@ -1718,7 +1730,103 @@ describe("Checks tab", () => {
       ),
       env as never,
     );
-    expect(await response.json()).toEqual({ ignored: true });
+    expect(await response.json()).toEqual({
+      ignored: true,
+      reason: "head_moved",
+    });
     expect(storage.put).not.toHaveBeenCalled();
   });
+
+  it("starts one new generation when Re-run all checks asks for the App's suite", async () => {
+    const { env, pr, stored, job, started } = fixture();
+    const gh = github();
+    await started();
+    gh.calls.length = 0;
+    const response = await worker.fetch(
+      await signed(
+        JSON.stringify(checkSuite()),
+        "webhook-secret",
+        "03345678-1234-1234-1234-123456789abc",
+        "check_suite",
+      ),
+      env as never,
+    );
+    expect(await response.json()).toEqual({ accepted: true });
+    const pull = gh.sent()[0]!;
+    expect(pull).toMatchObject({
+      method: "GET",
+      url: `${API}/pulls/7`,
+      body: null,
+    });
+    expect(pull.headers.get("authorization")).toBe("Bearer installation-token");
+    await pr.alarm();
+    expect(job.cancel).toHaveBeenCalledOnce();
+    expect(job.start).toHaveBeenCalledTimes(2);
+    expect(stored.get("current")).toMatchObject({
+      generation: 2,
+      phase: "running",
+      checkRunId: 100,
+      event: PULL,
+    });
+  });
+
+  it("ignores a rerequested suite that belongs to another App", async () => {
+    const { env, storage } = fixture();
+    const gh = github();
+    const response = await worker.fetch(
+      await signed(
+        JSON.stringify(
+          checkSuite({
+            check_suite: { ...checkSuite().check_suite, app: { id: 999 } },
+          }),
+        ),
+        "webhook-secret",
+        undefined,
+        "check_suite",
+      ),
+      env as never,
+    );
+    expect(await response.json()).toEqual({ ignored: true });
+    expect(gh.calls).toEqual([]);
+    expect(storage.put).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    ["check_run", checkRun()],
+    ["check_suite", checkSuite()],
+  ])(
+    "refuses a %s re-run on a PR the opened path would not review",
+    async (kind, payload) => {
+      const { env, storage } = fixture();
+      const gh = github({
+        routes: {
+          [`GET ${API}/pulls/7`]: () =>
+            Response.json({
+              state: "open",
+              draft: true,
+              author_association: "MEMBER",
+              head: { sha: HEAD },
+              base: { sha: BASE },
+            }),
+        },
+      });
+      const response = await worker.fetch(
+        await signed(
+          JSON.stringify(payload),
+          "webhook-secret",
+          undefined,
+          kind,
+        ),
+        env as never,
+      );
+      expect(await response.json()).toEqual({
+        ignored: true,
+        reason: "not_reviewable",
+      });
+      expect(gh.sent().map((call) => `${call.method} ${call.url}`)).toEqual([
+        `GET ${API}/pulls/7`,
+      ]);
+      expect(storage.put).not.toHaveBeenCalled();
+    },
+  );
 });

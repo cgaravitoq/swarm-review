@@ -144,22 +144,29 @@ export function pullRequestEvent(
   return event ? { action, event } : null;
 }
 
-export function checkRunEvent(value: unknown) {
+export function rerunEvent(
+  kind: "check_run" | "check_suite",
+  value: unknown,
+  appId: string,
+) {
   if (typeof value !== "object" || value === null || Array.isArray(value))
     return null;
   const body = value as Record<string, unknown>;
-  const run = body["check_run"] as Record<string, unknown> | undefined;
+  const run = body[kind] as Record<string, unknown> | undefined;
   const requested = body["requested_action"] as
     | Record<string, unknown>
     | undefined;
-  if (
-    body["action"] !== "rerequested" &&
-    !(
-      body["action"] === "requested_action" &&
-      requested?.["identifier"] === REVIEW_ACTION
-    )
-  )
-    return null;
+  const ours =
+    kind === "check_suite"
+      ? body["action"] === "rerequested" &&
+        String(
+          (run?.["app"] as Record<string, unknown> | undefined)?.["id"],
+        ) === appId
+      : run?.["name"] === "swarm-review" &&
+        (body["action"] === "rerequested" ||
+          (body["action"] === "requested_action" &&
+            requested?.["identifier"] === REVIEW_ACTION));
+  if (!ours) return null;
   const head = run?.["head_sha"];
   const repository = (
     body["repository"] as Record<string, unknown> | undefined
@@ -175,7 +182,6 @@ export function checkRunEvent(value: unknown) {
       head,
   ) as Record<string, unknown> | undefined;
   if (
-    run?.["name"] !== "swarm-review" ||
     typeof head !== "string" ||
     !/^[a-f0-9]{40}$/.test(head) ||
     typeof repository !== "string" ||

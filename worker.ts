@@ -17,7 +17,6 @@ import { CredentialVault } from "./src/credential-vault";
 import { gitCapability, proxyGitFetch } from "./src/git-proxy";
 import {
   allowedRepositories,
-  checkRunEvent,
   completeCheck,
   createCheck,
   GitHubRequestError,
@@ -27,6 +26,7 @@ import {
   type PullRequestEvent,
   pullRequestEvent,
   readBrief,
+  rerunEvent,
   updateCheck,
   verifyWebhook,
 } from "./src/github-app";
@@ -1761,7 +1761,11 @@ export default {
       if (!env.GITHUB_APP_ID || !env.GITHUB_APP_PRIVATE_KEY)
         return json({ error: "github_app_unconfigured" }, 503);
       const kind = request.headers.get("x-github-event");
-      if (kind !== "pull_request" && kind !== "check_run")
+      if (
+        kind !== "pull_request" &&
+        kind !== "check_run" &&
+        kind !== "check_suite"
+      )
         return json({ ignored: true });
       const delivery = request.headers.get("x-github-delivery");
       if (!delivery || !/^[a-fA-F0-9-]{36}$/.test(delivery))
@@ -1787,7 +1791,7 @@ export default {
             : await review.offer(parsed.event, delivery);
         return json({ accepted }, 202);
       }
-      const rerun = checkRunEvent(payload);
+      const rerun = rerunEvent(kind, payload, env.GITHUB_APP_ID);
       if (!rerun) return json({ ignored: true });
       if (!allowed.has(rerun.repository.toLowerCase()))
         return json({ error: "repository_mismatch" }, 403);
@@ -1810,7 +1814,11 @@ export default {
           502,
         );
       }
-      if (event?.head !== rerun.head) return json({ ignored: true });
+      if (event?.head !== rerun.head)
+        return json({
+          ignored: true,
+          reason: event ? "head_moved" : "not_reviewable",
+        });
       const accepted = await env.PULL_REQUEST_REVIEWS.getByName(
         `${event.repository.toLowerCase()}#${event.number}`,
       ).accept(event, delivery, url0.origin);
