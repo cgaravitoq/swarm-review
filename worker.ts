@@ -172,6 +172,8 @@ const refusedForGood = (error: unknown) =>
 const retryAfter = (error: unknown) =>
   error instanceof GitHubRequestError ? (error.retryAt ?? 0) : 0;
 
+const sentence = (text: unknown) => `${text}`.replace(/\.*$/, ".");
+
 const lostToPlatform = (message: unknown): message is string =>
   typeof message === "string" &&
   /^(interrupted$|destroy_failed|image source )|Durable Object reset because its code was updated/.test(
@@ -287,7 +289,7 @@ export class PullRequestReview extends DurableObject<ReviewPiEnv> {
               cancelFailures.set(previous.generation, failures);
               throw error;
             }
-            summary = `${SUPERSEDED_SUMMARY} Its cloud review could not be stopped after ${failures} attempts: ${messageOf(error)}.`;
+            summary = `${SUPERSEDED_SUMMARY} Its cloud review could not be stopped after ${failures} attempts: ${sentence(messageOf(error))}`;
           }
         await completeCheck(
           await this.token(previous.event),
@@ -433,7 +435,7 @@ export class PullRequestReview extends DurableObject<ReviewPiEnv> {
           token,
           state,
           "neutral",
-          `Review could not complete: ${receipt.failure?.message ?? `receipt status ${plain(receipt.status)}`}.\n\n${laneSummary(receipt)}`,
+          `Review could not complete: ${sentence(receipt.failure?.message ?? `receipt status ${plain(receipt.status)}`)}\n\n${laneSummary(receipt)}`,
         );
         return false;
       }
@@ -461,7 +463,7 @@ export class PullRequestReview extends DurableObject<ReviewPiEnv> {
           await this.token(state.event),
           state,
           "neutral",
-          `Review could not complete: ${messageOf(error)}.`,
+          `Review could not complete: ${sentence(messageOf(error))}`,
         );
       } catch (completion) {
         if (!refusedForGood(completion)) return retryAfter(completion);
@@ -525,7 +527,7 @@ export class PullRequestReview extends DurableObject<ReviewPiEnv> {
         (finding) => finding.status === "confirmed",
       ).length;
     } catch (error) {
-      return ["neutral", `Review not published: ${messageOf(error)}.`];
+      return ["neutral", `Review not published: ${sentence(messageOf(error))}`];
     }
     try {
       const validated = await revalidatePullRequest(
@@ -571,7 +573,7 @@ export class PullRequestReview extends DurableObject<ReviewPiEnv> {
           : error instanceof TypeError
       )
         throw error;
-      return ["neutral", `Review not published: ${messageOf(error)}.`];
+      return ["neutral", `Review not published: ${sentence(messageOf(error))}`];
     }
   }
 
