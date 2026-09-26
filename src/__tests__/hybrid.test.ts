@@ -493,13 +493,14 @@ it("gives a lane at the tool-turn budget one tools-off report turn and publishes
   ) as HybridReceipt;
   expect(receipt.lanes?.[0]?.status).toBe("completed");
   expect(receipt.lanes?.[0]?.model).toBe("test-a");
-  expect(receipt.lanes?.[0]?.turns).toBe(9);
+  expect(receipt.lanes?.[0]?.turns).toBe(17);
   expect(receipt.candidates).toHaveLength(1);
   const calls = (await readFile(input.log, "utf8"))
     .trim()
     .split("\n")
     .map((line) => JSON.parse(line) as { args: string[]; prompt: string });
   expect(calls).toHaveLength(3);
+  expect(calls[0]?.prompt).toContain("at most 16 investigation turns");
   expect(calls[1]?.args).toContain("--no-tools");
   expect(calls[1]?.args).toContain("--session-id");
   const sessionId = (args: string[]) => args[args.indexOf("--session-id") + 1];
@@ -554,7 +555,7 @@ it("reserves time for a tools-off report before the deadline", async () => {
     await readFile(join(input.out, "receipt.json"), "utf8"),
   ) as HybridReceipt;
   expect(receipt.lanes[0]?.status).toBe("completed");
-  expect(receipt.lanes[0]?.turns).toBeLessThan(9);
+  expect(receipt.lanes[0]?.turns).toBeLessThan(17);
   expect(receipt.candidates).toHaveLength(1);
   const calls = (await readFile(input.log, "utf8"))
     .trim()
@@ -573,12 +574,13 @@ it("gives a verifier at its tool-turn budget one tools-off verdict turn", async 
   const receipt = JSON.parse(
     await readFile(join(input.out, "receipt.json"), "utf8"),
   ) as HybridReceipt;
-  expect(receipt.lanes[1]).toMatchObject({ status: "completed", turns: 9 });
+  expect(receipt.lanes[1]).toMatchObject({ status: "completed", turns: 17 });
   expect(receipt.findings[0]?.status).toBe("confirmed");
   const calls = (await readFile(input.log, "utf8"))
     .trim()
     .split("\n")
-    .map((line) => JSON.parse(line) as { args: string[] });
+    .map((line) => JSON.parse(line) as { args: string[]; prompt: string });
+  expect(calls[1]?.prompt).toContain("at most 16 investigation turns");
   expect(calls[2]?.args).toContain("--no-tools");
 });
 

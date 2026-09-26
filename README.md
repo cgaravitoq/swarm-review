@@ -54,7 +54,7 @@ bun run src/swarm.ts --hybrid --repo owner/name --source /path/to/checkout \
 
 The hybrid run writes `status.json` and a publish-compatible `receipt.json` directly in `--out`.
 It defaults to an eight-minute deadline and never installs dependencies or runs project checks.
-Each lane gets up to eight investigation turns, then a final turn without tools or thinking to report its findings.
+Each lane gets up to sixteen investigation turns, then a final turn without tools or thinking to report its findings.
 Reviewers get the first 60% of the window; the runner requests each reviewer's report before that review deadline, and a reviewer that reaches it is marked cut with stop reason `review deadline`.
 The verifiers start as soon as every reviewer has ended and keep the rest of the window.
 Each verification has at most two minutes and never runs past the run deadline, leaving a slow candidate unverified when its verifier runs out of time.
