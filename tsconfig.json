@@ -10,9 +10,6 @@
     "moduleDetection": "force",
     "verbatimModuleSyntax": true,
 
-    "incremental": true,
-    "tsBuildInfoFile": ".cache/tsbuildinfo.json",
-
     "strict": true,
     "noUncheckedIndexedAccess": true,
     "exactOptionalPropertyTypes": true,
