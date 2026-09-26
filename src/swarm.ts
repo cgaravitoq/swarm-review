@@ -500,8 +500,9 @@ const parseJson = (body: string) => {
  *
  * A lab that opens the block and never closes the fence still handed over the
  * whole answer - `workers-ai/@cf/deepseek-ai/deepseek-v4-flash-0731` does this
- * on every packed call - and the closing fence is punctuation next to the JSON.
- * The same lab sometimes answers with the bare object and no fence at all
+ * on every packed call - and the closing fence is punctuation next to the JSON,
+ * as is a fence cut short to one or two backticks, which `gpt-6-luna` wrote.
+ * DeepSeek sometimes answers with the bare object and no fence at all
  * (run swarm-mtxj62kn), which is still the whole answer. What
  * rejects a lane that was cut mid-answer is the parse, not the fence.
  *
@@ -517,7 +518,9 @@ const lastJsonBlock = (finalText: string) => {
     .map(({ index }) => {
       const body = finalText.slice(index + "```json".length);
       const closed = body.indexOf("```");
-      return parseJson(closed === -1 ? body : body.slice(0, closed));
+      return parseJson(
+        closed === -1 ? body.replace(/`{1,2}\s*$/, "") : body.slice(0, closed),
+      );
     })
     .reverse();
   const answer = blocks.find((block) => block.error === null) ?? blocks[0];
