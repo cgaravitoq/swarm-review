@@ -242,7 +242,7 @@ const sentence = (text: unknown) => `${text}`.replace(/\.*$/, ".");
 
 const lostToPlatform = (message: unknown): message is string =>
   typeof message === "string" &&
-  /^(interrupted$|destroy_failed$|image source |Durable Object reset because its code was updated)/.test(
+  /^(interrupted$|destroy_failed$|image source |Durable Object reset because its code was updated|Connection closed: this Durable Object instance is no longer active)/.test(
     message,
   );
 
