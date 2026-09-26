@@ -4,6 +4,7 @@ import { fetchMergeBase, fetchPullRevisions } from "./publish";
 import { githubToken } from "./swarm";
 
 const POLL_MS = 15_000;
+const REQUEST_TIMEOUT_MS = 30_000;
 const DEADLINE_MARGIN_MS = 60_000;
 const UNOBSERVED_DEADLINE_MS = 10 * 60_000;
 const MAX_CONTEXT_CHARS = 64_000;
@@ -50,7 +51,9 @@ const requiredEnv = (name: string) => {
 };
 
 async function readBody(response: Response) {
-  const text = await response.text();
+  const text = await response
+    .text()
+    .catch((error: unknown) => `unreadable body: ${(error as Error).message}`);
   try {
     return JSON.parse(text) as unknown;
   } catch {
@@ -123,27 +126,43 @@ export async function runCloud(argv: string[], io: CloudIo = defaultIo) {
     io.print(line.replaceAll(secret, "[redacted]"));
   const { head, base } = await revisions(argv, repo, pr);
 
+  let reviewId = `review-${crypto.randomUUID()}`;
   const submitted = await fetch(`${origin}/reviews`, {
     method: "POST",
     headers: { ...headers, "content-type": "application/json" },
     body: JSON.stringify({
+      reviewId,
       repository: repo,
       pr,
       head,
       base,
       ...(context === undefined ? {} : { context }),
     }),
-  });
-  const accepted = await readBody(submitted);
-  const reviewId =
-    typeof accepted === "object" && accepted !== null
-      ? (accepted as { reviewId?: unknown }).reviewId
-      : undefined;
-  if (submitted.status !== 202 || typeof reviewId !== "string") {
-    print(`cloud review refused: ${describeRefusal(submitted, accepted)}`);
+    signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
+  }).catch((error: unknown) => error as Error);
+  // Only a request that timed out may have reached the Worker; one that could
+  // not connect started nothing.
+  if (submitted instanceof Error && submitted.name !== "TimeoutError") {
+    print(`cloud review not submitted: ${submitted.message}`);
     return 1;
   }
-  print(`cloud review ${reviewId}: accepted for ${repo}#${pr} at ${head}`);
+  if (submitted instanceof Error) {
+    print(
+      `cloud review ${reviewId}: submit unanswered (${submitted.message}); following it in case the Worker started it`,
+    );
+  } else {
+    const accepted = await readBody(submitted);
+    const answered =
+      typeof accepted === "object" && accepted !== null
+        ? (accepted as { reviewId?: unknown }).reviewId
+        : undefined;
+    if (submitted.status !== 202 || typeof answered !== "string") {
+      print(`cloud review refused: ${describeRefusal(submitted, accepted)}`);
+      return 1;
+    }
+    reviewId = answered;
+    print(`cloud review ${reviewId}: accepted for ${repo}#${pr} at ${head}`);
+  }
   await mkdir(out, { recursive: true });
 
   let deadline = io.now() + UNOBSERVED_DEADLINE_MS;
@@ -151,7 +170,7 @@ export async function runCloud(argv: string[], io: CloudIo = defaultIo) {
   while (io.now() <= deadline) {
     const response = await fetch(
       `${origin}/reviews/${encodeURIComponent(reviewId)}`,
-      { headers },
+      { headers, signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS) },
     ).catch((error: unknown) => error as Error);
     if (response instanceof Error) {
       print(`cloud review ${reviewId}: poll failed: ${response.message}`);

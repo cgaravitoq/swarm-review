@@ -1601,6 +1601,7 @@ describe("App review publication", () => {
         4_102_444_800_000,
       );
       gh.calls.length = 0;
+      vi.spyOn(Date, "now").mockReturnValue(4_102_444_800_000);
       await pr.alarm();
       expect(
         gh.sent().filter((call) => `${call.method} ${call.url}` === route),
@@ -1649,6 +1650,47 @@ describe("App review publication", () => {
       }),
     ]);
     expect(stored.get("superseded")).toEqual([]);
+  });
+
+  it("spreads five attempts to complete a superseded check over an hour, then stops", async () => {
+    const { pr, stored, storage, started } = fixture();
+    const gh = github({
+      routes: {
+        [`PATCH ${API}/check-runs/99`]: (call) =>
+          (call.body as { status: string }).status === "completed"
+            ? new Response("upstream error", { status: 502 })
+            : undefined,
+      },
+    });
+    await started();
+    await pr.accept(PULL, "e2345678-1234-1234-1234-123456789abc", ORIGIN);
+    const completions = () =>
+      gh.calls.filter(
+        (call) =>
+          call.method === "PATCH" &&
+          call.url === `${API}/check-runs/99` &&
+          (call.body as { status: string }).status === "completed",
+      );
+    let now = Date.now();
+    vi.spyOn(Date, "now").mockImplementation(() => now);
+    for (const wait of [60_000, 240_000, 960_000, 3_840_000]) {
+      await pr.alarm();
+      const attempts = completions().length;
+      now += wait - 1;
+      await pr.alarm();
+      expect(completions()).toHaveLength(attempts);
+      now += 1;
+    }
+    expect(completions()).toHaveLength(4);
+    expect(stored.get("superseded")).toEqual([
+      expect.objectContaining({ generation: 1, completionFailures: 4 }),
+    ]);
+    await pr.alarm();
+    expect(completions()).toHaveLength(5);
+    expect(stored.get("superseded")).toEqual([]);
+    storage.setAlarm.mockClear();
+    await pr.alarm();
+    expect(completions()).toHaveLength(5);
   });
 
   it("gives up on a cancel that keeps failing and records it on the superseded check", async () => {

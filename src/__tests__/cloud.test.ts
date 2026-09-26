@@ -145,6 +145,9 @@ it("submits the PR at its head and merge base, follows it to a completed receipt
   expect(post?.headers.get("user-agent")).toBe("swarm-review-cli");
   expect(post?.headers.get("content-type")).toBe("application/json");
   expect(post?.body).toEqual({
+    reviewId: expect.stringMatching(
+      /^review-[0-9a-f]{8}(-[0-9a-f]{4}){3}-[0-9a-f]{12}$/,
+    ),
     repository: "octo/widget",
     pr: 7,
     head: HEAD,
@@ -188,6 +191,9 @@ it("sends explicit --head and --base without asking GitHub", async () => {
     `${ORIGIN}/reviews/review-2`,
   ]);
   expect(calls[0]?.body).toEqual({
+    reviewId: expect.stringMatching(
+      /^review-[0-9a-f]{8}(-[0-9a-f]{4}){3}-[0-9a-f]{12}$/,
+    ),
     repository: "octo/widget",
     pr: 7,
     head: HEAD,
@@ -270,6 +276,137 @@ it("keeps the secret out of an error body that echoes the authorization header",
     "cloud review review-6: poll failed: 502 non-JSON body: upstream saw authorization: Bearer [redacted]",
   );
   await expectNoSecret();
+});
+
+function hangUntilAborted() {
+  const timers: { ms: number; controller: AbortController }[] = [];
+  vi.spyOn(AbortSignal, "timeout").mockImplementation((ms) => {
+    const controller = new AbortController();
+    timers.push({ ms, controller });
+    return controller.signal;
+  });
+  const hung = (init: RequestInit = {}) =>
+    new Promise<Response>((_, reject) =>
+      init.signal?.addEventListener("abort", () => reject(init.signal?.reason)),
+    );
+  const timeOut = async (index: number) => {
+    while (!timers[index]) await new Promise((wake) => setTimeout(wake, 1));
+    timers[index].controller.abort(
+      new DOMException("The operation timed out.", "TimeoutError"),
+    );
+  };
+  return { timers, hung, timeOut };
+}
+
+it("follows a review whose submit went unanswered under the id it sent", async () => {
+  const { timers, hung, timeOut } = hangUntilAborted();
+  const calls = stubFetch([
+    json({
+      status: status("done", [], { candidates: 0, verified: 0 }),
+      receipt: { status: "completed" },
+    }),
+  ]);
+  const fetchStub = vi.mocked(fetch);
+  const answer = fetchStub.getMockImplementation()!;
+  fetchStub.mockImplementation(async (input, init) =>
+    init?.method === "POST" ? hung(init) : answer(input, init),
+  );
+  const exit = runCloud(argv(), io);
+  await timeOut(0);
+  expect(await exit).toBe(0);
+  const [, submit] = fetchStub.mock.calls.find(
+    ([, init]) => init?.method === "POST",
+  )!;
+  const { reviewId } = JSON.parse(String(submit?.body)) as {
+    reviewId: string;
+  };
+  expect(submit?.signal).toBe(timers[0]?.controller.signal);
+  expect(timers[0]?.ms).toBe(30_000);
+  expect(workerCalls(calls).map((call) => call.url)).toEqual([
+    `${ORIGIN}/reviews/${reviewId}`,
+  ]);
+  expect(lines).toEqual([
+    `cloud review ${reviewId}: submit unanswered (The operation timed out.); following it in case the Worker started it`,
+    `cloud review ${reviewId}: phase done | reviewers none | candidates 0 | verified 0`,
+    `cloud review ${reviewId}: completed`,
+  ]);
+});
+
+it("gives up on an unanswered submit the Worker never started once nothing is observed", async () => {
+  const { hung, timeOut } = hangUntilAborted();
+  const calls = stubFetch(
+    Array.from({ length: 41 }, () => json({ error: "not_found" }, 404)),
+  );
+  const fetchStub = vi.mocked(fetch);
+  const answer = fetchStub.getMockImplementation()!;
+  fetchStub.mockImplementation(async (input, init) =>
+    init?.method === "POST" ? hung(init) : answer(input, init),
+  );
+  const exit = runCloud(argv(), io);
+  await timeOut(0);
+  expect(await exit).toBe(1);
+  expect(workerCalls(calls)).toHaveLength(41);
+  expect(lines.at(-1)).toMatch(
+    /^cloud review review-[0-9a-f-]{36}: timed out waiting for a receipt past the deadline$/,
+  );
+});
+
+it("reports a submit that could not reach the Worker as not submitted and polls nothing", async () => {
+  const calls = stubFetch([]);
+  const fetchStub = vi.mocked(fetch);
+  const answer = fetchStub.getMockImplementation()!;
+  fetchStub.mockImplementation(async (input, init) => {
+    if (String(input).startsWith(ORIGIN))
+      throw new TypeError(
+        "Unable to connect. Is the computer able to access the url?",
+      );
+    return answer(input, init);
+  });
+  expect(await runCloud(argv(), io)).toBe(1);
+  expect(lines).toEqual([
+    "cloud review not submitted: Unable to connect. Is the computer able to access the url?",
+  ]);
+  expect(
+    fetchStub.mock.calls.filter(([input]) => String(input).startsWith(ORIGIN)),
+  ).toHaveLength(1);
+  expect(workerCalls(calls)).toEqual([]);
+});
+
+it("keeps polling past a poll the Worker never answers once that request times out", async () => {
+  const { timers, hung, timeOut } = hangUntilAborted();
+  const calls = stubFetch([
+    json({ reviewId: "review-7" }, 202),
+    json({
+      status: status("done", [], { candidates: 0, verified: 0 }),
+      receipt: { status: "completed" },
+    }),
+  ]);
+  const fetchStub = vi.mocked(fetch);
+  const answer = fetchStub.getMockImplementation()!;
+  let polls = 0;
+  fetchStub.mockImplementation(async (input, init) =>
+    String(input).startsWith(`${ORIGIN}/reviews/`) && polls++ === 0
+      ? hung(init)
+      : answer(input, init),
+  );
+  const exit = runCloud(argv(), io);
+  await timeOut(1);
+  expect(await exit).toBe(0);
+  expect(lines).toEqual([
+    `cloud review review-7: accepted for octo/widget#7 at ${HEAD}`,
+    "cloud review review-7: poll failed: The operation timed out.",
+    "cloud review review-7: phase done | reviewers none | candidates 0 | verified 0",
+    "cloud review review-7: completed",
+  ]);
+  expect(timers.map((timer) => timer.ms)).toEqual([30_000, 30_000, 30_000]);
+  expect(
+    fetchStub.mock.calls
+      .filter(([input]) => String(input).startsWith(ORIGIN))
+      .map(
+        ([, init], index) => init?.signal === timers[index]?.controller.signal,
+      ),
+  ).toEqual([true, true, true]);
+  expect(workerCalls(calls)).toHaveLength(2);
 });
 
 it("survives a non-JSON poll and times out past the status deadline plus a margin", async () => {

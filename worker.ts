@@ -152,6 +152,8 @@ type AppReview = {
   progress: string | null;
   cancelFailures?: number;
   retriedAfter?: string;
+  completionFailures?: number;
+  completionRetryAt?: number;
 };
 
 const plain = (value: unknown) =>
@@ -172,7 +174,10 @@ const laneSummary = (receipt: SwarmReceipt) => {
     .join("\n");
 };
 
-const CANCEL_ATTEMPTS = 5;
+const RETIRE_ATTEMPTS = 5;
+// Four waits of 1, 4, 16 and 64 minutes, so the five attempts span an outage
+// rather than five alarms that other events can fire back to back.
+const COMPLETION_BACKOFF_MS = 60_000;
 const SUPERSEDED_SUMMARY = "A newer pull request event superseded this review.";
 
 const refusedForGood = (error: unknown) =>
@@ -287,21 +292,22 @@ export class PullRequestReview extends DurableObject<ReviewPiEnv> {
       (await this.ctx.storage.get<AppReview[]>("superseded")) ?? [];
     const retired = new Set<number>();
     let wakeAt = 0;
-    const cancelFailures = new Map<number, number>();
+    const failures = new Map<number, Partial<AppReview>>();
     for (const previous of superseded) {
-      try {
-        let summary = SUPERSEDED_SUMMARY;
-        if (previous.reviewId)
-          try {
-            await this.env.REVIEW_JOBS.getByName(previous.reviewId).cancel();
-          } catch (error) {
-            const failures = (previous.cancelFailures ?? 0) + 1;
-            if (failures < CANCEL_ATTEMPTS) {
-              cancelFailures.set(previous.generation, failures);
-              throw error;
-            }
-            summary = `${SUPERSEDED_SUMMARY} Its cloud review could not be stopped after ${failures} attempts: ${sentence(messageOf(error))}`;
+      if ((previous.completionRetryAt ?? 0) > Date.now()) continue;
+      let summary = SUPERSEDED_SUMMARY;
+      if (previous.reviewId)
+        try {
+          await this.env.REVIEW_JOBS.getByName(previous.reviewId).cancel();
+        } catch (error) {
+          const cancelFailures = (previous.cancelFailures ?? 0) + 1;
+          if (cancelFailures < RETIRE_ATTEMPTS) {
+            failures.set(previous.generation, { cancelFailures });
+            continue;
           }
+          summary = `${SUPERSEDED_SUMMARY} Its cloud review could not be stopped after ${cancelFailures} attempts: ${sentence(messageOf(error))}`;
+        }
+      try {
         await completeCheck(
           await this.token(previous.event),
           previous.event.repository,
@@ -311,20 +317,28 @@ export class PullRequestReview extends DurableObject<ReviewPiEnv> {
         );
         retired.add(previous.generation);
       } catch (error) {
-        if (refusedForGood(error)) retired.add(previous.generation);
-        else wakeAt = Math.max(wakeAt, retryAfter(error));
+        const completionFailures = (previous.completionFailures ?? 0) + 1;
+        if (refusedForGood(error) || completionFailures >= RETIRE_ATTEMPTS)
+          retired.add(previous.generation);
+        else {
+          failures.set(previous.generation, {
+            completionFailures,
+            completionRetryAt: Math.max(
+              retryAfter(error),
+              Date.now() +
+                COMPLETION_BACKOFF_MS * 4 ** (completionFailures - 1),
+            ),
+          });
+          wakeAt = Math.max(wakeAt, retryAfter(error));
+        }
       }
     }
     const left = ((await this.ctx.storage.get<AppReview[]>("superseded")) ?? [])
       .filter((previous) => !retired.has(previous.generation))
-      .map((previous) =>
-        cancelFailures.has(previous.generation)
-          ? {
-              ...previous,
-              cancelFailures: cancelFailures.get(previous.generation),
-            }
-          : previous,
-      );
+      .map((previous) => ({
+        ...previous,
+        ...failures.get(previous.generation),
+      }));
     await this.ctx.storage.put("superseded", left);
     return left.length > 0 && wakeAt;
   }
@@ -2099,13 +2113,25 @@ export default {
           !/^[0-9a-f]{40}$/.test(input["base"]) ||
           (input["context"] !== undefined &&
             (typeof input["context"] !== "string" ||
-              input["context"].length > 64_000))
+              input["context"].length > 64_000)) ||
+          (input["reviewId"] !== undefined &&
+            (typeof input["reviewId"] !== "string" ||
+              !/^review-[0-9a-f]{8}(-[0-9a-f]{4}){3}-[0-9a-f]{12}$/.test(
+                input["reviewId"],
+              )))
         )
           throw new Error();
       } catch {
         return json({ error: "invalid_review" }, 400);
       }
-      const reviewId = assertCloudRunId(`review-${crypto.randomUUID()}`);
+      // A client that names the id can follow a review whose 202 it never
+      // received, instead of starting a second one.
+      const reviewId = assertCloudRunId(
+        (input["reviewId"] as string | undefined) ??
+          `review-${crypto.randomUUID()}`,
+      );
+      if (await env.PROBE_RESULTS.head(reviewKey(reviewId, "git")))
+        return json({ error: "review_exists" }, 409);
       const review: CloudReview = {
         reviewId,
         repository: input["repository"] as string,
