@@ -7,6 +7,7 @@ import path from "node:path";
 import { pathToFileURL } from "node:url";
 
 import { afterEach, describe, expect, it, vi } from "vitest";
+import { verificationsPerFamily } from "../../prompts/hybrid";
 import {
   deployArguments,
   imageBuildArguments,
@@ -398,16 +399,13 @@ describe("cloud reviews", () => {
     expect(fixture.sandbox.putProbeSessions).toHaveBeenCalledOnce();
     const sessions = fixture.sandbox.putProbeSessions.mock.calls[0]?.[0] ?? {};
     expect(Object.keys(sessions)).toHaveLength(6);
-    for (const session of Object.values(sessions)) {
-      expect(session).toMatchObject({ caps: SESSION_CAPS.t1b });
-    }
     const modelFiles = [...fixture.files.entries()].filter(
       ([file]) =>
         file.startsWith(`/workspace/runs/${reviewId}/pi-`) &&
         file.endsWith("/models.json"),
     );
     expect(modelFiles).toHaveLength(6);
-    for (const [, body] of modelFiles) {
+    for (const [file, body] of modelFiles) {
       expect(body).not.toContain("fake-workers-bearer");
       const providers = JSON.parse(body).providers as Record<
         string,
@@ -419,6 +417,21 @@ describe("cloud reviews", () => {
       expect(configured?.apiKey).toBeTypeOf("string");
       expect(configured?.baseUrl).toContain(`/model/${reviewId}/`);
       expect(sessions).toHaveProperty(configured?.apiKey ?? "missing");
+      expect(sessions[configured!.apiKey!]).toMatchObject({
+        caps: file.endsWith("-verifier/models.json")
+          ? {
+              ...SESSION_CAPS.t1b,
+              maxRequests:
+                SESSION_CAPS.t1b.maxRequests * verificationsPerFamily,
+              maxCumulativeInputTokens:
+                SESSION_CAPS.t1b.maxCumulativeInputTokens *
+                verificationsPerFamily,
+              maxCumulativeOutputTokens:
+                SESSION_CAPS.t1b.maxCumulativeOutputTokens *
+                verificationsPerFamily,
+            }
+          : SESSION_CAPS.t1b,
+      });
     }
     const settingsFiles = [...fixture.files.entries()].filter(
       ([file]) =>

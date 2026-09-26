@@ -4,7 +4,12 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { mkdir, readFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
-import { reviewerPrompt, turnCap, verifierPrompt } from "../prompts/hybrid";
+import {
+  reviewerPrompt,
+  turnCap,
+  verificationsPerFamily,
+  verifierPrompt,
+} from "../prompts/hybrid";
 import { writeAtomic } from "./attempt";
 import {
   packBudgetChars,
@@ -528,8 +533,12 @@ export async function runHybrid(argv: string[]) {
         .filter((outcome) => outcome.status === "cut")
         .map((outcome) => outcome.family),
     );
+    const assigned = new Map<string, number>();
+    const bySeverity = [...candidates].sort((a, b) =>
+      a.severity.localeCompare(b.severity),
+    );
     await Promise.all(
-      candidates.map(async (candidate) => {
+      bySeverity.map(async (candidate) => {
         const finderFamilies = new Set(
           candidate.reportedBy.map((id) => {
             const index = Number(id.slice("reviewer-".length)) - 1;
@@ -541,13 +550,17 @@ export async function runHybrid(argv: string[]) {
             !finderFamilies.has(entry.family) &&
             !failedFamilies.has(entry.family),
         );
+        const open = eligible.filter(
+          (entry) => (assigned.get(entry.family) ?? 0) < verificationsPerFamily,
+        );
         const lane =
-          eligible.find((entry) => !cutFamilies.has(entry.family)) ??
-          eligible[0];
+          open.find((entry) => !cutFamilies.has(entry.family)) ?? open[0];
         if (!lane) {
           unverifiedReasons.set(
             candidate.id,
-            `no verifier family can rule: reported by ${[...finderFamilies].join(", ")}${failedFamilies.size > 0 ? `; reviewer failed in ${[...failedFamilies].join(", ")}` : ""}`,
+            eligible.length > 0
+              ? `every verifier family that can rule already has ${verificationsPerFamily} candidates`
+              : `no verifier family can rule: reported by ${[...finderFamilies].join(", ")}${failedFamilies.size > 0 ? `; reviewer failed in ${[...failedFamilies].join(", ")}` : ""}`,
           );
           return;
         }
@@ -558,6 +571,7 @@ export async function runHybrid(argv: string[]) {
           );
           return;
         }
+        assigned.set(lane.family, (assigned.get(lane.family) ?? 0) + 1);
         const brief = verifierBrief({
           repo: source,
           base,

@@ -12,6 +12,7 @@ import { getSandbox, Sandbox } from "@cloudflare/sandbox";
 
 export { ContainerProxy } from "@cloudflare/sandbox";
 
+import { verificationsPerFamily } from "./prompts/hybrid";
 import { createCodexRelayTransport } from "./src/codex-relay";
 import { CredentialVault } from "./src/credential-vault";
 import { gitCapability, proxyGitFetch } from "./src/git-proxy";
@@ -114,6 +115,16 @@ const VERIFIER_ORDER: readonly string[] = [
   "claude-code",
   "workers-ai",
 ];
+// One handle serves every candidate its family rules on, each a lane of its
+// own, so it carries one lane's budget per candidate the engine may hand it.
+const VERIFIER_CAPS = {
+  ...SESSION_CAPS.t1b,
+  maxRequests: SESSION_CAPS.t1b.maxRequests * verificationsPerFamily,
+  maxCumulativeInputTokens:
+    SESSION_CAPS.t1b.maxCumulativeInputTokens * verificationsPerFamily,
+  maxCumulativeOutputTokens:
+    SESSION_CAPS.t1b.maxCumulativeOutputTokens * verificationsPerFamily,
+};
 
 type CloudReview = {
   reviewId: string;
@@ -1333,7 +1344,10 @@ async function runCloudReview(env: ReviewPiEnv, review: CloudReview) {
           ...(family === "workers-ai"
             ? { upstreamAuthorization: `Bearer ${env.WORKERS_AI_API_KEY}` }
             : { credentialProvider: family }),
-          caps: { ...SESSION_CAPS.t1b },
+          caps:
+            role === "verifier"
+              ? { ...VERIFIER_CAPS }
+              : { ...SESSION_CAPS.t1b },
           totals: emptyModelTotals(),
         };
         const piDir = `${directory}/pi-${family}-${role}`;
