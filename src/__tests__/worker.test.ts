@@ -487,7 +487,7 @@ describe("cloud reviews", () => {
         (command) =>
           command.includes("git -c") &&
           command.includes(" clone --depth 1") &&
-          command.includes("pull/17/head"),
+          command.includes(`fetch --depth 1 origin '${"a".repeat(40)}'`),
       ),
     ).toBe(true);
     const engine = fixture.sandbox.startProcess.mock.calls[0]?.[0] as string;
@@ -960,7 +960,7 @@ describe("cloud reviews", () => {
       missingRemote: true,
     },
     { step: "fetch_head", exitCode: 128, pushPull: false },
-    { step: "head_mismatch", exitCode: 128, head: "c".repeat(40) },
+    { step: "fetch_head", exitCode: 128, head: "c".repeat(40) },
     { step: "fetch_base", exitCode: 128, base: "d".repeat(40) },
     { step: "merge_base", exitCode: 1, unrelatedBase: true },
   ])(
@@ -1002,7 +1002,7 @@ describe("cloud reviews", () => {
           failure: { stage: "cloud_review", message: "clone_failed", clone },
         });
         expect(clone.stderr.length).toBeGreaterThan(0);
-        if (scenario.step !== "head_mismatch" && scenario.step !== "merge_base")
+        if (scenario.step !== "merge_base")
           expect(clone.stderr).toMatch(/fatal:/);
         expect(fixture.r2.get(`reviews/${reviewId}/status.json`)).toMatchObject(
           {
@@ -1038,9 +1038,7 @@ describe("cloud reviews", () => {
       });
       const { reviewId } = (await response.json()) as { reviewId: string };
       await fixture.job.alarm();
-      expect(outputs).toEqual([
-        "clone\nfetch_head\nhead_mismatch\nfetch_base\nmerge_base\n",
-      ]);
+      expect(outputs).toEqual(["clone\nfetch_head\nfetch_base\nmerge_base\n"]);
       expect(fixture.r2.get(`reviews/${reviewId}/receipt.json`)).toEqual({
         swarmId: "test",
         status: "completed",
