@@ -17,7 +17,6 @@ import { CredentialVault } from "./src/credential-vault";
 import { gitCapability, proxyGitFetch } from "./src/git-proxy";
 import {
   allowedRepositories,
-  checkRunEvent,
   completeCheck,
   createCheck,
   GitHubRequestError,
@@ -27,6 +26,7 @@ import {
   type PullRequestEvent,
   pullRequestEvent,
   readBrief,
+  rerunEvent,
   updateCheck,
   verifyWebhook,
 } from "./src/github-app";
@@ -131,6 +131,7 @@ type AppReview = {
   outcome: string | null;
   briefNote: string | null;
   progress: string | null;
+  cancelFailures?: number;
 };
 
 const plain = (value: unknown) =>
@@ -151,6 +152,7 @@ const laneSummary = (receipt: SwarmReceipt) => {
     .join("\n");
 };
 
+const CANCEL_ATTEMPTS = 5;
 const SUPERSEDED_SUMMARY = "A newer pull request event superseded this review.";
 
 const refusedForGood = (error: unknown) =>
@@ -159,9 +161,7 @@ const refusedForGood = (error: unknown) =>
   [403, 404, 422].includes(error.status);
 
 const retryAfter = (error: unknown) =>
-  error instanceof GitHubRequestError && error.retryAt !== null
-    ? error.retryAt
-    : true;
+  error instanceof GitHubRequestError ? (error.retryAt ?? 0) : 0;
 
 export class PullRequestReview extends DurableObject<ReviewPiEnv> {
   async accept(event: PullRequestEvent, delivery: string, origin: string) {
@@ -248,46 +248,68 @@ export class PullRequestReview extends DurableObject<ReviewPiEnv> {
     const superseded =
       (await this.ctx.storage.get<AppReview[]>("superseded")) ?? [];
     const retired = new Set<number>();
+    let wakeAt = 0;
+    const cancelFailures = new Map<number, number>();
     for (const previous of superseded) {
       try {
+        let summary = SUPERSEDED_SUMMARY;
         if (previous.reviewId)
-          await this.env.REVIEW_JOBS.getByName(previous.reviewId).cancel();
+          try {
+            await this.env.REVIEW_JOBS.getByName(previous.reviewId).cancel();
+          } catch (error) {
+            const failures = (previous.cancelFailures ?? 0) + 1;
+            if (failures < CANCEL_ATTEMPTS) {
+              cancelFailures.set(previous.generation, failures);
+              throw error;
+            }
+            summary = `${SUPERSEDED_SUMMARY} Its cloud review could not be stopped after ${failures} attempts: ${messageOf(error)}.`;
+          }
         await completeCheck(
           await this.token(previous.event),
           previous.event.repository,
           previous.checkRunId!,
           "neutral",
-          SUPERSEDED_SUMMARY,
+          summary,
         );
         retired.add(previous.generation);
       } catch (error) {
         if (refusedForGood(error)) retired.add(previous.generation);
+        else wakeAt = Math.max(wakeAt, retryAfter(error));
       }
     }
-    const left = (
-      (await this.ctx.storage.get<AppReview[]>("superseded")) ?? []
-    ).filter((previous) => !retired.has(previous.generation));
+    const left = ((await this.ctx.storage.get<AppReview[]>("superseded")) ?? [])
+      .filter((previous) => !retired.has(previous.generation))
+      .map((previous) =>
+        cancelFailures.has(previous.generation)
+          ? {
+              ...previous,
+              cancelFailures: cancelFailures.get(previous.generation),
+            }
+          : previous,
+      );
     await this.ctx.storage.put("superseded", left);
-    return left.length > 0;
+    return left.length > 0 && wakeAt;
   }
 
   private async offerReviews() {
     const offers =
       (await this.ctx.storage.get<PullRequestEvent[]>("offers")) ?? [];
     const offered = new Set<string>();
+    let wakeAt = 0;
     for (const offer of offers) {
       try {
         await offerCheck(await this.token(offer), offer);
         offered.add(offer.head);
       } catch (error) {
         if (refusedForGood(error)) offered.add(offer.head);
+        else wakeAt = Math.max(wakeAt, retryAfter(error));
       }
     }
     const left = (
       (await this.ctx.storage.get<PullRequestEvent[]>("offers")) ?? []
     ).filter((offer) => !offered.has(offer.head));
     await this.ctx.storage.put("offers", left);
-    return left.length > 0;
+    return left.length > 0 && wakeAt;
   }
 
   private async advance(): Promise<boolean | number> {
@@ -315,13 +337,15 @@ export class PullRequestReview extends DurableObject<ReviewPiEnv> {
           token,
         );
         if (!(await this.save(state))) return false;
-        const reviewId = assertCloudRunId(`review-${crypto.randomUUID()}`);
+        const brief = await readBrief(token, repository, state.event.base);
+        state.briefNote = brief.note ?? null;
+        state.reviewId ??= assertCloudRunId(`review-${crypto.randomUUID()}`);
+        const reviewId = state.reviewId;
         await putReviewJson(this.env, reviewId, "git", {
           repository,
           installationId: state.event.installationId,
         });
-        const brief = await readBrief(token, repository, state.event.base);
-        state.briefNote = brief.note ?? null;
+        if (!(await this.save(state))) return false;
         await startReview(this.env, {
           reviewId,
           repository,
@@ -332,12 +356,8 @@ export class PullRequestReview extends DurableObject<ReviewPiEnv> {
           origin: state.origin,
           deadlineAt: new Date(Date.now() + REVIEW_DEADLINE_MS).toISOString(),
         });
-        state.reviewId = reviewId;
         state.phase = "running";
-        if (!(await this.save(state))) {
-          await this.env.REVIEW_JOBS.getByName(reviewId).cancel();
-          return false;
-        }
+        if (!(await this.save(state))) return false;
       }
       const receiptObject = await this.env.PROBE_RESULTS.get(
         reviewKey(state.reviewId!, "receipt"),
@@ -436,7 +456,12 @@ export class PullRequestReview extends DurableObject<ReviewPiEnv> {
           `- ${plain(reviewer?.["family"])} ${plain(reviewer?.["model"])}: ${plain(reviewer?.["state"])}`,
       ),
     ].join("\n");
-    if (progress === state.progress) return;
+    if (
+      progress === state.progress ||
+      (await this.ctx.storage.get<AppReview>("current"))?.generation !==
+        state.generation
+    )
+      return;
     try {
       await updateCheck(
         token,
@@ -1785,7 +1810,11 @@ export default {
       if (!env.GITHUB_APP_ID || !env.GITHUB_APP_PRIVATE_KEY)
         return json({ error: "github_app_unconfigured" }, 503);
       const kind = request.headers.get("x-github-event");
-      if (kind !== "pull_request" && kind !== "check_run")
+      if (
+        kind !== "pull_request" &&
+        kind !== "check_run" &&
+        kind !== "check_suite"
+      )
         return json({ ignored: true });
       const delivery = request.headers.get("x-github-delivery");
       if (!delivery || !/^[a-fA-F0-9-]{36}$/.test(delivery))
@@ -1811,7 +1840,7 @@ export default {
             : await review.offer(parsed.event, delivery);
         return json({ accepted }, 202);
       }
-      const rerun = checkRunEvent(payload);
+      const rerun = rerunEvent(kind, payload, env.GITHUB_APP_ID);
       if (!rerun) return json({ ignored: true });
       if (!allowed.has(rerun.repository.toLowerCase()))
         return json({ error: "repository_mismatch" }, 403);
@@ -1834,7 +1863,11 @@ export default {
           502,
         );
       }
-      if (event?.head !== rerun.head) return json({ ignored: true });
+      if (event?.head !== rerun.head)
+        return json({
+          ignored: true,
+          reason: event ? "head_moved" : "not_reviewable",
+        });
       const accepted = await env.PULL_REQUEST_REVIEWS.getByName(
         `${event.repository.toLowerCase()}#${event.number}`,
       ).accept(event, delivery, url0.origin);

@@ -85,6 +85,15 @@ const BASE = "b".repeat(40);
 const MERGE_BASE = "c".repeat(40);
 const MOVED = "d".repeat(40);
 const API = "https://api.github.com/repos/acme/demo";
+const ORIGIN = "https://review.invalid";
+const SUPERSEDED = "A newer pull request event superseded this review.";
+const PULL = {
+  repository: "acme/demo",
+  number: 7,
+  head: HEAD,
+  base: BASE,
+  installationId: 42,
+};
 const BRIEF_AT_BASE = `${API}/contents/.swarm-review/brief.md?ref=${BASE}`;
 const DIFF = `diff --git a/src/app.ts b/src/app.ts
 index 1111111..2222222 100644
@@ -547,6 +556,50 @@ describe("GitHub App webhook", () => {
     },
   );
 
+  it("waits out a rate-limited brief read and then steers by the brief", async () => {
+    const { pr, job, stored, storage } = fixture();
+    const brief = "Money moves only through the ledger module.";
+    let limited = 1;
+    const gh = github({
+      routes: {
+        [`GET ${BRIEF_AT_BASE}`]: () =>
+          limited-- > 0
+            ? new Response("API rate limit exceeded", {
+                status: 403,
+                headers: {
+                  "x-ratelimit-remaining": "0",
+                  "x-ratelimit-reset": "4102444800",
+                },
+              })
+            : new Response(brief),
+      },
+    });
+    await pr.accept(PULL, "b2345678-1234-1234-1234-123456789abc", ORIGIN);
+    storage.setAlarm.mockClear();
+    await pr.alarm();
+    expect(job.start).not.toHaveBeenCalled();
+    expect(stored.get("current")).toMatchObject({
+      phase: "pending",
+      checkRunId: 99,
+      briefNote: null,
+    });
+    expect(storage.setAlarm).toHaveBeenCalledExactlyOnceWith(4_102_444_800_000);
+    await pr.alarm();
+    expect(
+      gh.calls
+        .filter((call) => call.url.includes("/contents/"))
+        .map((call) => `${call.method} ${call.url}`),
+    ).toEqual([`GET ${BRIEF_AT_BASE}`, `GET ${BRIEF_AT_BASE}`]);
+    expect(job.start).toHaveBeenCalledExactlyOnceWith(
+      expect.objectContaining({ context: brief }),
+    );
+    expect(stored.get("current")).toMatchObject({
+      phase: "running",
+      checkRunId: 99,
+      briefNote: null,
+    });
+  });
+
   it("updates the running check once per phase or reviewer change", async () => {
     const { pr, r2, stored, storage, started } = fixture();
     const gh = github();
@@ -626,6 +679,25 @@ describe("GitHub App webhook", () => {
       phase: "running",
       progress: "Phase: `reviewing`.",
     });
+  });
+
+  it("sends no progress to a check a newer generation superseded mid-read", async () => {
+    const { pr, env, r2, stored, started } = fixture();
+    const gh = github();
+    const reviewId = await started();
+    r2.set(`reviews/${reviewId}/status.json`, { phase: "verifying" });
+    const read = env.PROBE_RESULTS.get.getMockImplementation()!;
+    env.PROBE_RESULTS.get.mockImplementation(async (key: string) => {
+      if (key === `reviews/${reviewId}/status.json`)
+        await pr.accept(PULL, "f2345678-1234-1234-1234-123456789abc", ORIGIN);
+      return read(key);
+    });
+    gh.calls.length = 0;
+    await pr.alarm();
+    expect(stored.get("current")).toMatchObject({ generation: 2 });
+    expect(
+      gh.sent().filter((call) => call.url === `${API}/check-runs/99`),
+    ).toEqual([]);
   });
 
   it("names each lane of a partial review in the final summary", async () => {
@@ -1272,6 +1344,167 @@ describe("App review publication", () => {
     });
     expect(job.start).toHaveBeenCalledOnce();
   });
+  it("waits out a secondary rate limit GitHub names only in its body", async () => {
+    const { pr, stored, storage, job } = fixture();
+    const now = Date.now();
+    vi.spyOn(Date, "now").mockReturnValue(now);
+    let limited = 1;
+    const gh = github({
+      routes: {
+        [`POST ${API}/check-runs`]: () =>
+          limited-- > 0
+            ? Response.json(
+                {
+                  message:
+                    "You have exceeded a secondary rate limit. Please wait a few minutes before you try again.",
+                },
+                { status: 403 },
+              )
+            : undefined,
+      },
+    });
+    await pr.accept(PULL, "82345678-1234-1234-1234-123456789abc", ORIGIN);
+    storage.setAlarm.mockClear();
+    await pr.alarm();
+    expect(gh.sent()).toEqual([
+      expect.objectContaining({ method: "POST", url: `${API}/check-runs` }),
+    ]);
+    expect(stored.get("current")).toMatchObject({
+      phase: "pending",
+      checkRunId: null,
+      outcome: null,
+    });
+    expect(storage.setAlarm).toHaveBeenCalledExactlyOnceWith(now + 60_000);
+    await pr.alarm();
+    expect(stored.get("current")).toMatchObject({
+      phase: "running",
+      checkRunId: 99,
+    });
+    expect(job.start).toHaveBeenCalledOnce();
+  });
+  it.each([
+    [
+      "superseded check",
+      `PATCH ${API}/check-runs/99`,
+      (pr: InstanceType<typeof PullRequestReview>) =>
+        pr.accept(PULL, "92345678-1234-1234-1234-123456789abc", ORIGIN),
+    ],
+    [
+      "push offer",
+      `POST ${API}/check-runs`,
+      (pr: InstanceType<typeof PullRequestReview>) =>
+        pr.offer(
+          { ...PULL, head: MOVED },
+          "a2345678-1234-1234-1234-123456789abc",
+        ),
+    ],
+  ])(
+    "retries a rate-limited %s at the reset GitHub names",
+    async (_name, route, arrive) => {
+      const { pr, stored, storage, started } = fixture();
+      let limited = 1;
+      const gh = github({
+        routes: {
+          [route]: (call) =>
+            (call.body as { status: string; head_sha?: string }).status ===
+              "completed" && limited-- > 0
+              ? new Response("API rate limit exceeded", {
+                  status: 403,
+                  headers: {
+                    "x-ratelimit-remaining": "0",
+                    "x-ratelimit-reset": "4102444800",
+                  },
+                })
+              : undefined,
+        },
+      });
+      await started();
+      await arrive(pr);
+      storage.setAlarm.mockClear();
+      await pr.alarm();
+      expect(limited).toBe(0);
+      expect(storage.setAlarm).toHaveBeenCalledExactlyOnceWith(
+        4_102_444_800_000,
+      );
+      gh.calls.length = 0;
+      await pr.alarm();
+      expect(
+        gh.sent().filter((call) => `${call.method} ${call.url}` === route),
+      ).toEqual([
+        expect.objectContaining({
+          body: expect.objectContaining({
+            status: "completed",
+            conclusion: "neutral",
+          }),
+        }),
+      ]);
+      expect(stored.get("superseded") ?? []).toEqual([]);
+      expect(stored.get("offers") ?? []).toEqual([]);
+    },
+  );
+  it("cancels a review superseded during its start even when the first cancel fails", async () => {
+    const { pr, env, stored, job } = fixture();
+    const gh = github();
+    job.start.mockImplementationOnce(async () => {
+      await pr.accept(PULL, "c2345678-1234-1234-1234-123456789abc", ORIGIN);
+    });
+    job.cancel.mockRejectedValueOnce(new Error("destroy_failed: busy"));
+    await pr.accept(PULL, "d2345678-1234-1234-1234-123456789abc", ORIGIN);
+    await pr.alarm();
+    const first = (job.start.mock.calls[0]![0] as { reviewId: string })
+      .reviewId;
+    expect(stored.get("superseded")).toEqual([
+      expect.objectContaining({ generation: 1, reviewId: first }),
+    ]);
+    env.REVIEW_JOBS.getByName.mockClear();
+    await pr.alarm();
+    expect(env.REVIEW_JOBS.getByName).toHaveBeenCalledWith(first);
+    expect(stored.get("superseded")).toEqual([
+      expect.objectContaining({ generation: 1, cancelFailures: 1 }),
+    ]);
+    expect(gh.checks()).toEqual([]);
+    env.REVIEW_JOBS.getByName.mockClear();
+    await pr.alarm();
+    expect(env.REVIEW_JOBS.getByName).toHaveBeenCalledWith(first);
+    expect(job.cancel).toHaveBeenCalledTimes(2);
+    expect(gh.checks()).toEqual([
+      expect.objectContaining({
+        url: `${API}/check-runs/99`,
+        conclusion: "neutral",
+        output: expect.objectContaining({ summary: SUPERSEDED }),
+      }),
+    ]);
+    expect(stored.get("superseded")).toEqual([]);
+  });
+
+  it("gives up on a cancel that keeps failing and records it on the superseded check", async () => {
+    const { pr, stored, storage, job, started } = fixture();
+    const gh = github();
+    await started();
+    job.cancel.mockRejectedValue(new Error("destroy_failed: busy"));
+    await pr.accept(PULL, "e2345678-1234-1234-1234-123456789abc", ORIGIN);
+    for (let attempt = 1; attempt < 5; attempt += 1) await pr.alarm();
+    expect(gh.checks()).toEqual([]);
+    expect(stored.get("superseded")).toEqual([
+      expect.objectContaining({ generation: 1, cancelFailures: 4 }),
+    ]);
+    await pr.alarm();
+    expect(job.cancel).toHaveBeenCalledTimes(5);
+    expect(gh.checks()).toEqual([
+      expect.objectContaining({
+        url: `${API}/check-runs/99`,
+        conclusion: "neutral",
+        output: {
+          title: "Swarm review could not complete",
+          summary: `${SUPERSEDED} Its cloud review could not be stopped after 5 attempts: destroy_failed: busy.`,
+        },
+      }),
+    ]);
+    expect(stored.get("superseded")).toEqual([]);
+    storage.setAlarm.mockClear();
+    await pr.alarm();
+    expect(job.cancel).toHaveBeenCalledTimes(5);
+  });
 });
 
 describe("superseded cloud review", () => {
@@ -1335,6 +1568,18 @@ const checkRun = (overrides: Record<string, unknown> = {}) => ({
   check_run: {
     name: "swarm-review",
     head_sha: HEAD,
+    pull_requests: [{ number: 7, head: { sha: HEAD }, base: { sha: BASE } }],
+  },
+  repository: { full_name: "acme/demo" },
+  installation: { id: 42 },
+  ...overrides,
+});
+
+const checkSuite = (overrides: Record<string, unknown> = {}) => ({
+  action: "rerequested",
+  check_suite: {
+    head_sha: HEAD,
+    app: { id: 123 },
     pull_requests: [{ number: 7, head: { sha: HEAD }, base: { sha: BASE } }],
   },
   repository: { full_name: "acme/demo" },
@@ -1485,7 +1730,103 @@ describe("Checks tab", () => {
       ),
       env as never,
     );
-    expect(await response.json()).toEqual({ ignored: true });
+    expect(await response.json()).toEqual({
+      ignored: true,
+      reason: "head_moved",
+    });
     expect(storage.put).not.toHaveBeenCalled();
   });
+
+  it("starts one new generation when Re-run all checks asks for the App's suite", async () => {
+    const { env, pr, stored, job, started } = fixture();
+    const gh = github();
+    await started();
+    gh.calls.length = 0;
+    const response = await worker.fetch(
+      await signed(
+        JSON.stringify(checkSuite()),
+        "webhook-secret",
+        "03345678-1234-1234-1234-123456789abc",
+        "check_suite",
+      ),
+      env as never,
+    );
+    expect(await response.json()).toEqual({ accepted: true });
+    const pull = gh.sent()[0]!;
+    expect(pull).toMatchObject({
+      method: "GET",
+      url: `${API}/pulls/7`,
+      body: null,
+    });
+    expect(pull.headers.get("authorization")).toBe("Bearer installation-token");
+    await pr.alarm();
+    expect(job.cancel).toHaveBeenCalledOnce();
+    expect(job.start).toHaveBeenCalledTimes(2);
+    expect(stored.get("current")).toMatchObject({
+      generation: 2,
+      phase: "running",
+      checkRunId: 100,
+      event: PULL,
+    });
+  });
+
+  it("ignores a rerequested suite that belongs to another App", async () => {
+    const { env, storage } = fixture();
+    const gh = github();
+    const response = await worker.fetch(
+      await signed(
+        JSON.stringify(
+          checkSuite({
+            check_suite: { ...checkSuite().check_suite, app: { id: 999 } },
+          }),
+        ),
+        "webhook-secret",
+        undefined,
+        "check_suite",
+      ),
+      env as never,
+    );
+    expect(await response.json()).toEqual({ ignored: true });
+    expect(gh.calls).toEqual([]);
+    expect(storage.put).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    ["check_run", checkRun()],
+    ["check_suite", checkSuite()],
+  ])(
+    "refuses a %s re-run on a PR the opened path would not review",
+    async (kind, payload) => {
+      const { env, storage } = fixture();
+      const gh = github({
+        routes: {
+          [`GET ${API}/pulls/7`]: () =>
+            Response.json({
+              state: "open",
+              draft: true,
+              author_association: "MEMBER",
+              head: { sha: HEAD },
+              base: { sha: BASE },
+            }),
+        },
+      });
+      const response = await worker.fetch(
+        await signed(
+          JSON.stringify(payload),
+          "webhook-secret",
+          undefined,
+          kind,
+        ),
+        env as never,
+      );
+      expect(await response.json()).toEqual({
+        ignored: true,
+        reason: "not_reviewable",
+      });
+      expect(gh.sent().map((call) => `${call.method} ${call.url}`)).toEqual([
+        `GET ${API}/pulls/7`,
+      ]);
+      expect(storage.put).not.toHaveBeenCalled();
+    },
+  );
 });
