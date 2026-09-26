@@ -1,3 +1,5 @@
+import type { PullRequestMetadata } from "./jev";
+
 const encoder = new TextEncoder();
 const api = "https://api.github.com";
 const headers = (authorization: string) => ({
@@ -229,6 +231,56 @@ export async function openPull(
   return (pull as { state?: unknown } | null)?.state === "open"
     ? reviewablePull(repository, number, pull, installationId)
     : null;
+}
+
+const PULL_FILE_PAGES = 3;
+const PULL_DESCRIPTION_MAX_CHARS = 4_000;
+
+/** What Jev may see of a pull request: its words and its file list, never its code. */
+export async function readPullMetadata(
+  token: string,
+  repository: string,
+  number: number,
+): Promise<PullRequestMetadata> {
+  const read = async (path: string) => {
+    const response = await fetch(
+      `${api}/repos/${repository}/pulls/${number}${path}`,
+      { headers: headers(token) },
+    );
+    if (!response.ok)
+      throw new GitHubRequestError(
+        `fetch_pull_metadata_${response.status}`,
+        response,
+        await response.text(),
+      );
+    const value: unknown = await response.json();
+    return value;
+  };
+  const pull = (await read("")) as Record<string, unknown> | null;
+  const files: PullRequestMetadata["files"] = [];
+  for (let page = 1; page <= PULL_FILE_PAGES; page++) {
+    const listed = await read(`/files?per_page=100&page=${page}`);
+    if (!Array.isArray(listed)) break;
+    for (const file of listed as (Record<string, unknown> | null)[])
+      if (typeof file?.["filename"] === "string")
+        files.push({
+          path: file["filename"],
+          additions: Number(file["additions"]) || 0,
+          deletions: Number(file["deletions"]) || 0,
+        });
+    if (listed.length < 100) break;
+  }
+  return {
+    title: typeof pull?.["title"] === "string" ? pull["title"] : "",
+    description:
+      typeof pull?.["body"] === "string"
+        ? pull["body"].slice(0, PULL_DESCRIPTION_MAX_CHARS)
+        : "",
+    files,
+    totalFiles: Number.isSafeInteger(pull?.["changed_files"])
+      ? Number(pull?.["changed_files"])
+      : files.length,
+  };
 }
 
 const base64url = (bytes: Uint8Array) =>
