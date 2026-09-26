@@ -1,7 +1,7 @@
 import { spawn } from "node:child_process";
 import { createHash } from "node:crypto";
 import { cp, glob, mkdir, readFile, rm, stat } from "node:fs/promises";
-import { dirname, join, relative, resolve } from "node:path";
+import { basename, dirname, join, relative, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import ts from "typescript";
 import {
@@ -157,9 +157,11 @@ export const imageSourceHashes = async () =>
     ),
   );
 
-const wrangler = (args: string[], tee = false) =>
+const FAILURE_OUTPUT_CHARS = 2_000;
+
+export const captured = (command: string, args: string[], tee = false) =>
   new Promise<string>((resolvePromise, reject) => {
-    const child = spawn(wranglerBin, args, {
+    const child = spawn(command, args, {
       cwd: packageRoot,
       stdio: ["ignore", "pipe", "pipe"],
     });
@@ -177,10 +179,15 @@ const wrangler = (args: string[], tee = false) =>
       code === 0
         ? resolvePromise(output)
         : reject(
-            new Error(`wrangler ${args.join(" ")} exited with code ${code}`),
+            new Error(
+              `${basename(command)} ${args.join(" ")} exited with code ${code}${output.trim() ? `:\n${output.trim().slice(-FAILURE_OUTPUT_CHARS)}` : ""}`,
+            ),
           ),
     );
   });
+
+const wrangler = (args: string[], tee = false) =>
+  captured(wranglerBin, args, tee);
 
 const parseJson = <T>(output: string): T => {
   const lines = output.split("\n");
@@ -246,20 +253,34 @@ const ensureEvidenceExpiry = async () => {
   console.log(`r2 lifecycle: added ${EVIDENCE_RULE} to ${bucket}`);
 };
 
-const waitForRollout = async (id: string) => {
-  const deadline = Date.now() + rolloutTimeoutMs;
+// The Worker is already live when this runs, so one failed status read is a
+// reason to read again, not to report the deploy as failed.
+export const waitForRollout = async (
+  readApp: () => Promise<ContainerApp>,
+  intervalMs = pollIntervalMs,
+  timeoutMs = rolloutTimeoutMs,
+) => {
+  const deadline = Date.now() + timeoutMs;
   while (true) {
-    const app = parseJson<ContainerApp>(
-      await wrangler(["containers", "info", id, "--json"]),
-    );
+    let app: ContainerApp;
+    try {
+      app = await readApp();
+    } catch (error) {
+      if (Date.now() >= deadline) throw error;
+      console.log(
+        `rollout status unreadable, waiting: ${error instanceof Error ? error.message : String(error)}`,
+      );
+      await new Promise((wake) => setTimeout(wake, intervalMs));
+      continue;
+    }
     if (!app.active_rollout_id) return app;
     if (Date.now() >= deadline) {
       throw new Error(
-        `rollout ${app.active_rollout_id} is still active after ${rolloutTimeoutMs / 60_000} minutes`,
+        `rollout ${app.active_rollout_id} is still active after ${timeoutMs / 60_000} minutes`,
       );
     }
     console.log(`rollout ${app.active_rollout_id} still active, waiting`);
-    await new Promise((wake) => setTimeout(wake, pollIntervalMs));
+    await new Promise((wake) => setTimeout(wake, intervalMs));
   }
 };
 
@@ -300,7 +321,11 @@ const main = async () => {
   );
   const app = apps.find((entry) => entry.name === name);
   if (!app) throw new Error(`no container application named ${name}`);
-  const final = await waitForRollout(app.id);
+  const final = await waitForRollout(async () =>
+    parseJson<ContainerApp>(
+      await wrangler(["containers", "info", app.id, "--json"]),
+    ),
+  );
 
   console.log(
     [

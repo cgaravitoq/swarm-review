@@ -9,11 +9,13 @@ import { pathToFileURL } from "node:url";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { verificationsPerFamily } from "../../prompts/hybrid";
 import {
+  captured,
   deployArguments,
   EVIDENCE_RULE,
   imageBuildArguments,
   lifecycleRuleNames,
   targetCheckout,
+  waitForRollout,
 } from "../../scripts/deploy";
 import { main } from "../../scripts/probe";
 import { gitCapability } from "../git-proxy";
@@ -3094,6 +3096,55 @@ describe("deployed container image", () => {
         listing.slice(0, listing.indexOf("\nname:     evidence")),
       ),
     ).toEqual(["Default Multipart Abort Rule"]);
+  });
+
+  it("says what a failed command printed on both streams", async () => {
+    await expect(
+      captured("sh", ["-c", "echo listed; echo refused >&2; exit 3"]),
+    ).rejects.toThrow(
+      /^sh -c echo listed; echo refused >&2; exit 3 exited with code 3:\nlisted\nrefused$/,
+    );
+    await expect(captured("sh", ["-c", "exit 2"])).rejects.toThrow(
+      /^sh -c exit 2 exited with code 2$/,
+    );
+  });
+
+  it("reads a rollout's status again after a failed read", async () => {
+    const log = vi.spyOn(console, "log").mockImplementation(() => undefined);
+    const reads = [
+      () => Promise.reject(new Error("wrangler containers info exited")),
+      () => Promise.resolve({ id: "app", name: "sandbox", version: 3 }),
+    ];
+    const readApp = vi.fn(() => reads.shift()!());
+    await expect(waitForRollout(readApp, 1, 60_000)).resolves.toEqual({
+      id: "app",
+      name: "sandbox",
+      version: 3,
+    });
+    expect(readApp).toHaveBeenCalledTimes(2);
+    expect(log).toHaveBeenCalledWith(
+      "rollout status unreadable, waiting: wrangler containers info exited",
+    );
+  });
+
+  it("ends a rollout wait at its deadline with the last read's failure", async () => {
+    vi.spyOn(console, "log").mockImplementation(() => undefined);
+    await expect(
+      waitForRollout(() => Promise.reject(new Error("unreadable")), 1, 20),
+    ).rejects.toThrow("unreadable");
+    await expect(
+      waitForRollout(
+        () =>
+          Promise.resolve({
+            id: "app",
+            name: "sandbox",
+            version: 3,
+            active_rollout_id: "rollout-1",
+          }),
+        1,
+        20,
+      ),
+    ).rejects.toThrow("rollout rollout-1 is still active");
   });
 
   it("builds the computed image reference for the lane platform", () => {
