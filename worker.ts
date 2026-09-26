@@ -140,6 +140,7 @@ type AppReview = {
   briefNote: string | null;
   progress: string | null;
   cancelFailures?: number;
+  retriedAfter?: string;
 };
 
 const plain = (value: unknown) =>
@@ -170,6 +171,22 @@ const refusedForGood = (error: unknown) =>
 
 const retryAfter = (error: unknown) =>
   error instanceof GitHubRequestError ? (error.retryAt ?? 0) : 0;
+
+const lostToPlatform = (message: unknown): message is string =>
+  typeof message === "string" &&
+  /^(interrupted$|destroy_failed|image source )|Durable Object reset because its code was updated/.test(
+    message,
+  );
+
+const withNotes = (state: AppReview, text: string) =>
+  [
+    text,
+    state.retriedAfter &&
+      `Retried once: the first attempt ended with ${plain(state.retriedAfter)}.`,
+    state.briefNote,
+  ]
+    .filter(Boolean)
+    .join("\n\n");
 
 export class PullRequestReview extends DurableObject<ReviewPiEnv> {
   async accept(event: PullRequestEvent, delivery: string, origin: string) {
@@ -403,6 +420,15 @@ export class PullRequestReview extends DurableObject<ReviewPiEnv> {
         return false;
       }
       if (receipt.status !== "completed" && receipt.status !== "partial") {
+        const failure = receipt.failure?.message;
+        if (state.retriedAfter === undefined && lostToPlatform(failure)) {
+          state.retriedAfter = failure;
+          state.reviewId = null;
+          state.acceptedAt = Date.now();
+          state.progress = null;
+          state.phase = "pending";
+          return await this.save(state);
+        }
         await this.finish(
           token,
           state,
@@ -475,7 +501,7 @@ export class PullRequestReview extends DurableObject<ReviewPiEnv> {
         token,
         state.event.repository,
         state.checkRunId!,
-        state.briefNote ? `${progress}\n\n${state.briefNote}` : progress,
+        withNotes(state, progress),
       );
     } catch {
       return;
@@ -565,7 +591,7 @@ export class PullRequestReview extends DurableObject<ReviewPiEnv> {
       state.event.repository,
       state.checkRunId!,
       conclusion,
-      state.briefNote ? `${summary}\n\n${state.briefNote}` : summary,
+      withNotes(state, summary),
     );
     state.phase = "done";
     state.outcome = summary;
