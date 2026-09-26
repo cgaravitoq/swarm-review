@@ -16,7 +16,7 @@
  * so it is specific to one run and repository and never has to be stored.
  */
 
-const ALLOWED = new Set(["info/refs", "git-upload-pack"]);
+const ALLOWED = new Set(["info/refs", "git-upload-pack", "git-receive-pack"]);
 
 const hex = (buffer: ArrayBuffer) =>
   Array.from(new Uint8Array(buffer))
