@@ -63,6 +63,7 @@ A lane cut mid-turn also keeps `streamed`: the last 16 KiB of the text its last 
 The lanes file has `reviewers` and `verifiers` arrays; each entry names `family`, `provider`, `model`, `piDir`, `extensions` and `env`.
 Each verifier family may appear once, and a candidate needs a verifier from a family other than every family that reported it.
 A family whose reviewer failed in the run is never chosen as a verifier, and among the rest a family whose reviewer completed is preferred over one whose reviewer was cut, in `lanes.json` order.
+A cloud review lists its verifiers as `openai-codex`, `claude-code`, then `workers-ai`, because Workers AI verifiers take several long thinking turns and were cut every time the window was tight, so a candidate goes to Workers AI only when both other families reported it or cannot rule.
 A candidate with no family left to rule on it stays unverified, and its finding's `unverifiedReason` says why.
 
 ### GitHub Action

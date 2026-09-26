@@ -106,6 +106,14 @@ const REVIEW_FAMILIES = {
   "openai-codex": { provider: "openai-codex", model: "gpt-6-luna" },
   "claude-code": { provider: "claude-code", model: "claude-opus-5-5" },
 } as const;
+// Workers AI verifiers take several long thinking turns and ran out of the
+// window every time it was tight, so candidates go to the families that rule
+// in a few turns first.
+const VERIFIER_ORDER: readonly string[] = [
+  "openai-codex",
+  "claude-code",
+  "workers-ai",
+];
 
 type CloudReview = {
   reviewId: string;
@@ -1325,7 +1333,14 @@ async function runCloudReview(env: ReviewPiEnv, review: CloudReview) {
       "review lanes",
       sandbox.writeFile(
         `${directory}/lanes.json`,
-        JSON.stringify({ reviewers, verifiers }),
+        JSON.stringify({
+          reviewers,
+          verifiers: verifiers.sort(
+            (a, b) =>
+              VERIFIER_ORDER.indexOf(a.family) -
+              VERIFIER_ORDER.indexOf(b.family),
+          ),
+        }),
       ),
     );
     if (review.context)
