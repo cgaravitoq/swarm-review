@@ -487,7 +487,7 @@ describe("cloud reviews", () => {
         (command) =>
           command.includes("git -c") &&
           command.includes(" clone --depth 1") &&
-          command.includes("pull/17/head"),
+          command.includes(`fetch --depth 1 origin '${"a".repeat(40)}'`),
       ),
     ).toBe(true);
     const engine = fixture.sandbox.startProcess.mock.calls[0]?.[0] as string;
@@ -884,7 +884,7 @@ describe("cloud reviews", () => {
 
   const upstreamWithPull = async (
     root: string,
-    options: { pushPull: boolean; unrelatedBase: boolean },
+    options: { pushPull: boolean; unrelatedBase: boolean; movedPast?: boolean },
   ) => {
     const upstream = path.join(root, "upstream.git");
     const source = path.join(root, "source");
@@ -909,6 +909,11 @@ describe("cloud reviews", () => {
     const head = git("-C", source, "rev-parse", "HEAD");
     if (options.pushPull)
       git("-C", source, "push", "-q", "origin", "HEAD:refs/pull/17/head");
+    if (options.movedPast) {
+      await writeFile(path.join(source, "file.txt"), "base\nhead\nlater\n");
+      git("-C", source, "commit", "-qam", "later");
+      git("-C", source, "push", "-q", "origin", "HEAD:refs/pull/17/head");
+    }
     if (!options.unrelatedBase) return { upstream, head, base: fork };
     git("-C", source, "checkout", "-q", "--orphan", "unrelated");
     git("-C", source, "commit", "-q", "--allow-empty", "-m", "unrelated");
@@ -960,7 +965,7 @@ describe("cloud reviews", () => {
       missingRemote: true,
     },
     { step: "fetch_head", exitCode: 128, pushPull: false },
-    { step: "head_mismatch", exitCode: 128, head: "c".repeat(40) },
+    { step: "fetch_head", exitCode: 128, head: "c".repeat(40) },
     { step: "fetch_base", exitCode: 128, base: "d".repeat(40) },
     { step: "merge_base", exitCode: 1, unrelatedBase: true },
   ])(
@@ -1002,7 +1007,7 @@ describe("cloud reviews", () => {
           failure: { stage: "cloud_review", message: "clone_failed", clone },
         });
         expect(clone.stderr.length).toBeGreaterThan(0);
-        if (scenario.step !== "head_mismatch" && scenario.step !== "merge_base")
+        if (scenario.step !== "merge_base")
           expect(clone.stderr).toMatch(/fatal:/);
         expect(fixture.r2.get(`reviews/${reviewId}/status.json`)).toMatchObject(
           {
@@ -1017,6 +1022,42 @@ describe("cloud reviews", () => {
       }
     },
   );
+
+  it("reviews a commit its pull request has since moved past", async () => {
+    const root = await mkdtemp(path.join(tmpdir(), "review-clone-"));
+    try {
+      const upstream = await upstreamWithPull(root, {
+        pushPull: true,
+        unrelatedBase: false,
+        movedPast: true,
+      });
+      const fixture = setup();
+      const checkout = path.join(root, "checkout");
+      const outputs = runCloneThroughShell(
+        fixture,
+        pathToFileURL(upstream.upstream).href,
+        checkout,
+      );
+      const response = await post(fixture.reviewEnv, {
+        ...requestBody,
+        head: upstream.head,
+        base: upstream.base,
+      });
+      const { reviewId } = (await response.json()) as { reviewId: string };
+      await fixture.job.alarm();
+      expect(outputs).toEqual(["clone\nfetch_head\nfetch_base\nmerge_base\n"]);
+      expect(
+        spawnSync("git", ["-C", checkout, "rev-parse", "HEAD"], {
+          encoding: "utf8",
+        }).stdout.trim(),
+      ).toBe(upstream.head);
+      expect(fixture.r2.get(`reviews/${reviewId}/receipt.json`)).toMatchObject({
+        status: "completed",
+      });
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
 
   it("records a clone that passes every step and adds nothing to its receipt or status", async () => {
     const root = await mkdtemp(path.join(tmpdir(), "review-clone-"));
@@ -1038,9 +1079,7 @@ describe("cloud reviews", () => {
       });
       const { reviewId } = (await response.json()) as { reviewId: string };
       await fixture.job.alarm();
-      expect(outputs).toEqual([
-        "clone\nfetch_head\nhead_mismatch\nfetch_base\nmerge_base\n",
-      ]);
+      expect(outputs).toEqual(["clone\nfetch_head\nfetch_base\nmerge_base\n"]);
       expect(fixture.r2.get(`reviews/${reviewId}/receipt.json`)).toEqual({
         swarmId: "test",
         status: "completed",

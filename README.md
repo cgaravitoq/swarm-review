@@ -162,7 +162,7 @@ The relay uses direct HTTPS because intercepted HTTPS returns a Worker-side 403 
 
 The authenticated `POST /reviews` route accepts `{repository, pr, head, base, context?}` and returns `202 {reviewId}` after recording the initial status in R2 and scheduling a Durable Object alarm.
 The repository must be in the deployed Worker's `TARGET_REPOSITORIES` allowlist.
-The alarm uses one fresh Sandbox, clones the exact PR head through the read-only Git proxy, and runs the hybrid engine as `review-target` without installing the checkout's dependencies.
+The alarm uses one fresh Sandbox, fetches the requested head and base by their SHAs through the read-only Git proxy, so a pull request that moved on since still gets the commit it asked for, and runs the hybrid engine as `review-target` without installing the checkout's dependencies.
 Each reviewer and verifier family gets a separate capped model-proxy session.
 The deadline is eight minutes from admission; the engine has a shorter deadline so the Worker can store its partial receipt, including verified findings and cut lanes, before destroying the Sandbox.
 If the engine produces no receipt, a failed or expired review records a failed receipt; failure status retains the last observed reviewer states.

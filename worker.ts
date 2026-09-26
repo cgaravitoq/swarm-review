@@ -1249,7 +1249,6 @@ type EngineFailure = { exitCode: number | null; stderr: string | null };
 const CLONE_STEPS = [
   "clone",
   "fetch_head",
-  "head_mismatch",
   "fetch_base",
   "merge_base",
 ] as const;
@@ -1418,9 +1417,9 @@ async function runCloudReview(env: ReviewPiEnv, review: CloudReview) {
       `http.extraHeader=x-review-run: ${review.reviewId}`,
     );
     const clone = `${directory}/clone`;
-    const pullRef = posixQuote(`pull/${review.pr}/head`);
+    const head = posixQuote(review.head);
     const base = posixQuote(review.base);
-    const cloneCommand = `echo clone && ${asTarget} git -c ${gitHeader} clone --depth 1 --no-tags --quiet ${posixQuote(remote)} ${posixQuote(clone)} && echo fetch_head && cd ${posixQuote(clone)} && ${asTarget} git -c ${gitHeader} fetch --depth 1 origin ${pullRef} && echo head_mismatch && ${asTarget} git checkout --quiet --detach ${posixQuote(review.head)} && test "$(${asTarget} git rev-parse HEAD)" = ${posixQuote(review.head)} && echo fetch_base && ${asTarget} git -c ${gitHeader} fetch --depth 1 origin ${base} && echo merge_base && { while ! ${asTarget} git merge-base ${base} HEAD >/dev/null; do test "$(${asTarget} git rev-parse --is-shallow-repository)" = true || exit 1; ${asTarget} git -c ${gitHeader} fetch --deepen=64 origin ${pullRef} ${base} || exit 1; done; }`;
+    const cloneCommand = `echo clone && ${asTarget} git -c ${gitHeader} clone --depth 1 --no-tags --quiet ${posixQuote(remote)} ${posixQuote(clone)} && echo fetch_head && cd ${posixQuote(clone)} && ${asTarget} git -c ${gitHeader} fetch --depth 1 origin ${head} && ${asTarget} git checkout --quiet --detach ${head} && echo fetch_base && ${asTarget} git -c ${gitHeader} fetch --depth 1 origin ${base} && echo merge_base && { while ! ${asTarget} git merge-base ${base} HEAD >/dev/null; do test "$(${asTarget} git rev-parse --is-shallow-repository)" = true || exit 1; ${asTarget} git -c ${gitHeader} fetch --deepen=64 origin ${head} ${base} || exit 1; done; }`;
     const cloned = await reviewStep(
       review,
       "review clone",
