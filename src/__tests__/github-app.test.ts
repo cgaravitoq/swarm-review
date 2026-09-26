@@ -863,6 +863,57 @@ describe("GitHub App webhook", () => {
     },
   );
 
+  it.each([
+    "deadline",
+    "deadline; destroy_failed: Durable Object reset because its code was updated.",
+    "engine_failed; destroy_failed: busy",
+  ])(
+    "ends neutral without a retry when the platform did not cause the loss: %s",
+    async (message) => {
+      const { pr, r2, job, destroy, started } = fixture();
+      const gh = github();
+      const first = await started();
+      r2.set(`reviews/${first}/receipt.json`, {
+        status: "failed",
+        failure: { stage: "cloud_review", message },
+      });
+      await pr.alarm();
+      expect(destroy).not.toHaveBeenCalled();
+      expect(job.start).toHaveBeenCalledOnce();
+      expect(gh.checks()).toEqual([
+        expect.objectContaining({ conclusion: "neutral" }),
+      ]);
+    },
+  );
+
+  it("does not retry a lost review whose sandbox still cannot be stopped", async () => {
+    const { pr, r2, job, destroy, stored, started } = fixture();
+    const gh = github();
+    const first = await started();
+    r2.set(`reviews/${first}/receipt.json`, {
+      status: "failed",
+      failure: {
+        stage: "cloud_review",
+        message:
+          "destroy_failed: Durable Object reset because its code was updated.",
+      },
+    });
+    destroy.mockRejectedValueOnce(new Error("busy"));
+    await pr.alarm();
+    expect(job.start).toHaveBeenCalledOnce();
+    expect(gh.checks()).toEqual([
+      expect.objectContaining({
+        conclusion: "neutral",
+        output: {
+          title: "Swarm review could not complete",
+          summary:
+            "Review could not complete: destroy_failed: Durable Object reset because its code was updated. Not retried, because its sandbox could not be stopped: busy.\n\nThe receipt names no lanes.",
+        },
+      }),
+    ]);
+    expect(stored.get("current")).toMatchObject({ phase: "done" });
+  });
+
   it("publishes the retry of a review a deploy lost and says it was retried", async () => {
     const { pr, r2, stored, started } = fixture();
     const gh = github();
