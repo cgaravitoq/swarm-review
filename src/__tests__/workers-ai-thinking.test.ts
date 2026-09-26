@@ -3,7 +3,6 @@ import { readFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath, URL } from "node:url";
-import { ModelRuntime } from "@earendil-works/pi-coding-agent";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { modelsJsonForProxy } from "../model-proxy";
 
@@ -11,6 +10,45 @@ const PROVIDER = "cloudflare-workers-ai";
 const MODEL = "@cf/deepseek-ai/deepseek-v4-flash-0731";
 const HANDLE = "review-pi-00000000-0000-4000-8000-000000000000";
 const BASE_URL = "https://review.example.workers.dev/model/run-1/cap-1";
+
+// Pi's declarations reference @types/node ahead of @cloudflare/workers-types,
+// which flips the global `process` the rest of the program compiles against,
+// so Pi is loaded through a specifier the compiler does not resolve.
+const PI = "@earendil-works/pi-coding-agent";
+
+type PiModel = { id: string; provider: string };
+
+type PiRuntime = {
+  getModel(provider: string, id: string): PiModel | undefined;
+  streamSimple(
+    model: PiModel,
+    context: {
+      messages: {
+        role: "user";
+        content: { type: "text"; text: string }[];
+        timestamp: number;
+      }[];
+      tools: [];
+    },
+    options: {
+      reasoning?: "medium";
+      maxRetries: number;
+      fetch: (
+        input: RequestInfo | URL,
+        init?: RequestInit,
+      ) => Promise<Response>;
+    },
+  ): { result(): Promise<{ stopReason: string }> };
+};
+
+type PiModule = {
+  ModelRuntime: {
+    create(options: {
+      modelsPath: string;
+      authPath: string;
+    }): Promise<PiRuntime>;
+  };
+};
 
 let dir: string;
 
@@ -43,6 +81,7 @@ const laneRequest = async (reasoning: "medium" | undefined) => {
     modelsPath,
     modelsJsonForProxy(image, PROVIDER, HANDLE, BASE_URL),
   );
+  const { ModelRuntime } = (await import(PI)) as PiModule;
   const runtime = await ModelRuntime.create({
     modelsPath,
     authPath: join(dir, "auth.json"),
