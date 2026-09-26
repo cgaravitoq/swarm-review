@@ -1511,7 +1511,10 @@ async function runCloudReview(env: ReviewPiEnv, review: CloudReview) {
     ).catch(() => undefined);
     const shutdown = await destroySandbox(sandbox);
     if (!shutdown.acknowledged)
-      reason = [reason, `destroy_failed: ${shutdown.error}`]
+      reason = [
+        reason?.replace(/\.+$/, ""),
+        `destroy_failed: ${shutdown.error}`,
+      ]
         .filter(Boolean)
         .join("; ");
     if (reason) await finishReview(env, review, reason, receipt, failureDetail);
