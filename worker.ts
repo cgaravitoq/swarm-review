@@ -140,6 +140,7 @@ type AppReview = {
   briefNote: string | null;
   progress: string | null;
   cancelFailures?: number;
+  retriedAfter?: string;
 };
 
 const plain = (value: unknown) =>
@@ -170,6 +171,24 @@ const refusedForGood = (error: unknown) =>
 
 const retryAfter = (error: unknown) =>
   error instanceof GitHubRequestError ? (error.retryAt ?? 0) : 0;
+
+const sentence = (text: unknown) => `${text}`.replace(/\.*$/, ".");
+
+const lostToPlatform = (message: unknown): message is string =>
+  typeof message === "string" &&
+  /^(interrupted$|destroy_failed$|image source |Durable Object reset because its code was updated)/.test(
+    message,
+  );
+
+const withNotes = (state: AppReview, text: string) =>
+  [
+    text,
+    state.retriedAfter &&
+      `Retried once: the first attempt ended with ${plain(state.retriedAfter)}.`,
+    state.briefNote,
+  ]
+    .filter(Boolean)
+    .join("\n\n");
 
 export class PullRequestReview extends DurableObject<ReviewPiEnv> {
   async accept(event: PullRequestEvent, delivery: string, origin: string) {
@@ -270,7 +289,7 @@ export class PullRequestReview extends DurableObject<ReviewPiEnv> {
               cancelFailures.set(previous.generation, failures);
               throw error;
             }
-            summary = `${SUPERSEDED_SUMMARY} Its cloud review could not be stopped after ${failures} attempts: ${messageOf(error)}.`;
+            summary = `${SUPERSEDED_SUMMARY} Its cloud review could not be stopped after ${failures} attempts: ${sentence(messageOf(error))}`;
           }
         await completeCheck(
           await this.token(previous.event),
@@ -403,11 +422,27 @@ export class PullRequestReview extends DurableObject<ReviewPiEnv> {
         return false;
       }
       if (receipt.status !== "completed" && receipt.status !== "partial") {
+        const failure = receipt.failure?.message;
+        let notRetried = "";
+        if (state.retriedAfter === undefined && lostToPlatform(failure)) {
+          const shutdown = await destroySandbox(
+            getSandbox(this.env.REVIEW_SANDBOX, state.reviewId!),
+          );
+          if (shutdown.acknowledged) {
+            state.retriedAfter = failure;
+            state.reviewId = null;
+            state.acceptedAt = Date.now();
+            state.progress = null;
+            state.phase = "pending";
+            return await this.save(state);
+          }
+          notRetried = ` Not retried, because its sandbox could not be stopped: ${sentence(shutdown.error)}`;
+        }
         await this.finish(
           token,
           state,
           "neutral",
-          `Review could not complete: ${receipt.failure?.message ?? `receipt status ${plain(receipt.status)}`}.\n\n${laneSummary(receipt)}`,
+          `Review could not complete: ${sentence(receipt.failure?.message ?? `receipt status ${plain(receipt.status)}`)}${notRetried}\n\n${laneSummary(receipt)}`,
         );
         return false;
       }
@@ -435,7 +470,7 @@ export class PullRequestReview extends DurableObject<ReviewPiEnv> {
           await this.token(state.event),
           state,
           "neutral",
-          `Review could not complete: ${messageOf(error)}.`,
+          `Review could not complete: ${sentence(messageOf(error))}`,
         );
       } catch (completion) {
         if (!refusedForGood(completion)) return retryAfter(completion);
@@ -475,7 +510,7 @@ export class PullRequestReview extends DurableObject<ReviewPiEnv> {
         token,
         state.event.repository,
         state.checkRunId!,
-        state.briefNote ? `${progress}\n\n${state.briefNote}` : progress,
+        withNotes(state, progress),
       );
     } catch {
       return;
@@ -499,7 +534,7 @@ export class PullRequestReview extends DurableObject<ReviewPiEnv> {
         (finding) => finding.status === "confirmed",
       ).length;
     } catch (error) {
-      return ["neutral", `Review not published: ${messageOf(error)}.`];
+      return ["neutral", `Review not published: ${sentence(messageOf(error))}`];
     }
     try {
       const validated = await revalidatePullRequest(
@@ -545,7 +580,7 @@ export class PullRequestReview extends DurableObject<ReviewPiEnv> {
           : error instanceof TypeError
       )
         throw error;
-      return ["neutral", `Review not published: ${messageOf(error)}.`];
+      return ["neutral", `Review not published: ${sentence(messageOf(error))}`];
     }
   }
 
@@ -565,7 +600,7 @@ export class PullRequestReview extends DurableObject<ReviewPiEnv> {
       state.event.repository,
       state.checkRunId!,
       conclusion,
-      state.briefNote ? `${summary}\n\n${state.briefNote}` : summary,
+      withNotes(state, summary),
     );
     state.phase = "done";
     state.outcome = summary;
@@ -1147,7 +1182,7 @@ async function finishReview(
     findings: [],
     status: "failed",
     failure: {
-      stage: reason === "deadline" ? "deadline" : "cloud_review",
+      stage: reason.startsWith("deadline") ? "deadline" : "cloud_review",
       message: reason,
       ...detail,
     },
@@ -1475,7 +1510,13 @@ async function runCloudReview(env: ReviewPiEnv, review: CloudReview) {
       REVIEW_SESSION_CLEAR_MS,
     ).catch(() => undefined);
     const shutdown = await destroySandbox(sandbox);
-    if (!shutdown.acknowledged) reason = `destroy_failed: ${shutdown.error}`;
+    if (!shutdown.acknowledged)
+      reason = [
+        reason?.replace(/\.+$/, ""),
+        `destroy_failed: ${shutdown.error}`,
+      ]
+        .filter(Boolean)
+        .join("; ");
     if (reason) await finishReview(env, review, reason, receipt, failureDetail);
   }
 }

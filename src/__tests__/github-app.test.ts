@@ -247,6 +247,8 @@ const fixture = () => {
     isDone: vi.fn(async () => true),
     cancel: vi.fn(async () => undefined),
   };
+  const destroy = vi.fn(async () => undefined);
+  getSandbox.mockReturnValue({ destroy });
   const env = {
     CONTROL_SECRET: "control-secret",
     GITHUB_APP_ID: "123",
@@ -257,6 +259,7 @@ const fixture = () => {
       "https://github.com/acme/demo.git,https://github.com/acme/other.git",
     PULL_REQUEST_REVIEWS: { getByName: vi.fn(() => pr) },
     REVIEW_JOBS: { getByName: vi.fn(() => job) },
+    REVIEW_SANDBOX: "sandboxes",
     PROBE_RESULTS: {
       put: vi.fn(async (key: string, body: string) => {
         r2.set(key, JSON.parse(body));
@@ -276,7 +279,7 @@ const fixture = () => {
     await pr.alarm();
     return (stored.get("current") as { reviewId: string }).reviewId;
   };
-  return { pr, env, stored, storage, r2, job, started };
+  return { pr, env, stored, storage, r2, job, destroy, started };
 };
 
 describe("GitHub App webhook", () => {
@@ -472,6 +475,26 @@ describe("GitHub App webhook", () => {
           title: "Swarm review could not complete",
           summary:
             "Review could not complete: deadline.\n\nThe receipt names no lanes.",
+        },
+      }),
+    ]);
+  });
+
+  it("ends a failure summary whose reason is already a sentence with one period", async () => {
+    const { r2, pr, started } = fixture();
+    const gh = github();
+    const reviewId = await started();
+    r2.set(`reviews/${reviewId}/receipt.json`, {
+      status: "failed",
+      failure: { message: "engine_failed: the provider refused." },
+    });
+    await pr.alarm();
+    expect(gh.checks()).toEqual([
+      expect.objectContaining({
+        output: {
+          title: "Swarm review could not complete",
+          summary:
+            "Review could not complete: engine_failed: the provider refused.\n\nThe receipt names no lanes.",
         },
       }),
     ]);
@@ -796,6 +819,157 @@ describe("GitHub App webhook", () => {
           title: "Swarm review could not complete",
           summary:
             "Review could not complete: engine_failed.\n\n- `none` `none` `none`: `none`",
+        },
+      }),
+    ]);
+    expect(stored.get("current")).toMatchObject({ phase: "done" });
+    expect(storage.setAlarm).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    "interrupted",
+    "destroy_failed",
+    "Durable Object reset because its code was updated; destroy_failed: Durable Object reset because its code was updated.",
+    "Durable Object reset because its code was updated.",
+    "image source /opt/review/review-run.sh differs from the host's copy: expected 1, observed 2",
+  ])(
+    "starts a fresh review once when the platform lost the first: %s",
+    async (message) => {
+      const { pr, r2, job, destroy, stored, started } = fixture();
+      const gh = github();
+      const first = await started();
+      r2.set(`reviews/${first}/receipt.json`, {
+        status: "failed",
+        failure: { stage: "cloud_review", message },
+      });
+      await pr.alarm();
+      expect(getSandbox).toHaveBeenLastCalledWith("sandboxes", first);
+      expect(destroy).toHaveBeenCalledOnce();
+      expect(job.start).toHaveBeenCalledOnce();
+      await pr.alarm();
+      const second = (stored.get("current") as { reviewId: string }).reviewId;
+      expect(second).not.toBe(first);
+      expect(job.start).toHaveBeenCalledTimes(2);
+      expect(job.start.mock.calls[1]![0]).toMatchObject({
+        reviewId: second,
+        head: HEAD,
+        base: MERGE_BASE,
+      });
+      expect(gh.checks()).toEqual([]);
+      expect(stored.get("current")).toMatchObject({
+        phase: "running",
+        retriedAfter: message,
+      });
+    },
+  );
+
+  it.each([
+    "deadline",
+    "deadline; destroy_failed: Durable Object reset because its code was updated.",
+    "engine_failed; destroy_failed: busy",
+    "destroy_failed: Durable Object reset because its code was updated.",
+  ])(
+    "ends neutral without a retry when the platform did not cause the loss: %s",
+    async (message) => {
+      const { pr, r2, job, destroy, started } = fixture();
+      const gh = github();
+      const first = await started();
+      r2.set(`reviews/${first}/receipt.json`, {
+        status: "failed",
+        failure: { stage: "cloud_review", message },
+      });
+      await pr.alarm();
+      expect(destroy).not.toHaveBeenCalled();
+      expect(job.start).toHaveBeenCalledOnce();
+      expect(gh.checks()).toEqual([
+        expect.objectContaining({ conclusion: "neutral" }),
+      ]);
+    },
+  );
+
+  it("does not retry a lost review whose sandbox still cannot be stopped", async () => {
+    const { pr, r2, job, destroy, stored, started } = fixture();
+    const gh = github();
+    const first = await started();
+    r2.set(`reviews/${first}/receipt.json`, {
+      status: "failed",
+      failure: {
+        stage: "cloud_review",
+        message:
+          "Durable Object reset because its code was updated; destroy_failed: Durable Object reset because its code was updated.",
+      },
+    });
+    destroy.mockRejectedValueOnce(new Error("busy"));
+    await pr.alarm();
+    expect(job.start).toHaveBeenCalledOnce();
+    expect(gh.checks()).toEqual([
+      expect.objectContaining({
+        conclusion: "neutral",
+        output: {
+          title: "Swarm review could not complete",
+          summary:
+            "Review could not complete: Durable Object reset because its code was updated; destroy_failed: Durable Object reset because its code was updated. Not retried, because its sandbox could not be stopped: busy.\n\nThe receipt names no lanes.",
+        },
+      }),
+    ]);
+    expect(stored.get("current")).toMatchObject({ phase: "done" });
+  });
+
+  it("publishes the retry of a review a deploy lost and says it was retried", async () => {
+    const { pr, r2, stored, started } = fixture();
+    const gh = github();
+    const first = await started();
+    r2.set(`reviews/${first}/receipt.json`, {
+      status: "failed",
+      failure: {
+        stage: "cloud_review",
+        message:
+          "Durable Object reset because its code was updated; destroy_failed: Durable Object reset because its code was updated.",
+      },
+    });
+    await pr.alarm();
+    await pr.alarm();
+    const second = (stored.get("current") as { reviewId: string }).reviewId;
+    r2.set(`reviews/${second}/receipt.json`, { ...receipt, swarmId: second });
+    await pr.alarm();
+    expect(gh.posts()).toHaveLength(1);
+    expect(gh.checks()).toEqual([
+      expect.objectContaining({
+        conclusion: "success",
+        output: {
+          title: "Swarm review completed",
+          summary:
+            "Review published at aaaaaaa. 2 confirmed finding(s).\n\nRetried once: the first attempt ended with `Durable Object reset because its code was updated; destroy_failed: Durable Object reset because its code was updated.`.",
+        },
+      }),
+    ]);
+  });
+
+  it("ends neutral when the retry is lost too, and starts no third review", async () => {
+    const { pr, r2, job, stored, storage, started } = fixture();
+    const gh = github();
+    const first = await started();
+    r2.set(`reviews/${first}/receipt.json`, {
+      status: "failed",
+      failure: { stage: "cloud_review", message: "interrupted" },
+    });
+    await pr.alarm();
+    await pr.alarm();
+    const second = (stored.get("current") as { reviewId: string }).reviewId;
+    r2.set(`reviews/${second}/receipt.json`, {
+      status: "failed",
+      failure: { stage: "cloud_review", message: "interrupted" },
+    });
+    storage.setAlarm.mockClear();
+    await pr.alarm();
+    expect(job.start).toHaveBeenCalledTimes(2);
+    expect(gh.checks()).toEqual([
+      expect.objectContaining({
+        conclusion: "neutral",
+        output: {
+          title: "Swarm review could not complete",
+          summary:
+            "Review could not complete: interrupted.\n\nThe receipt names no lanes.\n\nRetried once: the first attempt ended with `interrupted`.",
         },
       }),
     ]);

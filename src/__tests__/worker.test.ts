@@ -727,6 +727,41 @@ describe("cloud reviews", () => {
     });
   });
 
+  it("keeps the deadline as the failure when the Sandbox then fails to stop", async () => {
+    const fixture = setup();
+    const response = await post(fixture.reviewEnv);
+    const { reviewId } = (await response.json()) as { reviewId: string };
+    const review = fixture.stored.get("review") as { deadlineAt: string };
+    review.deadlineAt = new Date(Date.now() - 1).toISOString();
+    fixture.sandbox.destroy.mockRejectedValueOnce(new Error("destroy failed"));
+    await fixture.job.alarm();
+    expect(fixture.r2.get(`reviews/${reviewId}/receipt.json`)).toMatchObject({
+      failure: {
+        stage: "deadline",
+        message: "deadline; destroy_failed: destroy failed",
+      },
+    });
+  });
+
+  it("joins a platform reset and the failed shutdown after it into one sentence", async () => {
+    const fixture = setup();
+    const response = await post(fixture.reviewEnv);
+    const { reviewId } = (await response.json()) as { reviewId: string };
+    const reset = new Error(
+      "Durable Object reset because its code was updated.",
+    );
+    fixture.sandbox.exec.mockRejectedValueOnce(reset);
+    fixture.sandbox.destroy.mockRejectedValueOnce(reset);
+    await fixture.job.alarm();
+    expect(fixture.r2.get(`reviews/${reviewId}/receipt.json`)).toMatchObject({
+      failure: {
+        stage: "cloud_review",
+        message:
+          "Durable Object reset because its code was updated; destroy_failed: Durable Object reset because its code was updated.",
+      },
+    });
+  });
+
   it("does not start an engine without time to read its receipt and destroy the Sandbox", async () => {
     const fixture = setup();
     await post(fixture.reviewEnv);
