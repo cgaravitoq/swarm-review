@@ -351,6 +351,27 @@ it("gives up on an unanswered submit the Worker never started once nothing is ob
   );
 });
 
+it("reports a submit that could not reach the Worker as not submitted and polls nothing", async () => {
+  const calls = stubFetch([]);
+  const fetchStub = vi.mocked(fetch);
+  const answer = fetchStub.getMockImplementation()!;
+  fetchStub.mockImplementation(async (input, init) => {
+    if (String(input).startsWith(ORIGIN))
+      throw new TypeError(
+        "Unable to connect. Is the computer able to access the url?",
+      );
+    return answer(input, init);
+  });
+  expect(await runCloud(argv(), io)).toBe(1);
+  expect(lines).toEqual([
+    "cloud review not submitted: Unable to connect. Is the computer able to access the url?",
+  ]);
+  expect(
+    fetchStub.mock.calls.filter(([input]) => String(input).startsWith(ORIGIN)),
+  ).toHaveLength(1);
+  expect(workerCalls(calls)).toEqual([]);
+});
+
 it("keeps polling past a poll the Worker never answers once that request times out", async () => {
   const { timers, hung, timeOut } = hangUntilAborted();
   const calls = stubFetch([
