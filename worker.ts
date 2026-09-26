@@ -177,9 +177,6 @@ const laneSummary = (receipt: SwarmReceipt) => {
     .join("\n");
 };
 
-// GitHub refuses a check run summary over 65535 characters; the rest is room
-// for the notes and the lane summary that follow the review.
-const SHADOW_BODY_MAX = 60_000;
 const RETIRE_ATTEMPTS = 5;
 // Four waits of 1, 4, 16 and 64 minutes, so the five attempts span an outage
 // rather than five alarms that other events can fire back to back.
@@ -575,11 +572,7 @@ export class PullRequestReview extends DurableObject<ReviewPiEnv> {
     if (state.shadow)
       return [
         "success",
-        `Shadow review at ${expected.head.slice(0, 7)}, not posted to the pull request. ${confirmed} confirmed finding(s).\n\n${
-          body.length > SHADOW_BODY_MAX
-            ? `${body.slice(0, SHADOW_BODY_MAX)}\n\n(The review is cut here to fit the check run.)`
-            : body
-        }`,
+        `Shadow review at ${expected.head.slice(0, 7)}, not posted to the pull request. ${confirmed} confirmed finding(s).\n\n${body}`,
       ];
     try {
       const validated = await revalidatePullRequest(

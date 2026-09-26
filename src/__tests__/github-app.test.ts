@@ -662,7 +662,7 @@ describe("GitHub App webhook", () => {
     },
   );
 
-  it("cuts a shadow review that would not fit the check run", async () => {
+  it("keeps a long partial shadow review's check summary within GitHub's limit", async () => {
     const { pr, r2, started } = fixture();
     const gh = github({
       routes: {
@@ -672,14 +672,22 @@ describe("GitHub App webhook", () => {
     const reviewId = await started();
     r2.set(`reviews/${reviewId}/receipt.json`, {
       ...receipt,
-      findings: [{ ...finding("long", 40), mechanism: "x".repeat(70_000) }],
+      status: "partial",
+      findings: [{ ...finding("long", 40), mechanism: "x".repeat(62_000) }],
+      lanes: Array.from({ length: 27 }, () => ({
+        role: "verifier",
+        family: "openai-codex",
+        model: "gpt-6-luna",
+        status: "failed",
+        stopReason: "error",
+        error: "e".repeat(500),
+      })),
     });
     await pr.alarm();
     const { summary } = gh.checks().at(-1)!.output as { summary: string };
-    expect(summary.length).toBeLessThanOrEqual(65_535);
-    expect(
-      summary.endsWith("(The review is cut here to fit the check run.)"),
-    ).toBe(true);
+    expect(summary).toMatch(/^Shadow review at aaaaaaa/);
+    expect(summary.length).toBe(65_535);
+    expect(summary.endsWith("\n\n(Cut here to fit the check run.)")).toBe(true);
   });
 
   it("waits out a rate-limited brief read and then steers by the brief", async () => {

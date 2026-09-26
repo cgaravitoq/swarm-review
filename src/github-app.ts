@@ -360,6 +360,10 @@ export async function offerCheck(
     );
 }
 
+// GitHub refuses a check run summary over 65535 characters.
+const CHECK_SUMMARY_MAX = 65_535;
+const CUT = "\n\n(Cut here to fit the check run.)";
+
 export async function completeCheck(
   token: string,
   repository: string,
@@ -381,7 +385,10 @@ export async function completeCheck(
             conclusion === "success"
               ? "Swarm review completed"
               : "Swarm review could not complete",
-          summary,
+          summary:
+            summary.length > CHECK_SUMMARY_MAX
+              ? `${summary.slice(0, CHECK_SUMMARY_MAX - CUT.length)}${CUT}`
+              : summary,
         },
       }),
     },
