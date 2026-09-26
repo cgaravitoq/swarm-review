@@ -1,0 +1,3 @@
+```json
+{"verdicts":[{"id":"c2","status":"rejected","reason":"The candidate identifies no reachable defect: materialize() generates context/swarm.js before deployment, and the image hash is computed from that same file. The --image-only path builds the image after materialization and does not enter the Worker deploy branch."}]}
+```

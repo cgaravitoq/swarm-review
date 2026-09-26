@@ -760,8 +760,11 @@ export function parseVerdicts(
     const duplicateOf = nonEmptyString(verdict["duplicateOf"])
       ? String(verdict["duplicateOf"]).trim()
       : null;
+    // A rejected candidate is never published, so a strength it omits decides
+    // nothing and is recorded the way a duplicate's is.
     const strength =
-      status === "duplicate"
+      status === "duplicate" ||
+      (status === "rejected" && verdict["evidenceStrength"] === undefined)
         ? ("static" as const)
         : EVIDENCE_STRENGTHS.find(
             (known_) => known_ === verdict["evidenceStrength"],

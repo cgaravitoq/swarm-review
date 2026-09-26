@@ -1316,6 +1316,43 @@ describe("deduplication and verification", () => {
     expect(findings[0]?.verifierReason).toMatch(/does not import/);
   });
 
+  it("accepts a real verifier rejection that names no evidence strength", () => {
+    const { verdicts, error } = parseVerdicts(
+      readFileSync(
+        join(
+          packageRoot,
+          "src/__tests__/verifier-rejection-without-strength.txt",
+        ),
+        "utf8",
+      ),
+      ["c2"],
+    );
+
+    expect(error).toBeNull();
+    expect(verdicts).toEqual([
+      expect.objectContaining({
+        id: "c2",
+        status: "rejected",
+        evidenceStrength: "static",
+      }),
+    ]);
+    expect(verdicts[0]?.reason).toMatch(/identifies no reachable defect/);
+  });
+
+  it("still refuses a confirmed verdict that names no evidence strength", () => {
+    const { verdicts, error } = parseVerdicts(
+      fenced({
+        verdicts: [
+          { id: "c1", status: "confirmed", reason: "the source matches" },
+        ],
+      }),
+      ["c1"],
+    );
+
+    expect(error).toBe("verdicts[0] does not satisfy the verdict contract");
+    expect(verdicts).toEqual([]);
+  });
+
   it("records the change's own diff relation and declared intent on the finding", () => {
     const deduped = twoLaneCandidates();
     const { verdicts, error } = parseVerdicts(
