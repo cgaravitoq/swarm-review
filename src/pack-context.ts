@@ -49,6 +49,7 @@ const MODEL_PROMPT_TOKENS = new Map<string, number>([
   // 1,048,576 is also the t1b per-request cap, so the trial binds first.
   ["openai/gpt-5.6-luna", 1_050_000],
   ["workers-ai/@cf/deepseek-ai/deepseek-v4-flash-0731", 1_048_576],
+  ["workers-ai/@cf/deepseek-ai/deepseek-v4-pro-0813", 1_048_576],
 ]);
 
 const UNKNOWN_MODEL_PROMPT_TOKENS = 128_000;

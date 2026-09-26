@@ -355,6 +355,34 @@ describe("cloud reviews", () => {
       reviewEnv,
     );
 
+  it("runs a deep review's lanes on each family's deepest model", async () => {
+    const fixture = setup();
+    const reviewId = "review-deep";
+    await fixture.job.start({
+      reviewId,
+      ...requestBody,
+      origin: "https://review.invalid",
+      deadlineAt: new Date(Date.now() + 13 * 60_000).toISOString(),
+      deep: true,
+    });
+    await fixture.job.alarm();
+    const lanes = JSON.parse(
+      fixture.files.get(`/workspace/runs/${reviewId}/lanes.json`) ?? "{}",
+    ) as Record<"reviewers" | "verifiers", { family: string; model: string }[]>;
+    expect(
+      lanes.reviewers.map((lane) => `${lane.family} ${lane.model}`),
+    ).toEqual([
+      "workers-ai @cf/deepseek-ai/deepseek-v4-pro-0813",
+      "openai-codex gpt-6-astra",
+      "claude-code claude-fable-5-1",
+    ]);
+    expect(lanes.verifiers.map((lane) => lane.model)).toEqual([
+      "gpt-6-astra",
+      "claude-fable-5-1",
+      "@cf/deepseek-ai/deepseek-v4-pro-0813",
+    ]);
+  });
+
   it("accepts immediately, runs the engine as uid 1102 with broker handles, and stores R2 state and receipt", async () => {
     const fixture = setup();
     const response = await post(fixture.reviewEnv);

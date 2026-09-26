@@ -198,6 +198,9 @@ The check completes with `success` when the review is published, or `neutral` wi
 A failed or partial review's check names each lane with its family, model, status, stop reason and error.
 A push (`synchronize`) starts no review: the new head gets a `neutral` check with a Review button, and a run already in flight finishes on its own SHA.
 Review and Re-run on that check start a new generation if its commit is still the head of an open PR, and the newer generation stops the older one's cloud review and keeps it from publishing.
+Every completed check, and the neutral check a push gets, also offers Deep review, which starts a new generation the same way with DeepSeek V4 Pro, GPT-6 Astra and Claude Fable 5.1 as the three families and a 13-minute deadline instead of 8.
+A review runs inside one Durable Object alarm, which Cloudflare stops after 15 minutes, so the deep deadline leaves room for the transcripts and teardown, and the check still completes within 15 minutes of the click.
+Re-run on a deep review's check starts a standard one; Deep review is the button that repeats it.
 A 403, 404, or 422 from GitHub ends that generation's retries, completes its check with the reason, and does not block later generations.
 A rate-limited 403 or 429 is retried after the reset GitHub names instead.
 Set `GITHUB_APP_ID`, `GITHUB_APP_PRIVATE_KEY` (PKCS#8 PEM), and `GITHUB_WEBHOOK_SECRET` as Worker secrets before installing the App.

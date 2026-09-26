@@ -1975,6 +1975,11 @@ describe("Checks tab", () => {
           description: "Review this pull request head",
           identifier: "review",
         },
+        {
+          label: "Deep review",
+          description: "Review again with the deepest models",
+          identifier: "deep-review",
+        },
       ],
     });
     expect(job.start).toHaveBeenCalledOnce();
@@ -2040,6 +2045,64 @@ describe("Checks tab", () => {
       });
     },
   );
+
+  it("runs Deep review as a new deep generation and says so on its check", async () => {
+    const { env, pr, job, r2, started } = fixture();
+    const gh = github();
+    await started();
+    const response = await worker.fetch(
+      await signed(
+        JSON.stringify(
+          checkRun({ requested_action: { identifier: "deep-review" } }),
+        ),
+        "webhook-secret",
+        "82345678-1234-1234-1234-123456789abc",
+        "check_run",
+      ),
+      env as never,
+    );
+    expect(await response.json()).toEqual({ accepted: true });
+    const before = Date.now();
+    await pr.alarm();
+    const [standard, deep] = job.start.mock.calls.map(
+      ([review]) =>
+        review as { deep?: boolean; deadlineAt: string; reviewId: string },
+    );
+    expect(standard).not.toHaveProperty("deep");
+    expect(deep).toMatchObject({ deep: true });
+    const deadline = Date.parse(deep!.deadlineAt);
+    expect(deadline - before).toBeGreaterThanOrEqual(13 * 60_000);
+    expect(deadline - Date.now()).toBeLessThanOrEqual(13 * 60_000);
+    r2.set(`reviews/${deep!.reviewId}/receipt.json`, receipt);
+    await pr.alarm();
+    const actions = [
+      {
+        label: "Deep review",
+        description: "Review again with the deepest models",
+        identifier: "deep-review",
+      },
+    ];
+    const note =
+      "Deep review: each family's deepest model, with up to 13 minutes.";
+    expect(gh.checks()).toEqual([
+      expect.objectContaining({
+        url: `${API}/check-runs/99`,
+        conclusion: "neutral",
+        actions,
+        output: expect.objectContaining({
+          summary: expect.not.stringContaining(note),
+        }),
+      }),
+      expect.objectContaining({
+        url: `${API}/check-runs/100`,
+        conclusion: "success",
+        actions,
+        output: expect.objectContaining({
+          summary: expect.stringContaining(note),
+        }),
+      }),
+    ]);
+  });
 
   it.each([
     ["another action", checkRun({ requested_action: { identifier: "other" } })],

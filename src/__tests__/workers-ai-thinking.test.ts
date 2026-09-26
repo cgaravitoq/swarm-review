@@ -7,7 +7,10 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { modelsJsonForProxy } from "../model-proxy";
 
 const PROVIDER = "cloudflare-workers-ai";
-const MODEL = "@cf/deepseek-ai/deepseek-v4-flash-0731";
+const MODELS = [
+  "@cf/deepseek-ai/deepseek-v4-flash-0731",
+  "@cf/deepseek-ai/deepseek-v4-pro-0813",
+];
 const HANDLE = "review-pi-00000000-0000-4000-8000-000000000000";
 const BASE_URL = "https://review.example.workers.dev/model/run-1/cap-1";
 
@@ -82,7 +85,7 @@ const READ_TOOL = {
   parameters: { type: "object" as const, properties: {} },
 };
 
-const laneRequest = async (turn: "report" | "tool") => {
+const laneRequest = async (id: string, turn: "report" | "tool") => {
   const image = await readFile(
     fileURLToPath(new URL("../../container/models.json", import.meta.url)),
     "utf8",
@@ -97,8 +100,8 @@ const laneRequest = async (turn: "report" | "tool") => {
     modelsPath,
     authPath: join(dir, "auth.json"),
   });
-  const model = runtime.getModel(PROVIDER, MODEL);
-  if (!model) throw new Error(`${MODEL} missing from Pi's catalog`);
+  const model = runtime.getModel(PROVIDER, id);
+  if (!model) throw new Error(`${id} missing from Pi's catalog`);
   const requests: { url: string; headers: Headers; body: unknown }[] = [];
   const events = runtime.streamSimple(
     model,
@@ -134,15 +137,15 @@ const laneRequest = async (turn: "report" | "tool") => {
   return request.body;
 };
 
-describe("the workers-ai DeepSeek lane", () => {
+describe.each(MODELS)("the workers-ai %s lane", (id) => {
   // Against the model, `reasoning_effort: "none"` still reasoned and
   // `chat_template_kwargs: {thinking: false}` did not, so the report turn
   // switches thinking off through the chat template.
   it("turns thinking off through the chat template on the report turn", async () => {
-    const body = await laneRequest("report");
+    const body = await laneRequest(id, "report");
 
     expect(body).toMatchObject({
-      model: MODEL,
+      model: id,
       chat_template_kwargs: { thinking: false },
     });
     expect(body).not.toHaveProperty("reasoning_effort");
@@ -152,10 +155,10 @@ describe("the workers-ai DeepSeek lane", () => {
   // With no `reasoning_effort` the model runs at its default, high: the level
   // the tool turns ran at before.
   it("keeps thinking on through the chat template on a tool turn", async () => {
-    const body = await laneRequest("tool");
+    const body = await laneRequest(id, "tool");
 
     expect(body).toMatchObject({
-      model: MODEL,
+      model: id,
       tools: [{ type: "function", function: { name: "read" } }],
       chat_template_kwargs: { thinking: true },
     });

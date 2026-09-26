@@ -235,6 +235,9 @@ describe("packLaneContext", () => {
     expect(packBudgetChars("t1b", "some-unknown-model")).toBeLessThan(
       packBudgetChars("t1b", "grok-4.6"),
     );
+    expect(packBudgetChars("t1b", "@cf/deepseek-ai/deepseek-v4-pro-0813")).toBe(
+      packBudgetChars("t1b", "@cf/deepseek-ai/deepseek-v4-flash-0731"),
+    );
   });
 
   it("knows the prompt ceiling of every lab the packed lanes route to", () => {
