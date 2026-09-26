@@ -285,7 +285,7 @@ A sealed answer key names the defects a change actually introduced; the harness 
 bun run typecheck   # tsgo --noEmit
 bun run lint        # oxlint, with the anti-slop plugin
 bun run biome       # biome check .
-bun run test        # vitest
+bun run test        # vitest run
 ```
 
 Git hooks run secretlint, biome, typecheck and the anti-slop lint on every commit, and CI runs the same four plus the tests.
