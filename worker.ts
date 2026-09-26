@@ -153,6 +153,7 @@ type AppReview = {
   cancelFailures?: number;
   retriedAfter?: string;
   completionFailures?: number;
+  completionRetryAt?: number;
 };
 
 const plain = (value: unknown) =>
@@ -174,6 +175,9 @@ const laneSummary = (receipt: SwarmReceipt) => {
 };
 
 const RETIRE_ATTEMPTS = 5;
+// Four waits of 1, 4, 16 and 64 minutes, so the five attempts span an outage
+// rather than five alarms that other events can fire back to back.
+const COMPLETION_BACKOFF_MS = 60_000;
 const SUPERSEDED_SUMMARY = "A newer pull request event superseded this review.";
 
 const refusedForGood = (error: unknown) =>
@@ -290,6 +294,7 @@ export class PullRequestReview extends DurableObject<ReviewPiEnv> {
     let wakeAt = 0;
     const failures = new Map<number, Partial<AppReview>>();
     for (const previous of superseded) {
+      if ((previous.completionRetryAt ?? 0) > Date.now()) continue;
       let summary = SUPERSEDED_SUMMARY;
       if (previous.reviewId)
         try {
@@ -316,7 +321,14 @@ export class PullRequestReview extends DurableObject<ReviewPiEnv> {
         if (refusedForGood(error) || completionFailures >= RETIRE_ATTEMPTS)
           retired.add(previous.generation);
         else {
-          failures.set(previous.generation, { completionFailures });
+          failures.set(previous.generation, {
+            completionFailures,
+            completionRetryAt: Math.max(
+              retryAfter(error),
+              Date.now() +
+                COMPLETION_BACKOFF_MS * 4 ** (completionFailures - 1),
+            ),
+          });
           wakeAt = Math.max(wakeAt, retryAfter(error));
         }
       }

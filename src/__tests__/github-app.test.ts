@@ -1601,6 +1601,7 @@ describe("App review publication", () => {
         4_102_444_800_000,
       );
       gh.calls.length = 0;
+      vi.spyOn(Date, "now").mockReturnValue(4_102_444_800_000);
       await pr.alarm();
       expect(
         gh.sent().filter((call) => `${call.method} ${call.url}` === route),
@@ -1651,7 +1652,7 @@ describe("App review publication", () => {
     expect(stored.get("superseded")).toEqual([]);
   });
 
-  it("stops completing a superseded check GitHub keeps failing after five attempts", async () => {
+  it("spreads five attempts to complete a superseded check over an hour, then stops", async () => {
     const { pr, stored, storage, started } = fixture();
     const gh = github({
       routes: {
@@ -1670,7 +1671,17 @@ describe("App review publication", () => {
           call.url === `${API}/check-runs/99` &&
           (call.body as { status: string }).status === "completed",
       );
-    for (let attempt = 1; attempt < 5; attempt += 1) await pr.alarm();
+    let now = Date.now();
+    vi.spyOn(Date, "now").mockImplementation(() => now);
+    for (const wait of [60_000, 240_000, 960_000, 3_840_000]) {
+      await pr.alarm();
+      const attempts = completions().length;
+      now += wait - 1;
+      await pr.alarm();
+      expect(completions()).toHaveLength(attempts);
+      now += 1;
+    }
+    expect(completions()).toHaveLength(4);
     expect(stored.get("superseded")).toEqual([
       expect.objectContaining({ generation: 1, completionFailures: 4 }),
     ]);
