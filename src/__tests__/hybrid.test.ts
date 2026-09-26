@@ -858,6 +858,28 @@ it("hands a reviewer still running at the review deadline one tools-off report t
   expect(receipt.findings[0]?.status).toBe("confirmed");
 });
 
+it("cuts a reviewer whose first turn never ended at the review deadline, with no report turn", async () => {
+  // Pi writes nothing to the session before its first assistant message, so a
+  // report turn before one would start empty and answer it has no tools.
+  const input = await setup();
+  const config = JSON.parse(await readFile(input.lanes, "utf8"));
+  config.reviewers[0].env.PI_HANG = "silent";
+  await writeFile(input.lanes, JSON.stringify(config));
+  const result = run(input, 10);
+  expect(result.status, result.stderr).toBe(0);
+  const { receipt } = await windows(input.out);
+  const reviewer = (await calls(input.log)).filter(
+    (call) => call.family === "workers-ai",
+  );
+  expect(reviewer.map((call) => call.args.includes("--no-tools"))).toEqual([
+    false,
+  ]);
+  expect(receipt.lanes[0]).toMatchObject({
+    status: "cancelled",
+    stopReason: "review deadline",
+  });
+});
+
 it("declares a reviewer cut at the review deadline when its report turn does not finish", async () => {
   const input = await setup();
   const config = JSON.parse(await readFile(input.lanes, "utf8"));
