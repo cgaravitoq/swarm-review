@@ -90,7 +90,11 @@ if (process.env.PI_HANG === "runaway" || ((process.env.PI_HANG === "cap" || proc
   for (const delta of ["🧪".repeat(5000), report])
     event({type:"message_update",usage,assistantMessageEvent:{type:"text_delta",contentIndex:1,delta}});
   setInterval(() => {}, 1000);
-} else if (process.env.PI_HANG === "deadline" || (process.env.PI_HANG === "stall" && !reportTurn)) {
+} else if (process.env.PI_HANG === "silent" || process.env.PI_HANG === "deadline" || (process.env.PI_HANG === "stall" && !reportTurn)) {
+  if (process.env.PI_HANG !== "silent") {
+    event({type:"turn_start"});
+    event({type:"turn_end",message:{stopReason:"toolUse",usage:{input:1,output:1,totalTokens:2}}});
+  }
   setInterval(() => {}, 1000);
 } else {
   event({type:"turn_start"});

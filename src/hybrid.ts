@@ -231,7 +231,10 @@ function runPi(input: {
       });
     };
     const requestReport = () => {
-      if (complete || cut || reportTurn || handoff || finalText) return;
+      // Pi writes nothing to the session before its first assistant message,
+      // so a report turn before one starts empty and answers it has no tools.
+      if (complete || cut || reportTurn || handoff || finalText || turns === 0)
+        return;
       handoff = true;
       if (child.pid) {
         try {
