@@ -2709,7 +2709,11 @@ exec /usr/bin/git "$@"
     "100",
   ];
 
-  const runSwarm = (args: string[], arranged: Arranged, env = arranged.env) =>
+  const runSwarm = (
+    args: string[],
+    arranged: Arranged,
+    env: NodeJS.ProcessEnv = arranged.env,
+  ) =>
     new Promise<{ code: number; output: string }>((resolvePromise) => {
       let output = "";
       const child = spawn("bun", args, {

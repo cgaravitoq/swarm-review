@@ -45,7 +45,7 @@ const required = (name: string) => {
 };
 
 const githubToken = () =>
-  process.env.GITHUB_TOKEN ??
+  process.env["GITHUB_TOKEN"] ??
   execFileSync("gh", ["auth", "token"], { encoding: "utf8" }).trim();
 
 async function github<T>(path: string, token: string) {
@@ -714,7 +714,7 @@ export const brokerCaps = (
 
 export async function main() {
   const token = githubToken();
-  const secret = process.env.REVIEW_PI_CONTROL_SECRET ?? required("secret");
+  const secret = process.env["REVIEW_PI_CONTROL_SECRET"] ?? required("secret");
   const runId = assertRunId(argument("run-id") ?? mintRunId("run"));
   const outDir = join(required("out"), runId);
   const worker = required("worker");

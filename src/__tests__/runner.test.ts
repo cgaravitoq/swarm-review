@@ -1859,7 +1859,7 @@ exec /bin/date "$@"
     const runnerProc = spawn("bash", argv, {
       env: {
         ...process.env,
-        PATH: `${binDir}:${process.env.PATH}`,
+        PATH: `${binDir}:${process.env["PATH"]}`,
         PI_BIN: fakePiPath,
         PI_ARGS_LOG: join(root, "pi-args.jsonl"),
         PI_STEER_LOG: join(root, "pi-steer.log"),
