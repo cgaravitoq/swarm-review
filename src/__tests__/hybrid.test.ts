@@ -156,7 +156,7 @@ function run(
       cwd: input.source,
       env: {
         ...process.env,
-        PATH: `${input.bin}:${process.env.PATH}`,
+        PATH: `${input.bin}:${process.env["PATH"]}`,
         PARENT_SECRET_SENTINEL: "do-not-copy",
         ...envExtra,
       },
