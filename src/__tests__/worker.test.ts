@@ -884,7 +884,7 @@ describe("cloud reviews", () => {
 
   const upstreamWithPull = async (
     root: string,
-    options: { pushPull: boolean; unrelatedBase: boolean },
+    options: { pushPull: boolean; unrelatedBase: boolean; movedPast?: boolean },
   ) => {
     const upstream = path.join(root, "upstream.git");
     const source = path.join(root, "source");
@@ -909,6 +909,11 @@ describe("cloud reviews", () => {
     const head = git("-C", source, "rev-parse", "HEAD");
     if (options.pushPull)
       git("-C", source, "push", "-q", "origin", "HEAD:refs/pull/17/head");
+    if (options.movedPast) {
+      await writeFile(path.join(source, "file.txt"), "base\nhead\nlater\n");
+      git("-C", source, "commit", "-qam", "later");
+      git("-C", source, "push", "-q", "origin", "HEAD:refs/pull/17/head");
+    }
     if (!options.unrelatedBase) return { upstream, head, base: fork };
     git("-C", source, "checkout", "-q", "--orphan", "unrelated");
     git("-C", source, "commit", "-q", "--allow-empty", "-m", "unrelated");
@@ -1017,6 +1022,42 @@ describe("cloud reviews", () => {
       }
     },
   );
+
+  it("reviews a commit its pull request has since moved past", async () => {
+    const root = await mkdtemp(path.join(tmpdir(), "review-clone-"));
+    try {
+      const upstream = await upstreamWithPull(root, {
+        pushPull: true,
+        unrelatedBase: false,
+        movedPast: true,
+      });
+      const fixture = setup();
+      const checkout = path.join(root, "checkout");
+      const outputs = runCloneThroughShell(
+        fixture,
+        pathToFileURL(upstream.upstream).href,
+        checkout,
+      );
+      const response = await post(fixture.reviewEnv, {
+        ...requestBody,
+        head: upstream.head,
+        base: upstream.base,
+      });
+      const { reviewId } = (await response.json()) as { reviewId: string };
+      await fixture.job.alarm();
+      expect(outputs).toEqual(["clone\nfetch_head\nfetch_base\nmerge_base\n"]);
+      expect(
+        spawnSync("git", ["-C", checkout, "rev-parse", "HEAD"], {
+          encoding: "utf8",
+        }).stdout.trim(),
+      ).toBe(upstream.head);
+      expect(fixture.r2.get(`reviews/${reviewId}/receipt.json`)).toMatchObject({
+        status: "completed",
+      });
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
 
   it("records a clone that passes every step and adds nothing to its receipt or status", async () => {
     const root = await mkdtemp(path.join(tmpdir(), "review-clone-"));
