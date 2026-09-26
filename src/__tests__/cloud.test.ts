@@ -272,6 +272,86 @@ it("keeps the secret out of an error body that echoes the authorization header",
   await expectNoSecret();
 });
 
+function hangUntilAborted() {
+  const timers: { ms: number; controller: AbortController }[] = [];
+  vi.spyOn(AbortSignal, "timeout").mockImplementation((ms) => {
+    const controller = new AbortController();
+    timers.push({ ms, controller });
+    return controller.signal;
+  });
+  const hung = (init: RequestInit = {}) =>
+    new Promise<Response>((_, reject) =>
+      init.signal?.addEventListener("abort", () => reject(init.signal?.reason)),
+    );
+  const timeOut = async (index: number) => {
+    while (!timers[index]) await new Promise((wake) => setTimeout(wake, 1));
+    timers[index].controller.abort(
+      new DOMException("The operation timed out.", "TimeoutError"),
+    );
+  };
+  return { timers, hung, timeOut };
+}
+
+it("ends a submit the Worker never answers with one line once its request times out", async () => {
+  const { timers, hung, timeOut } = hangUntilAborted();
+  const calls = stubFetch([]);
+  const fetchStub = vi.mocked(fetch);
+  const answer = fetchStub.getMockImplementation()!;
+  fetchStub.mockImplementation(async (input, init) =>
+    String(input).startsWith(ORIGIN) ? hung(init) : answer(input, init),
+  );
+  const exit = runCloud(argv(), io);
+  await timeOut(0);
+  expect(await exit).toBe(1);
+  expect(lines).toEqual([
+    "cloud review not submitted: The operation timed out.",
+  ]);
+  expect(timers.map((timer) => timer.ms)).toEqual([30_000]);
+  expect(
+    fetchStub.mock.calls
+      .filter(([input]) => String(input).startsWith(ORIGIN))
+      .map(([, init]) => init?.signal === timers[0]?.controller.signal),
+  ).toEqual([true]);
+  expect(calls.every((call) => !call.url.startsWith(ORIGIN))).toBe(true);
+});
+
+it("keeps polling past a poll the Worker never answers once that request times out", async () => {
+  const { timers, hung, timeOut } = hangUntilAborted();
+  const calls = stubFetch([
+    json({ reviewId: "review-7" }, 202),
+    json({
+      status: status("done", [], { candidates: 0, verified: 0 }),
+      receipt: { status: "completed" },
+    }),
+  ]);
+  const fetchStub = vi.mocked(fetch);
+  const answer = fetchStub.getMockImplementation()!;
+  let polls = 0;
+  fetchStub.mockImplementation(async (input, init) =>
+    String(input).startsWith(`${ORIGIN}/reviews/`) && polls++ === 0
+      ? hung(init)
+      : answer(input, init),
+  );
+  const exit = runCloud(argv(), io);
+  await timeOut(1);
+  expect(await exit).toBe(0);
+  expect(lines).toEqual([
+    `cloud review review-7: accepted for octo/widget#7 at ${HEAD}`,
+    "cloud review review-7: poll failed: The operation timed out.",
+    "cloud review review-7: phase done | reviewers none | candidates 0 | verified 0",
+    "cloud review review-7: completed",
+  ]);
+  expect(timers.map((timer) => timer.ms)).toEqual([30_000, 30_000, 30_000]);
+  expect(
+    fetchStub.mock.calls
+      .filter(([input]) => String(input).startsWith(ORIGIN))
+      .map(
+        ([, init], index) => init?.signal === timers[index]?.controller.signal,
+      ),
+  ).toEqual([true, true, true]);
+  expect(workerCalls(calls)).toHaveLength(2);
+});
+
 it("survives a non-JSON poll and times out past the status deadline plus a margin", async () => {
   const reviewing = json({
     status: status("reviewing", ["running"], { candidates: 0, verified: 0 }),
