@@ -639,6 +639,7 @@ export class PullRequestReview extends DurableObject<ReviewPiEnv> {
       state.checkRunId!,
       conclusion,
       withNotes(state, summary),
+      state.reviewId,
     );
     state.phase = "done";
     state.outcome = summary;

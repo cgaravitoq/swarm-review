@@ -370,6 +370,7 @@ export async function completeCheck(
   checkRunId: number,
   conclusion: "success" | "neutral",
   summary: string,
+  reviewId: string | null = null,
 ): Promise<void> {
   const response = await fetch(
     `${api}/repos/${repository}/check-runs/${checkRunId}`,
@@ -377,6 +378,7 @@ export async function completeCheck(
       method: "PATCH",
       headers: headers(token),
       body: JSON.stringify({
+        ...(reviewId ? { external_id: reviewId } : {}),
         status: "completed",
         conclusion,
         completed_at: new Date().toISOString(),
