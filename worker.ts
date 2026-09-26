@@ -99,6 +99,10 @@ const PROBE_SESSIONS_KEY = "probeSessions";
 const MODEL_SEALS_KEY = "modelSeals";
 const COMMAND_SEQUENCE_KEY = "commandSequence";
 const REVIEW_DEADLINE_MS = 8 * 60_000;
+// A review runs inside one Durable Object alarm, which Cloudflare stops after
+// 15 minutes of wall time, and its evidence and teardown can run a minute past
+// the deadline, so a deep review stops at 13 minutes and its check by 15.
+const DEEP_REVIEW_DEADLINE_MS = 13 * 60_000;
 const REVIEW_ENGINE_MARGIN_MS = 90_000;
 const REVIEW_FAMILIES = {
   "workers-ai": {
@@ -107,6 +111,14 @@ const REVIEW_FAMILIES = {
   },
   "openai-codex": { provider: "openai-codex", model: "gpt-6-luna" },
   "claude-code": { provider: "claude-code", model: "claude-opus-5-5" },
+} as const;
+const DEEP_REVIEW_FAMILIES = {
+  "workers-ai": {
+    provider: "cloudflare-workers-ai",
+    model: "@cf/deepseek-ai/deepseek-v4-pro-0813",
+  },
+  "openai-codex": { provider: "openai-codex", model: "gpt-6-astra" },
+  "claude-code": { provider: "claude-code", model: "claude-fable-5-1" },
 } as const;
 // Workers AI verifiers take several long thinking turns and ran out of the
 // window every time it was tight, so candidates go to the families that rule
@@ -136,6 +148,7 @@ type CloudReview = {
   context?: string;
   origin: string;
   deadlineAt: string;
+  deep?: boolean;
 };
 
 type AppReview = {
@@ -157,6 +170,7 @@ type AppReview = {
   completionRetryAt?: number;
   shadow?: boolean;
   configNote?: string | null;
+  deep?: boolean;
 };
 
 const plain = (value: unknown) =>
@@ -202,6 +216,8 @@ const lostToPlatform = (message: unknown): message is string =>
 const withNotes = (state: AppReview, text: string) =>
   [
     text,
+    state.deep &&
+      "Deep review: each family's deepest model, with up to 13 minutes.",
     state.retriedAfter &&
       `Retried once: the first attempt ended with ${plain(state.retriedAfter)}.`,
     state.briefNote,
@@ -211,7 +227,12 @@ const withNotes = (state: AppReview, text: string) =>
     .join("\n\n");
 
 export class PullRequestReview extends DurableObject<ReviewPiEnv> {
-  async accept(event: PullRequestEvent, delivery: string, origin: string) {
+  async accept(
+    event: PullRequestEvent,
+    delivery: string,
+    origin: string,
+    deep = false,
+  ) {
     if (await this.ctx.storage.get(`delivery:${delivery}`)) return false;
     await this.ctx.storage.put(`delivery:${delivery}`, true);
     const current = await this.ctx.storage.get<AppReview>("current");
@@ -233,6 +254,7 @@ export class PullRequestReview extends DurableObject<ReviewPiEnv> {
       outcome: null,
       briefNote: null,
       progress: null,
+      ...(deep ? { deep } : {}),
     };
     await this.ctx.storage.put("current", state);
     await this.ctx.storage.setAlarm(Date.now());
@@ -371,6 +393,9 @@ export class PullRequestReview extends DurableObject<ReviewPiEnv> {
   private async advance(): Promise<boolean | number> {
     const state = await this.ctx.storage.get<AppReview>("current");
     if (!state || state.phase === "done") return false;
+    const deadlineMs = state.deep
+      ? DEEP_REVIEW_DEADLINE_MS
+      : REVIEW_DEADLINE_MS;
     try {
       const token = await this.token(state.event);
       const { repository } = state.event;
@@ -413,7 +438,8 @@ export class PullRequestReview extends DurableObject<ReviewPiEnv> {
           base: state.mergeBase,
           ...(brief.context ? { context: brief.context } : {}),
           origin: state.origin,
-          deadlineAt: new Date(Date.now() + REVIEW_DEADLINE_MS).toISOString(),
+          deadlineAt: new Date(Date.now() + deadlineMs).toISOString(),
+          ...(state.deep ? { deep: true } : {}),
         });
         state.phase = "running";
         if (!(await this.save(state))) return false;
@@ -426,7 +452,7 @@ export class PullRequestReview extends DurableObject<ReviewPiEnv> {
           !receiptObject ||
           !(await this.env.REVIEW_JOBS.getByName(state.reviewId!).isDone())
         ) {
-          if (Date.now() <= state.acceptedAt + REVIEW_DEADLINE_MS + 120_000) {
+          if (Date.now() <= state.acceptedAt + deadlineMs + 120_000) {
             await this.reportProgress(token, state);
             return true;
           }
@@ -1378,8 +1404,9 @@ async function runCloudReview(env: ReviewPiEnv, review: CloudReview) {
       review.reviewId,
       capability,
     );
+    const families = review.deep ? DEEP_REVIEW_FAMILIES : REVIEW_FAMILIES;
     const handles = Object.fromEntries(
-      Object.keys(REVIEW_FAMILIES).flatMap((family) => [
+      Object.keys(families).flatMap((family) => [
         [
           `${family}-reviewer`,
           family === "openai-codex"
@@ -1406,9 +1433,7 @@ async function runCloudReview(env: ReviewPiEnv, review: CloudReview) {
     };
     const reviewers: ReviewLane[] = [];
     const verifiers: ReviewLane[] = [];
-    for (const [family, { provider, model }] of Object.entries(
-      REVIEW_FAMILIES,
-    )) {
+    for (const [family, { provider, model }] of Object.entries(families)) {
       for (const role of ["reviewer", "verifier"] as const) {
         const handle = handles[`${family}-${role}`];
         if (!handle) throw new Error("missing_handle");
@@ -2038,7 +2063,7 @@ export default {
         });
       const accepted = await env.PULL_REQUEST_REVIEWS.getByName(
         `${event.repository.toLowerCase()}#${event.number}`,
-      ).accept(event, delivery, url0.origin);
+      ).accept(event, delivery, url0.origin, rerun.deep);
       return json({ accepted }, 202);
     }
     if (url0.pathname.startsWith("/git/")) {

@@ -1975,6 +1975,11 @@ describe("Checks tab", () => {
           description: "Review this pull request head",
           identifier: "review",
         },
+        {
+          label: "Deep review",
+          description: "Review again with the deepest models",
+          identifier: "deep-review",
+        },
       ],
     });
     expect(job.start).toHaveBeenCalledOnce();

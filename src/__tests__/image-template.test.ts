@@ -81,7 +81,11 @@ describe("the image's Pi", () => {
     const served = models.providers["claude-code"]?.models?.map(
       (model) => model.id,
     );
-    expect(named).toEqual(["claude-opus-5-5", "claude-opus-5"]);
+    expect(named).toEqual([
+      "claude-opus-5-5",
+      "claude-fable-5-1",
+      "claude-opus-5",
+    ]);
     for (const model of named) expect(served).toContain(model);
   });
 

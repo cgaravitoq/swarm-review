@@ -82,6 +82,12 @@ export async function verifyWebhook(
 }
 
 export const REVIEW_ACTION = "review";
+export const DEEP_REVIEW_ACTION = "deep-review";
+const DEEP_REVIEW = {
+  label: "Deep review",
+  description: "Review again with the deepest models",
+  identifier: DEEP_REVIEW_ACTION,
+};
 
 function reviewablePull(
   repository: unknown,
@@ -165,7 +171,8 @@ export function rerunEvent(
       : run?.["name"] === "swarm-review" &&
         (body["action"] === "rerequested" ||
           (body["action"] === "requested_action" &&
-            requested?.["identifier"] === REVIEW_ACTION));
+            (requested?.["identifier"] === REVIEW_ACTION ||
+              requested?.["identifier"] === DEEP_REVIEW_ACTION)));
   if (!ours) return null;
   const head = run?.["head_sha"];
   const repository = (
@@ -197,6 +204,9 @@ export function rerunEvent(
     number: Number(pull?.["number"]),
     head,
     installationId: Number(installationId),
+    deep:
+      body["action"] === "requested_action" &&
+      requested?.["identifier"] === DEEP_REVIEW_ACTION,
   };
 }
 
@@ -349,6 +359,7 @@ export async function offerCheck(
           description: "Review this pull request head",
           identifier: REVIEW_ACTION,
         },
+        DEEP_REVIEW,
       ],
     }),
   });
@@ -392,6 +403,7 @@ export async function completeCheck(
               ? `${summary.slice(0, CHECK_SUMMARY_MAX - CUT.length)}${CUT}`
               : summary,
         },
+        actions: [DEEP_REVIEW],
       }),
     },
   );
