@@ -94,9 +94,12 @@ if (process.env.PI_HANG === "runaway" || ((process.env.PI_HANG === "cap" || proc
 } else {
   event({type:"turn_start"});
   event({type:"turn_end",message:{stopReason:"stop",usage:{input:2,output:3,totalTokens:5}}});
+  const candidateId = (prompt.match(/"candidates":\\[\\{"id":"(c\\d+)"/) ?? [])[1] ?? "c1";
   const answer = verifying
-    ? {verdicts:[{id:"c1",status:"confirmed",severity:"P1",evidenceStrength:"static",diffRelation:"added",declaredIntent:null,reason:"value changes for callers"}]}
-    : process.env.PI_REPORT === "none" ? {status:"complete",blockerReason:"",findings:[]} : {status:"complete",blockerReason:"",findings:[{severity:"P1",file:"a.ts",line:1,mechanism:"value changes",evidence:"diff",affectedBehavior:"caller sees 2"}]};
+    ? {verdicts:[{id:candidateId,status:"confirmed",severity:"P1",evidenceStrength:"static",diffRelation:"added",declaredIntent:null,reason:"value changes for callers"}]}
+    : process.env.PI_REPORT === "none" ? {status:"complete",blockerReason:"",findings:[]}
+    : process.env.PI_REPORT === "many" ? {status:"complete",blockerReason:"",findings:Array.from({length:9},(_, index) => ({severity:index === 0 ? "P2" : "P1",file:"a.ts",line:1,mechanism:"value changes " + index,evidence:"diff",affectedBehavior:"caller sees 2"}))}
+    : {status:"complete",blockerReason:"",findings:[{severity:"P1",file:"a.ts",line:1,mechanism:"value changes",evidence:"diff",affectedBehavior:"caller sees 2"}]};
   const fence = String.fromCharCode(96).repeat(3);
   const text = process.env.PI_REPORT === "empty" && !verifying ? "" : process.env.PI_REPORT === "invalid" && !verifying ? "not a report" : process.env.PI_REPORT === "large" && !verifying ? "🧪".repeat(5000) + fence + "json\\n" + JSON.stringify(answer) + "\\n" + fence : fence + "json\\n" + JSON.stringify(answer) + "\\n" + fence;
   event({type:"agent_end",messages:[{role:"assistant",content:[{type:"text",text}]}]});
@@ -361,6 +364,62 @@ it("offers a candidate to the first finder-free family in the Worker's verifier 
     ).toEqual([verifier]);
     expect(receipt.findings[0]?.status).toBe("confirmed");
   }
+});
+
+it("rules on at most eight candidates per verifier family, most severe first, and declares the rest", async () => {
+  const input = await setup();
+  await familyLanes(
+    input,
+    [["workers-ai", { PI_REPORT: "many" }]],
+    [["openai-codex", {}]],
+  );
+  const result = run(input);
+  expect(result.status, result.stderr).toBe(0);
+  const receipt = JSON.parse(
+    await readFile(join(input.out, "receipt.json"), "utf8"),
+  ) as HybridReceipt;
+  expect(
+    (await calls(input.log)).filter((call) => call.phase === "verifying"),
+  ).toHaveLength(8);
+  expect(
+    receipt.findings.filter((finding) => finding.status === "confirmed"),
+  ).toHaveLength(8);
+  expect(
+    receipt.findings.filter((finding) => finding.status === "unverified"),
+  ).toEqual([
+    expect.objectContaining({
+      mechanism: "value changes 0",
+      unverifiedReason:
+        "every verifier family that can rule already has 8 candidates",
+    }),
+  ]);
+  expect(receipt.status).toBe("partial");
+});
+
+it("hands a candidate past one family's share to the next family that can rule", async () => {
+  const input = await setup();
+  await familyLanes(
+    input,
+    [["workers-ai", { PI_REPORT: "many" }]],
+    [
+      ["openai-codex", {}],
+      ["claude-code", {}],
+    ],
+  );
+  const result = run(input);
+  expect(result.status, result.stderr).toBe(0);
+  const receipt = JSON.parse(
+    await readFile(join(input.out, "receipt.json"), "utf8"),
+  ) as HybridReceipt;
+  expect(
+    (await calls(input.log))
+      .filter((call) => call.phase === "verifying")
+      .map((call) => call.family)
+      .sort(),
+  ).toEqual([...Array(8).fill("openai-codex"), "claude-code"].sort());
+  expect(
+    receipt.findings.every((finding) => finding.status === "confirmed"),
+  ).toBe(true);
 });
 
 it("never sends a candidate to a family whose reviewer failed", async () => {
