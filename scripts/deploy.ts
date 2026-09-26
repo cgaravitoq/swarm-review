@@ -206,6 +206,46 @@ const containerAppName = () => {
   return `${config.name as string}-${container.class_name}`.toLowerCase();
 };
 
+export const EVIDENCE_RULE = "evidence-30-days";
+
+export const lifecycleRuleNames = (output: string) =>
+  output
+    .split("\n")
+    .flatMap((line) => /^name:\s+(.+?)\s*$/.exec(line)?.[1] ?? []);
+
+const evidenceBucket = () => {
+  const buckets = wranglerConfig().r2_buckets as {
+    binding: string;
+    bucket_name: string;
+  }[];
+  const bucket = buckets.find((entry) => entry.binding === "PROBE_RESULTS");
+  if (!bucket) throw new Error("wrangler.jsonc binds no PROBE_RESULTS bucket");
+  return bucket.bucket_name;
+};
+
+// Lane transcripts carry the reviewed tree's code, so a Worker that stores
+// them must not ship onto a bucket that keeps them forever.
+const ensureEvidenceExpiry = async () => {
+  const bucket = evidenceBucket();
+  const rules = lifecycleRuleNames(
+    await wrangler(["r2", "bucket", "lifecycle", "list", bucket]),
+  );
+  if (rules.includes(EVIDENCE_RULE)) return;
+  await wrangler([
+    "r2",
+    "bucket",
+    "lifecycle",
+    "add",
+    bucket,
+    EVIDENCE_RULE,
+    "evidence/",
+    "--expire-days",
+    "30",
+    "-y",
+  ]);
+  console.log(`r2 lifecycle: added ${EVIDENCE_RULE} to ${bucket}`);
+};
+
 const waitForRollout = async (id: string) => {
   const deadline = Date.now() + rolloutTimeoutMs;
   while (true) {
@@ -244,6 +284,7 @@ const main = async () => {
     return;
   }
 
+  await ensureEvidenceExpiry();
   const deployed = await wrangler(
     [
       "deploy",
