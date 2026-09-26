@@ -420,6 +420,22 @@ describe("cloud reviews", () => {
       expect(configured?.baseUrl).toContain(`/model/${reviewId}/`);
       expect(sessions).toHaveProperty(configured?.apiKey ?? "missing");
     }
+    const settingsFiles = [...fixture.files.entries()].filter(
+      ([file]) =>
+        file.startsWith(`/workspace/runs/${reviewId}/pi-`) &&
+        file.endsWith("/settings.json"),
+    );
+    expect(settingsFiles).toHaveLength(6);
+    for (const [, body] of settingsFiles) {
+      expect(JSON.parse(body)).toEqual({
+        retry: {
+          enabled: true,
+          maxRetries: 2,
+          baseDelayMs: 1000,
+          provider: { maxRetries: 0 },
+        },
+      });
+    }
     expect(fixture.sandbox.destroy).toHaveBeenCalledOnce();
     expect(fixture.r2.has(`reviews/${reviewId}/receipt.json`)).toBe(true);
     const got = await handler.fetch(
