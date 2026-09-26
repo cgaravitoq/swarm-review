@@ -484,6 +484,39 @@ describe("cloud reviews", () => {
     },
   );
 
+  it("runs a review under the id its client named, once", async () => {
+    const fixture = setup();
+    const start = vi.spyOn(fixture.job, "start");
+    const reviewId = "review-0f8c2a1e-5b7d-4c3a-9e21-6d4b8f0a7c35";
+
+    const accepted = await post(fixture.reviewEnv, {
+      ...requestBody,
+      reviewId,
+    });
+    expect(accepted.status).toBe(202);
+    expect(await accepted.json()).toEqual({ reviewId });
+    expect(fixture.r2.has(`reviews/${reviewId}/status.json`)).toBe(true);
+
+    const again = await post(fixture.reviewEnv, { ...requestBody, reviewId });
+    expect(again.status).toBe(409);
+    expect(await again.json()).toEqual({ error: "review_exists" });
+    expect(start).toHaveBeenCalledOnce();
+
+    for (const named of [
+      "review-../../status",
+      "probe-0f8c2a1e-5b7d-4c3a-9e21-6d4b8f0a7c35",
+      17,
+    ]) {
+      const refused = await post(fixture.reviewEnv, {
+        ...requestBody,
+        reviewId: named,
+      });
+      expect(refused.status).toBe(400);
+      expect(await refused.json()).toEqual({ error: "invalid_review" });
+    }
+    expect(start).toHaveBeenCalledOnce();
+  });
+
   it("records the engine's exit code and stderr tail when it fails", async () => {
     const fixture = setup("engine-exit");
     const response = await post(fixture.reviewEnv);
