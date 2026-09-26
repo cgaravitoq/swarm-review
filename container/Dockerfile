@@ -48,8 +48,8 @@ FROM bun
 
 ENV PI_CODING_AGENT_DIR=/opt/review/pi-config
 
-RUN npm install -g "@earendil-works/pi-coding-agent@0.85.1" \
-  && pi --version | grep -qx "0.85.1"
+RUN npm install -g "@earendil-works/pi-coding-agent@0.87.1" \
+  && pi --version | grep -qx "0.87.1"
 
 # The review prompt asks for `rg`; the base image has no ripgrep, so every
 # search silently degraded to repeated grep/find sweeps of the whole monorepo.
@@ -73,7 +73,7 @@ RUN apt-get update \
 RUN mkdir -p /opt/review/extensions \
   && cd /opt/review/extensions \
   && npm install --no-audit --no-fund --ignore-scripts --legacy-peer-deps \
-    "@cgaravitoq/pi-claude-code-auth@2.5.2" \
+    "@cgaravitoq/pi-claude-code-auth@2.6.0" \
   && test -f node_modules/@cgaravitoq/pi-claude-code-auth/src/anthropic-stream.ts
 
 # The provider seam: registered with the extension's stream and with neither a

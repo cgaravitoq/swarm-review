@@ -111,7 +111,7 @@ afterEach(async () => {
   rmSync(dir, { recursive: true, force: true });
 });
 
-// Runs Pi 0.85.1's own CLI as a lane runs it, on the openai-codex models.json
+// Runs the image's Pi CLI as a lane runs it, on the openai-codex models.json
 // the Worker writes, against a model proxy whose first stream ends before a
 // terminal event, as verifier-c5's did on the dev Worker, and whose second
 // completes. The WebSocket upgrade is refused, so Pi falls back to the POST.

@@ -2775,7 +2775,7 @@ exec /bin/date "$@"
     );
     try {
       const statusPath = join(root, "status.json");
-      // The table in pi 0.85.1's own docs/rpc.md: a retry, a compaction and an
+      // The table in pi 0.87.1's own docs/json.md: a retry, a compaction and an
       // extension error are what a healthy lane can see, not a broken stream.
       // The retry and the extension error name a 429 and a 401 before the
       // turn ends, so a runner that read their text into the stderr it
