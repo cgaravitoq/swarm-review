@@ -505,6 +505,118 @@ describe("cloud reviews", () => {
     expect(fixture.sandbox.destroy).toHaveBeenCalledOnce();
   });
 
+  const leakedCredentials = async (
+    fixture: ReturnType<typeof setup>,
+    reviewId: string,
+  ) => {
+    const readable = [
+      ...[...fixture.files.entries()]
+        .filter(([file]) => file.endsWith("/models.json"))
+        .map(([, body]) => body),
+      ...fixture.sandbox.exec.mock.calls.map(([command]) => command),
+    ].join("\n");
+    const secrets = [
+      ...Object.keys(fixture.sandbox.putProbeSessions.mock.calls[0]?.[0] ?? {}),
+      await modelCapability(reviewId, env.CONTROL_SECRET),
+      await gitCapability(reviewId, env.CONTROL_SECRET, "acme/demo"),
+    ];
+    expect(secrets).toHaveLength(8);
+    for (const secret of secrets) expect(readable).toContain(secret);
+    return { readable, secrets };
+  };
+
+  it("keeps every per-run credential a lane can read out of the receipt and status it stores", async () => {
+    const fixture = setup();
+    const response = await post(fixture.reviewEnv);
+    const { reviewId } = (await response.json()) as { reviewId: string };
+    let leak = { readable: "", secrets: [] as string[] };
+    fixture.sandbox.startProcess.mockImplementationOnce(async () => {
+      leak = await leakedCredentials(fixture, reviewId);
+      const out = `/workspace/runs/${reviewId}/out`;
+      fixture.files.set(
+        `${out}/status.json`,
+        JSON.stringify({
+          phase: "done",
+          reviewers: [{ family: "workers-ai", state: leak.readable }],
+        }),
+      );
+      fixture.files.set(
+        `${out}/receipt.json`,
+        JSON.stringify({
+          swarmId: reviewId,
+          status: "completed",
+          findings: [{ id: "c1", title: leak.readable }],
+          lanes: [{ role: "reviewer", error: leak.readable }],
+        }),
+      );
+      return { getStatus: vi.fn(async () => "completed") };
+    });
+    await fixture.job.alarm();
+
+    const stored = [
+      JSON.stringify(fixture.r2.get(`reviews/${reviewId}/receipt.json`)),
+      JSON.stringify(fixture.r2.get(`reviews/${reviewId}/status.json`)),
+    ];
+    for (const text of stored) {
+      expect(text).toContain("[redacted]");
+      for (const secret of leak.secrets) expect(text).not.toContain(secret);
+    }
+    expect(fixture.r2.get(`reviews/${reviewId}/receipt.json`)).toMatchObject({
+      status: "completed",
+      findings: [{ id: "c1" }],
+    });
+  });
+
+  it("keeps every per-run credential out of a failed engine's stored stderr", async () => {
+    const fixture = setup();
+    const response = await post(fixture.reviewEnv);
+    const { reviewId } = (await response.json()) as { reviewId: string };
+    let leak = { readable: "", secrets: [] as string[] };
+    fixture.sandbox.startProcess.mockImplementationOnce(async () => {
+      leak = await leakedCredentials(fixture, reviewId);
+      return {
+        getStatus: vi.fn(async () => "failed"),
+        waitForExit: vi.fn(async () => ({ exitCode: 1 })),
+        getLogs: vi.fn(async () => ({ stdout: "", stderr: leak.readable })),
+      };
+    });
+    await fixture.job.alarm();
+
+    const receipt = fixture.r2.get(`reviews/${reviewId}/receipt.json`) as {
+      failure: { engine: { stderr: string } };
+    };
+    expect(receipt.failure.engine.stderr).toContain("[redacted]");
+    for (const secret of leak.secrets)
+      expect(JSON.stringify(receipt)).not.toContain(secret);
+  });
+
+  it("keeps the git capability out of the failure a sandbox error names", async () => {
+    const fixture = setup();
+    const response = await post(fixture.reviewEnv);
+    const { reviewId } = (await response.json()) as { reviewId: string };
+    const answer = fixture.sandbox.exec.getMockImplementation()!;
+    fixture.sandbox.exec.mockImplementation(async (command: string) => {
+      if (command.includes(" clone --depth 1"))
+        throw new Error(`exec failed: ${command}`);
+      return answer(command);
+    });
+    await fixture.job.alarm();
+
+    const capability = await gitCapability(
+      reviewId,
+      env.CONTROL_SECRET,
+      "acme/demo",
+    );
+    const receipt = fixture.r2.get(`reviews/${reviewId}/receipt.json`) as {
+      failure: { message: string };
+    };
+    expect(receipt.failure.message).toMatch(/^exec failed: .*\[redacted\]/);
+    expect(JSON.stringify(receipt)).not.toContain(capability);
+    expect(
+      JSON.stringify(fixture.r2.get(`reviews/${reviewId}/status.json`)),
+    ).not.toContain(capability);
+  });
+
   const upstreamWithPull = async (
     root: string,
     options: { pushPull: boolean; unrelatedBase: boolean },

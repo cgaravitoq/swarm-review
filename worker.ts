@@ -1223,6 +1223,14 @@ const reviewStep = <T>(review: CloudReview, label: string, work: Promise<T>) =>
 async function runCloudReview(env: ReviewPiEnv, review: CloudReview) {
   const sandbox = getSandbox(env.REVIEW_SANDBOX, review.reviewId);
   const directory = runDir(review.reviewId);
+  // What a lane can read it can also write into a finding or an error, so no
+  // per-run credential leaves the sandbox in text the Worker stores.
+  const secrets: string[] = [];
+  const redact = (text: string) =>
+    secrets.reduce(
+      (redacted, secret) => redacted.replaceAll(secret, "[redacted]"),
+      text,
+    );
   let reason: string | null = null;
   let receipt: Record<string, unknown> | null = null;
   let failureDetail: FailureDetail | null = null;
@@ -1260,6 +1268,7 @@ async function runCloudReview(env: ReviewPiEnv, review: CloudReview) {
       env.CONTROL_SECRET,
       review.repository,
     );
+    secrets.push(gitRemoteCapability);
     const remote = `${review.origin}/git/${gitRemoteCapability}`;
     const gitHeader = posixQuote(
       `http.extraHeader=x-review-run: ${review.reviewId}`,
@@ -1295,6 +1304,7 @@ async function runCloudReview(env: ReviewPiEnv, review: CloudReview) {
       review.reviewId,
       env.CONTROL_SECRET,
     );
+    secrets.push(capability);
     const baseUrl = modelProxyBaseUrl(
       review.origin,
       review.reviewId,
@@ -1316,6 +1326,7 @@ async function runCloudReview(env: ReviewPiEnv, review: CloudReview) {
         ],
       ]),
     );
+    secrets.push(...Object.values(handles));
     const sessions: Record<string, ModelSession> = {};
     type ReviewLane = {
       family: string;
@@ -1463,7 +1474,7 @@ async function runCloudReview(env: ReviewPiEnv, review: CloudReview) {
           env,
           review.reviewId,
           "status",
-          JSON.parse(statusFile.content),
+          JSON.parse(redact(statusFile.content)),
         );
       }
       if (status !== "running" && status !== "starting") {
@@ -1484,7 +1495,7 @@ async function runCloudReview(env: ReviewPiEnv, review: CloudReview) {
           exitCode: exit.status === "fulfilled" ? exit.value.exitCode : null,
           stderr:
             logs.status === "fulfilled"
-              ? logs.value.stderr.slice(-ENGINE_STDERR_TAIL)
+              ? redact(logs.value.stderr).slice(-ENGINE_STDERR_TAIL)
               : null,
         },
       };
@@ -1501,7 +1512,7 @@ async function runCloudReview(env: ReviewPiEnv, review: CloudReview) {
       env,
       review.reviewId,
       "status",
-      JSON.parse(finalStatus.content),
+      JSON.parse(redact(finalStatus.content)),
     );
     const output = await reviewStep(
       review,
@@ -1510,7 +1521,7 @@ async function runCloudReview(env: ReviewPiEnv, review: CloudReview) {
     );
     if (!output.exists || output.truncated)
       throw new Error("receipt_unavailable");
-    receipt = JSON.parse(output.content);
+    receipt = JSON.parse(redact(output.content));
     await putReviewJson(env, review.reviewId, "receipt", receipt);
   } catch (error) {
     reason =
@@ -1531,7 +1542,8 @@ async function runCloudReview(env: ReviewPiEnv, review: CloudReview) {
       ]
         .filter(Boolean)
         .join("; ");
-    if (reason) await finishReview(env, review, reason, receipt, failureDetail);
+    if (reason)
+      await finishReview(env, review, redact(reason), receipt, failureDetail);
   }
 }
 
