@@ -97,6 +97,45 @@ describe("the engine placeholder in the image build context", () => {
     expect(existsSync(engine)).toBe(false);
   });
 
+  it("keeps the placeholder for a run still using it when another run in the checkout ends", async () => {
+    const root = await stageSuite();
+    const engine = join(root, "container/context/swarm.js");
+    const started = join(root, "started");
+    const release = join(root, "release");
+    await writeFile(
+      join(root, "src/__tests__/wait.test.ts"),
+      `import { existsSync, readFileSync, writeFileSync } from "node:fs";
+import { setTimeout as sleep } from "node:timers/promises";
+import { expect, it } from "vitest";
+it("reads the engine after another run ended", async () => {
+  writeFileSync(${JSON.stringify(started)}, "");
+  while (!existsSync(${JSON.stringify(release)})) await sleep(50);
+  expect(readFileSync(${JSON.stringify(engine)}, "utf8")).toBe("test engine bundle");
+});
+`,
+    );
+    const first = spawn(join(root, "node_modules/.bin/vitest"), ["run"], {
+      cwd: root,
+      env: { ...process.env, EXPECTED_ENGINE: "test engine bundle" },
+    });
+    const firstExit = new Promise((resolve) => first.once("exit", resolve));
+    while (!existsSync(started)) await sleep(50);
+    const second = spawnSync(
+      join(root, "node_modules/.bin/vitest"),
+      ["run", "first.test.ts"],
+      {
+        cwd: root,
+        encoding: "utf8",
+        env: { ...process.env, EXPECTED_ENGINE: "test engine bundle" },
+      },
+    );
+    expect(second.status, second.stdout + second.stderr).toBe(0);
+    expect(existsSync(engine)).toBe(true);
+    await writeFile(release, "");
+    expect(await firstExit).toBe(0);
+    expect(existsSync(engine)).toBe(false);
+  });
+
   it("removes the placeholder when the run is interrupted", async () => {
     const root = await stageSuite();
     const started = join(root, "started");
