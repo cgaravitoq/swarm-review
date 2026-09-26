@@ -90,8 +90,12 @@
         "@cf/deepseek-ai/deepseek-v4-flash-0731": {
           "contextWindow": 1048576,
           "maxTokens": 65536,
-          "compat": { "thinkingFormat": "openai" },
-          "thinkingLevelMap": { "off": "none" }
+          "compat": {
+            "thinkingFormat": "chat-template",
+            "chatTemplateKwargs": {
+              "thinking": { "$var": "thinking.enabled" }
+            }
+          }
         },
         "@cf/zai-org/glm-5.3-flash": {
           "contextWindow": 1048576,
