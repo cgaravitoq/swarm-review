@@ -332,6 +332,25 @@ it("follows a review whose submit went unanswered under the id it sent", async (
   ]);
 });
 
+it("gives up on an unanswered submit the Worker never started once nothing is observed", async () => {
+  const { hung, timeOut } = hangUntilAborted();
+  const calls = stubFetch(
+    Array.from({ length: 41 }, () => json({ error: "not_found" }, 404)),
+  );
+  const fetchStub = vi.mocked(fetch);
+  const answer = fetchStub.getMockImplementation()!;
+  fetchStub.mockImplementation(async (input, init) =>
+    init?.method === "POST" ? hung(init) : answer(input, init),
+  );
+  const exit = runCloud(argv(), io);
+  await timeOut(0);
+  expect(await exit).toBe(1);
+  expect(workerCalls(calls)).toHaveLength(41);
+  expect(lines.at(-1)).toMatch(
+    /^cloud review review-[0-9a-f-]{36}: timed out waiting for a receipt past the deadline$/,
+  );
+});
+
 it("keeps polling past a poll the Worker never answers once that request times out", async () => {
   const { timers, hung, timeOut } = hangUntilAborted();
   const calls = stubFetch([
