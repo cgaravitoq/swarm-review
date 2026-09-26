@@ -960,6 +960,17 @@ const probeCaps = { ...SESSION_CAPS.t1b, maxRequests: 2 };
 const PI_PROBE_SETTINGS = JSON.stringify({
   retry: { enabled: false, provider: { maxRetries: 0 } },
 });
+// A review lane retries a transient stream failure at the agent level, where
+// the proxy admits each attempt as a request. Two retries back off 1 s then
+// 2 s, which leaves a verifier's 120 s window room to finish.
+const PI_REVIEW_SETTINGS = JSON.stringify({
+  retry: {
+    enabled: true,
+    maxRetries: 2,
+    baseDelayMs: 1000,
+    provider: { maxRetries: 0 },
+  },
+});
 
 const PI_PROBE_FAMILIES = {
   "workers-ai": {
@@ -1307,7 +1318,7 @@ async function runCloudReview(env: ReviewPiEnv, review: CloudReview) {
         await reviewStep(
           review,
           "review settings",
-          sandbox.writeFile(`${piDir}/settings.json`, PI_PROBE_SETTINGS),
+          sandbox.writeFile(`${piDir}/settings.json`, PI_REVIEW_SETTINGS),
         );
         const lane = {
           family,
