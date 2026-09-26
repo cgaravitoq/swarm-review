@@ -1036,6 +1036,20 @@ describe("candidate contract", () => {
     expect(cut.candidates).toEqual([]);
   });
 
+  it("reads a block whose closing fence the lab cut to a backtick or two", () => {
+    // gpt-6-luna closed a complete answer with one backtick where the fence
+    // belongs, and that answer was the only report of a real defect in its
+    // run. A stray tail of the fence is still punctuation.
+    for (const tail of ["`", "``", "`\n"]) {
+      const parsed = parseCandidates(
+        answer([finding()]).replace(/\n```$/, tail),
+        "reviewer-2",
+      );
+      expect(parsed.error).toBeNull();
+      expect(parsed.candidates).toHaveLength(1);
+    }
+  });
+
   it("reads the last block the lane opened, not the last one it closed", () => {
     // The lane wrote a block, reconsidered, and left the second fence open. The
     // closed fence above is the answer it abandoned, and reading it back turned
