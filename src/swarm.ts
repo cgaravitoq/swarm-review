@@ -32,6 +32,7 @@ import {
   writeAtomic,
   writeTerminalReceipt,
 } from "./attempt";
+import { runCloud } from "./cloud";
 import {
   addPackedUsage,
   canaryModels,
@@ -1134,7 +1135,7 @@ export const renderVerifierBrief = (
  * It is never logged and never reaches a lane: the pull request body is read
  * here, on the host, and only its text travels in the brief.
  */
-const githubToken = () => {
+export const githubToken = () => {
   const fromEnv = process.env["GITHUB_TOKEN"] ?? process.env["GH_TOKEN"];
   if (fromEnv) return fromEnv;
   try {
@@ -3718,6 +3719,9 @@ async function main() {
 }
 
 if (import.meta.main) {
-  if (process.argv.includes("--hybrid")) await runHybrid(process.argv.slice(2));
+  if (process.argv.includes("--cloud"))
+    process.exitCode = await runCloud(process.argv.slice(2));
+  else if (process.argv.includes("--hybrid"))
+    await runHybrid(process.argv.slice(2));
   else await main();
 }
