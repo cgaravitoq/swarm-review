@@ -1,3 +1,5 @@
+import { readFileSync } from "node:fs";
+import path from "node:path";
 import { afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import { gitCapability } from "../git-proxy";
 
@@ -2066,10 +2068,10 @@ describe("Checks tab", () => {
     await pr.alarm();
     const [standard, deep] = job.start.mock.calls.map(
       ([review]) =>
-        review as { deep?: boolean; deadlineAt: string; reviewId: string },
+        review as { tier?: string; deadlineAt: string; reviewId: string },
     );
-    expect(standard).not.toHaveProperty("deep");
-    expect(deep).toMatchObject({ deep: true });
+    expect(standard).not.toHaveProperty("tier");
+    expect(deep).toMatchObject({ tier: "deep-review" });
     const deadline = Date.parse(deep!.deadlineAt);
     expect(deadline - before).toBeGreaterThanOrEqual(13 * 60_000);
     expect(deadline - Date.now()).toBeLessThanOrEqual(13 * 60_000);
@@ -2238,4 +2240,245 @@ describe("Checks tab", () => {
       expect(storage.put).not.toHaveBeenCalled();
     },
   );
+});
+
+const SYSTEM_ONE = "https://api.typesafe.ai/v1/systemone";
+const jevAnswer = JSON.parse(
+  readFileSync(
+    path.join(import.meta.dirname, "jev-systemone-response.json"),
+    "utf8",
+  ),
+) as { answers: { tier: { choice: string; confidence: number } } };
+const answeringJev = (tier: { choice: string; confidence: number }) => ({
+  ...jevAnswer,
+  answers: { tier: { ...jevAnswer.answers.tier, ...tier } },
+});
+const titledPull = (overrides: Record<string, unknown> = {}) =>
+  Response.json({
+    state: "open",
+    draft: false,
+    merged: false,
+    author_association: "MEMBER",
+    head: { sha: HEAD },
+    base: { sha: BASE },
+    title: "feat: add a line",
+    body: "Adds one line to the app.",
+    changed_files: 2,
+    ...overrides,
+  });
+const changedFile = (filename: string, additions: number, deletions = 0) => ({
+  filename,
+  additions,
+  deletions,
+  status: "modified",
+  patch: `@@ -1,2 +1,3 @@\n keep\n+${filename} code Jev must not see\n tail`,
+});
+
+describe("Jev's review tier", () => {
+  const jevCalls = (gh: ReturnType<typeof github>) =>
+    gh.calls.filter((call) => call.url === SYSTEM_ONE);
+
+  it("asks Jev from the pull request's metadata alone and runs the review at its pick", async () => {
+    const { env, pr, job, r2, started } = fixture();
+    Object.assign(env, { TYPESAFE_API_KEY: "typesafe-key" });
+    const gh = github({
+      routes: {
+        [`GET ${API}/pulls/7`]: () => titledPull(),
+        [`GET ${API}/pulls/7/files?per_page=100&page=1`]: () =>
+          Response.json([
+            changedFile("src/app.ts", 1),
+            changedFile("README.md", 4, 2),
+          ]),
+        [`POST ${SYSTEM_ONE}`]: () =>
+          Response.json(answeringJev({ choice: "light", confidence: 0.91 })),
+      },
+    });
+    const reviewId = await started();
+    expect(jevCalls(gh)).toHaveLength(1);
+    const asked = jevCalls(gh)[0]!;
+    expect(asked.headers.get("authorization")).toBe("Bearer typesafe-key");
+    expect((asked.body as { state: unknown }).state).toEqual({
+      title: "feat: add a line",
+      description: "Adds one line to the app.",
+      files: [
+        { path: "src/app.ts", additions: 1, deletions: 0 },
+        { path: "README.md", additions: 4, deletions: 2 },
+      ],
+      totalFiles: 2,
+    });
+    expect(JSON.stringify(asked.body)).not.toContain("must not see");
+    expect(job.start).toHaveBeenCalledOnce();
+    expect(job.start.mock.calls[0]?.[0]).toMatchObject({ tier: "light" });
+    r2.set(`reviews/${reviewId}/receipt.json`, receipt);
+    await pr.alarm();
+    expect(gh.checks()).toEqual([
+      expect.objectContaining({
+        conclusion: "success",
+        output: expect.objectContaining({
+          summary: expect.stringContaining(
+            "Tier light, picked by Jev from the pull request's metadata with confidence 0.91: A trivial change",
+          ),
+        }),
+      }),
+    ]);
+  });
+
+  it("cuts the description at 4000 characters and the file list at three pages", async () => {
+    const { env, job, started } = fixture();
+    Object.assign(env, { TYPESAFE_API_KEY: "typesafe-key" });
+    const page = (n: number) =>
+      Response.json(
+        Array.from({ length: 100 }, (_, i) =>
+          changedFile(`src/${n}-${i}.ts`, 1),
+        ),
+      );
+    const gh = github({
+      routes: {
+        [`GET ${API}/pulls/7`]: () =>
+          titledPull({ body: "x".repeat(5_000), changed_files: 450 }),
+        [`GET ${API}/pulls/7/files?per_page=100&page=1`]: () => page(1),
+        [`GET ${API}/pulls/7/files?per_page=100&page=2`]: () => page(2),
+        [`GET ${API}/pulls/7/files?per_page=100&page=3`]: () => page(3),
+        [`POST ${SYSTEM_ONE}`]: () =>
+          Response.json(answeringJev({ choice: "deep", confidence: 0.8 })),
+      },
+    });
+    await started();
+    const { state } = jevCalls(gh)[0]!.body as {
+      state: { description: string; files: unknown[]; totalFiles: number };
+    };
+    expect(state.description).toBe("x".repeat(4_000));
+    expect(state.files).toHaveLength(300);
+    expect(state.totalFiles).toBe(450);
+    expect(gh.calls.some((call) => call.url.endsWith("page=4"))).toBe(false);
+    expect(job.start.mock.calls[0]?.[0]).toMatchObject({ tier: "deep" });
+  });
+
+  it.each([
+    [
+      "Jev leans under 0.55",
+      {},
+      Response.json(jevAnswer),
+      "Tier standard: Jev leaned deep with confidence 0.47, under 0.55.",
+    ],
+    [
+      "Jev does not answer",
+      {},
+      Response.json({ error: { message: "bad key" } }, { status: 401 }),
+      "Tier standard: Jev did not answer (",
+    ],
+    [
+      "the metadata cannot be read",
+      {
+        [`GET ${API}/pulls/7/files?per_page=100&page=1`]: () =>
+          new Response("boom", { status: 500 }),
+      },
+      null,
+      "Tier standard: the pull request's metadata could not be read (500).",
+    ],
+  ])(
+    "runs a standard review and says why when %s",
+    async (_case, routes, answer, note) => {
+      const { env, pr, job, r2, started } = fixture();
+      Object.assign(env, { TYPESAFE_API_KEY: "typesafe-key" });
+      const gh = github({
+        routes: {
+          [`GET ${API}/pulls/7`]: () => titledPull(),
+          [`GET ${API}/pulls/7/files?per_page=100&page=1`]: () =>
+            Response.json([changedFile("src/app.ts", 1)]),
+          ...routes,
+          [`POST ${SYSTEM_ONE}`]: () => answer ?? undefined,
+        },
+      });
+      const reviewId = await started();
+      expect(jevCalls(gh)).toHaveLength(answer ? 1 : 0);
+      expect(job.start.mock.calls[0]?.[0]).toMatchObject({ tier: "standard" });
+      r2.set(`reviews/${reviewId}/receipt.json`, receipt);
+      await pr.alarm();
+      expect(gh.checks()).toEqual([
+        expect.objectContaining({
+          output: expect.objectContaining({
+            summary: expect.stringContaining(note),
+          }),
+        }),
+      ]);
+    },
+  );
+
+  it("waits out a rate-limited metadata read instead of falling back", async () => {
+    const { env, pr, job, stored, started } = fixture();
+    Object.assign(env, { TYPESAFE_API_KEY: "typesafe-key" });
+    let limited = true;
+    const gh = github({
+      routes: {
+        [`GET ${API}/pulls/7`]: () => titledPull(),
+        [`GET ${API}/pulls/7/files?per_page=100&page=1`]: () =>
+          limited
+            ? new Response("API rate limit exceeded", {
+                status: 403,
+                headers: {
+                  "x-ratelimit-remaining": "0",
+                  "x-ratelimit-reset": String(
+                    Math.ceil(Date.now() / 1000) + 60,
+                  ),
+                },
+              })
+            : Response.json([changedFile("src/app.ts", 1)]),
+        [`POST ${SYSTEM_ONE}`]: () =>
+          Response.json(answeringJev({ choice: "light", confidence: 0.9 })),
+      },
+    });
+    await started();
+    expect(job.start).not.toHaveBeenCalled();
+    expect(jevCalls(gh)).toHaveLength(0);
+    expect(stored.get("current")).not.toHaveProperty("tier");
+    limited = false;
+    await pr.alarm();
+    expect(job.start).toHaveBeenCalledOnce();
+    expect(job.start.mock.calls[0]?.[0]).toMatchObject({ tier: "light" });
+  });
+
+  it("never asks Jev on a Worker without a TypeSafe key", async () => {
+    const { job, started } = fixture();
+    const gh = github();
+    await started();
+    expect(
+      gh.calls.filter(
+        (call) => call.url === SYSTEM_ONE || call.url.includes("/files?"),
+      ),
+    ).toEqual([]);
+    expect(job.start.mock.calls[0]?.[0]).not.toHaveProperty("tier");
+  });
+
+  it("runs Deep review from the check without asking Jev again", async () => {
+    const { env, pr, job, started } = fixture();
+    Object.assign(env, { TYPESAFE_API_KEY: "typesafe-key" });
+    const gh = github({
+      routes: {
+        [`GET ${API}/pulls/7`]: () => titledPull(),
+        [`GET ${API}/pulls/7/files?per_page=100&page=1`]: () =>
+          Response.json([changedFile("src/app.ts", 1)]),
+        [`POST ${SYSTEM_ONE}`]: () =>
+          Response.json(answeringJev({ choice: "light", confidence: 0.9 })),
+      },
+    });
+    await started();
+    await worker.fetch(
+      await signed(
+        JSON.stringify(
+          checkRun({ requested_action: { identifier: "deep-review" } }),
+        ),
+        "webhook-secret",
+        "82345678-1234-1234-1234-123456789abc",
+        "check_run",
+      ),
+      env as never,
+    );
+    await pr.alarm();
+    expect(job.start.mock.calls.map(([review]) => review)).toEqual([
+      expect.objectContaining({ tier: "light" }),
+      expect.objectContaining({ tier: "deep-review" }),
+    ]);
+    expect(jevCalls(gh)).toHaveLength(1);
+  });
 });

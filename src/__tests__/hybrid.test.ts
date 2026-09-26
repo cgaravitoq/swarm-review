@@ -594,6 +594,44 @@ it("keeps each lane's Pi session under its lane id, the report turn included", a
   ]);
 });
 
+it("runs each lane's tool turns at the thinking level its config names and the report turn off", async () => {
+  const input = await setup();
+  const config = JSON.parse(await readFile(input.lanes, "utf8"));
+  config.reviewers[0].thinking = "low";
+  config.reviewers[0].env.PI_HANG = "cap";
+  config.verifiers[0].thinking = "high";
+  await writeFile(input.lanes, JSON.stringify(config));
+  const result = run(input, 5);
+  expect(result.status, result.stderr).toBe(0);
+  const calls = (await readFile(input.log, "utf8"))
+    .trim()
+    .split("\n")
+    .map((line) => JSON.parse(line) as { args: string[]; family: string });
+  const thinking = (args: string[]) =>
+    args.slice(args.indexOf("--thinking"), args.indexOf("--thinking") + 2);
+  expect(
+    calls.map((call) => [
+      call.family,
+      call.args.includes("--no-tools") ? "report" : "tools",
+      ...thinking(call.args),
+    ]),
+  ).toEqual([
+    ["workers-ai", "tools", "--thinking", "low"],
+    ["workers-ai", "report", "--thinking", "off"],
+    ["openai-codex", "tools", "--thinking", "high"],
+  ]);
+});
+
+it("refuses a lane whose thinking level Pi does not know", async () => {
+  const input = await setup();
+  const config = JSON.parse(await readFile(input.lanes, "utf8"));
+  config.reviewers[0].thinking = "extreme";
+  await writeFile(input.lanes, JSON.stringify(config));
+  const result = run(input);
+  expect(result.status).not.toBe(0);
+  expect(result.stderr).toContain("invalid lane config");
+});
+
 it("kills a tools-off report turn that starts a second turn past the cap", async () => {
   const input = await setup();
   const config = JSON.parse(await readFile(input.lanes, "utf8"));

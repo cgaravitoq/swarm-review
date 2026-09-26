@@ -22,7 +22,8 @@
   },
   "dependencies": {
     "@cgaravitoq/claude-code-core": "0.3.2",
-    "@cloudflare/sandbox": "0.12.9"
+    "@cloudflare/sandbox": "0.12.9",
+    "@typesafe-ai/sdk": "0.6.0"
   },
   "devDependencies": {
     "@biomejs/biome": "2.5.14",
