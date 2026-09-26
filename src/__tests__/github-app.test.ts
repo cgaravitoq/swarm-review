@@ -681,6 +681,25 @@ describe("GitHub App webhook", () => {
     });
   });
 
+  it("sends no progress to a check a newer generation superseded mid-read", async () => {
+    const { pr, env, r2, stored, started } = fixture();
+    const gh = github();
+    const reviewId = await started();
+    r2.set(`reviews/${reviewId}/status.json`, { phase: "verifying" });
+    const read = env.PROBE_RESULTS.get.getMockImplementation()!;
+    env.PROBE_RESULTS.get.mockImplementation(async (key: string) => {
+      if (key === `reviews/${reviewId}/status.json`)
+        await pr.accept(PULL, "f2345678-1234-1234-1234-123456789abc", ORIGIN);
+      return read(key);
+    });
+    gh.calls.length = 0;
+    await pr.alarm();
+    expect(stored.get("current")).toMatchObject({ generation: 2 });
+    expect(
+      gh.sent().filter((call) => call.url === `${API}/check-runs/99`),
+    ).toEqual([]);
+  });
+
   it("names each lane of a partial review in the final summary", async () => {
     const { pr, r2, started } = fixture();
     const gh = github();

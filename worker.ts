@@ -456,7 +456,12 @@ export class PullRequestReview extends DurableObject<ReviewPiEnv> {
           `- ${plain(reviewer?.["family"])} ${plain(reviewer?.["model"])}: ${plain(reviewer?.["state"])}`,
       ),
     ].join("\n");
-    if (progress === state.progress) return;
+    if (
+      progress === state.progress ||
+      (await this.ctx.storage.get<AppReview>("current"))?.generation !==
+        state.generation
+    )
+      return;
     try {
       await updateCheck(
         token,
