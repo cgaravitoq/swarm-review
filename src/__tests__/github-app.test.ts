@@ -949,6 +949,7 @@ describe("GitHub App webhook", () => {
     "Durable Object reset because its code was updated; destroy_failed: Durable Object reset because its code was updated.",
     "Durable Object reset because its code was updated.",
     "image source /opt/review/review-run.sh differs from the host's copy: expected 1, observed 2",
+    "Connection closed: this Durable Object instance is no longer active. Reconnect or retry the request; destroy_failed: Connection closed: this Durable Object instance is no longer active. Reconnect or retry the request.",
   ])(
     "starts a fresh review once when the platform lost the first: %s",
     async (message) => {
