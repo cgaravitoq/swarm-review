@@ -68,7 +68,7 @@ const phase = JSON.parse(readFileSync(process.env.PI_OUT + "/status.json", "utf8
 const verifying = phase === "verifying";
 appendFileSync(process.env.PI_LOG, JSON.stringify({at: Date.now(), args, env, phase, family: process.env.PI_FAMILY, promptChars: prompt.length, prompt}) + "\\n");
 const event = (data) => process.stdout.write(JSON.stringify(data) + "\\n");
-if ((process.env.PI_HANG === "cap" || process.env.PI_HANG === "time") && !reportTurn) {
+if (process.env.PI_HANG === "runaway" || ((process.env.PI_HANG === "cap" || process.env.PI_HANG === "time") && !reportTurn)) {
   setInterval(() => {
     event({type:"turn_start"});
     event({type:"turn_end",message:{stopReason:"toolUse",usage:{input:1,output:1,totalTokens:2}}});
@@ -506,6 +506,30 @@ it("gives a lane at the tool-turn budget one tools-off report turn and publishes
   const sessionId = (args: string[]) => args[args.indexOf("--session-id") + 1];
   expect(sessionId(calls[1]!.args)).toBe(sessionId(calls[0]!.args));
   expect(calls[1]?.prompt).toContain("report now");
+});
+
+it("kills a tools-off report turn that starts a second turn past the cap", async () => {
+  const input = await setup();
+  const config = JSON.parse(await readFile(input.lanes, "utf8"));
+  config.reviewers[0].env.PI_HANG = "runaway";
+  await writeFile(input.lanes, JSON.stringify(config));
+  const result = run(input, 5);
+  expect(result.status, result.stderr).toBe(0);
+  const receipt = JSON.parse(
+    await readFile(join(input.out, "receipt.json"), "utf8"),
+  ) as HybridReceipt;
+  expect(receipt.lanes?.[0]).toMatchObject({
+    status: "cancelled",
+    stopReason: "turn cap",
+    turns: 17,
+  });
+  expect(receipt.candidates).toEqual([]);
+  const calls = (await readFile(input.log, "utf8"))
+    .trim()
+    .split("\n")
+    .map((line) => JSON.parse(line) as { args: string[] });
+  expect(calls).toHaveLength(2);
+  expect(calls[1]?.args).toContain("--no-tools");
 });
 
 it("records an unparseable report as a contract error with its final text", async () => {
