@@ -1333,7 +1333,7 @@ describe("deduplication and verification", () => {
       expect.objectContaining({
         id: "c2",
         status: "rejected",
-        evidenceStrength: "static",
+        evidenceStrength: "unstated",
       }),
     ]);
     expect(verdicts[0]?.reason).toMatch(/identifies no reachable defect/);
