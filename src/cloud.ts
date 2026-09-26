@@ -114,10 +114,13 @@ export async function runCloud(argv: string[], io: CloudIo = defaultIo) {
     );
   }
   const origin = requiredEnv("WORKER_ORIGIN").replace(/\/+$/, "");
+  const secret = requiredEnv("CONTROL_SECRET");
   const headers = {
-    authorization: `Bearer ${requiredEnv("CONTROL_SECRET")}`,
+    authorization: `Bearer ${secret}`,
     "user-agent": USER_AGENT,
   };
+  const print = (line: string) =>
+    io.print(line.replaceAll(secret, "[redacted]"));
   const { head, base } = await revisions(argv, repo, pr);
 
   const submitted = await fetch(`${origin}/reviews`, {
@@ -137,10 +140,10 @@ export async function runCloud(argv: string[], io: CloudIo = defaultIo) {
       ? (accepted as { reviewId?: unknown }).reviewId
       : undefined;
   if (submitted.status !== 202 || typeof reviewId !== "string") {
-    io.print(`cloud review refused: ${describeRefusal(submitted, accepted)}`);
+    print(`cloud review refused: ${describeRefusal(submitted, accepted)}`);
     return 1;
   }
-  io.print(`cloud review ${reviewId}: accepted for ${repo}#${pr} at ${head}`);
+  print(`cloud review ${reviewId}: accepted for ${repo}#${pr} at ${head}`);
   await mkdir(out, { recursive: true });
 
   let deadline = io.now() + UNOBSERVED_DEADLINE_MS;
@@ -151,7 +154,7 @@ export async function runCloud(argv: string[], io: CloudIo = defaultIo) {
       { headers },
     ).catch((error: unknown) => error as Error);
     if (response instanceof Error) {
-      io.print(`cloud review ${reviewId}: poll failed: ${response.message}`);
+      print(`cloud review ${reviewId}: poll failed: ${response.message}`);
     } else {
       const body = await readBody(response);
       const polled =
@@ -159,7 +162,7 @@ export async function runCloud(argv: string[], io: CloudIo = defaultIo) {
           ? (body as { status?: ReviewStatus; receipt?: { status?: unknown } })
           : null;
       if (!polled?.status) {
-        io.print(
+        print(
           `cloud review ${reviewId}: poll failed: ${describeRefusal(response, body)}`,
         );
       } else {
@@ -168,7 +171,7 @@ export async function runCloud(argv: string[], io: CloudIo = defaultIo) {
           JSON.stringify(polled.status),
         );
         const line = statusLine(polled.status);
-        if (line !== lastLine) io.print(`cloud review ${reviewId}: ${line}`);
+        if (line !== lastLine) print(`cloud review ${reviewId}: ${line}`);
         lastLine = line;
         const deadlineAt = Date.parse(String(polled.status.deadlineAt));
         if (Number.isFinite(deadlineAt))
@@ -179,14 +182,14 @@ export async function runCloud(argv: string[], io: CloudIo = defaultIo) {
             JSON.stringify(polled.receipt),
           );
           const outcome = String(polled.receipt.status);
-          io.print(`cloud review ${reviewId}: ${outcome}`);
+          print(`cloud review ${reviewId}: ${outcome}`);
           return outcome === "completed" ? 0 : 1;
         }
       }
     }
     await io.sleep(POLL_MS);
   }
-  io.print(
+  print(
     `cloud review ${reviewId}: timed out waiting for a receipt past the deadline`,
   );
   return 1;

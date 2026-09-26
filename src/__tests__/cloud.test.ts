@@ -249,6 +249,29 @@ it("reports a non-JSON error body instead of throwing", async () => {
   ]);
 });
 
+it("keeps the secret out of an error body that echoes the authorization header", async () => {
+  stubFetch([
+    json({ error: `bad header Bearer ${SECRET}` }, 401),
+    json({ reviewId: "review-6" }, 202),
+    new Response(`upstream saw authorization: Bearer ${SECRET}`, {
+      status: 502,
+    }),
+    json({
+      status: status("done", [], { candidates: 0, verified: 0 }),
+      receipt: { status: "completed" },
+    }),
+  ]);
+  expect(await runCloud(argv(), io)).toBe(1);
+  expect(await runCloud(argv(), io)).toBe(0);
+  expect(lines).toContain(
+    "cloud review refused: 401 bad header Bearer [redacted]",
+  );
+  expect(lines).toContain(
+    "cloud review review-6: poll failed: 502 non-JSON body: upstream saw authorization: Bearer [redacted]",
+  );
+  await expectNoSecret();
+});
+
 it("survives a non-JSON poll and times out past the status deadline plus a margin", async () => {
   const reviewing = json({
     status: status("reviewing", ["running"], { candidates: 0, verified: 0 }),
