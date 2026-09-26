@@ -585,6 +585,103 @@ describe("GitHub App webhook", () => {
     },
   );
 
+  it("runs in shadow when the base config asks for it and posts nothing to the pull request", async () => {
+    const { pr, r2, stored, started } = fixture();
+    const gh = github({
+      routes: {
+        [`GET ${CONFIG_AT_BASE}`]: () => new Response('{"shadow": true}'),
+      },
+    });
+    const reviewId = await started();
+    expect(stored.get("current")).toMatchObject({
+      shadow: true,
+      configNote: null,
+    });
+    r2.set(`reviews/${reviewId}/receipt.json`, receipt);
+    await pr.alarm();
+    expect(gh.posts()).toEqual([]);
+    expect(gh.calls.some((call) => call.url === `${API}/pulls/7`)).toBe(false);
+    const output = gh.checks().at(-1)?.output as {
+      title: string;
+      summary: string;
+    };
+    expect(output.title).toBe("Swarm review completed");
+    expect(output.summary).toMatch(
+      /^Shadow review at aaaaaaa, not posted to the pull request\. 2 confirmed finding\(s\)\.\n\n<!-- review-pi run=hybrid-one sha=a{40} -->/,
+    );
+    expect(output.summary).toContain("mechanism inline");
+    expect(output.summary).toContain("mechanism unanchored");
+  });
+
+  it("posts the review as usual when the base config turns shadow off", async () => {
+    const { pr, r2, started } = fixture();
+    const gh = github({
+      routes: {
+        [`GET ${CONFIG_AT_BASE}`]: () => new Response('{"shadow": false}'),
+      },
+    });
+    const reviewId = await started();
+    r2.set(`reviews/${reviewId}/receipt.json`, receipt);
+    await pr.alarm();
+    expect(gh.posts()).toHaveLength(1);
+    expect(gh.checks().at(-1)?.output).toEqual({
+      title: "Swarm review completed",
+      summary: "Review published at aaaaaaa. 2 confirmed finding(s).",
+    });
+  });
+
+  it.each([
+    ["{", "is not valid JSON"],
+    ["[]", "is not a JSON object"],
+    ['{"shadow": false, "mode": "loud"}', "has a key it does not know, `mode`"],
+    ['{"shadow": "no"}', "sets `shadow` to something other than true or false"],
+    [500, "could not be read (500)"],
+  ])(
+    "runs in shadow and says why when the config at the base reads %s",
+    async (answer, why) => {
+      const { pr, r2, started } = fixture();
+      const gh = github({
+        routes: {
+          [`GET ${CONFIG_AT_BASE}`]: () =>
+            typeof answer === "number"
+              ? new Response("Server Error", { status: answer })
+              : new Response(answer),
+        },
+      });
+      const reviewId = await started();
+      r2.set(`reviews/${reviewId}/receipt.json`, receipt);
+      await pr.alarm();
+      expect(gh.posts()).toEqual([]);
+      const { summary } = gh.checks().at(-1)!.output as { summary: string };
+      expect(summary).toMatch(/^Shadow review at aaaaaaa/);
+      expect(
+        summary.endsWith(
+          `\n\nThe repository config \`.swarm-review/config.json\` ${why}, so this review ran in shadow.`,
+        ),
+      ).toBe(true);
+    },
+  );
+
+  it("cuts a shadow review that would not fit the check run", async () => {
+    const { pr, r2, started } = fixture();
+    const gh = github({
+      routes: {
+        [`GET ${CONFIG_AT_BASE}`]: () => new Response('{"shadow": true}'),
+      },
+    });
+    const reviewId = await started();
+    r2.set(`reviews/${reviewId}/receipt.json`, {
+      ...receipt,
+      findings: [{ ...finding("long", 40), mechanism: "x".repeat(70_000) }],
+    });
+    await pr.alarm();
+    const { summary } = gh.checks().at(-1)!.output as { summary: string };
+    expect(summary.length).toBeLessThanOrEqual(65_535);
+    expect(
+      summary.endsWith("(The review is cut here to fit the check run.)"),
+    ).toBe(true);
+  });
+
   it("waits out a rate-limited brief read and then steers by the brief", async () => {
     const { pr, job, stored, storage } = fixture();
     const brief = "Money moves only through the ledger module.";
