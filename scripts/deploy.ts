@@ -189,7 +189,7 @@ const parseJson = <T>(output: string): T => {
   return JSON.parse(lines.slice(start).join("\n")) as T;
 };
 
-const containerAppName = () => {
+const wranglerConfig = () => {
   const { config, error } = ts.readConfigFile(
     join(packageRoot, "wrangler.jsonc"),
     ts.sys.readFile,
@@ -197,6 +197,11 @@ const containerAppName = () => {
   if (error) {
     throw new Error(ts.flattenDiagnosticMessageText(error.messageText, "\n"));
   }
+  return config;
+};
+
+const containerAppName = () => {
+  const config = wranglerConfig();
   const container = config.containers[0] as { class_name: string };
   return `${config.name as string}-${container.class_name}`.toLowerCase();
 };
