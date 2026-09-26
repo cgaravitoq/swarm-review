@@ -10,7 +10,9 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { verificationsPerFamily } from "../../prompts/hybrid";
 import {
   deployArguments,
+  EVIDENCE_RULE,
   imageBuildArguments,
+  lifecycleRuleNames,
   targetCheckout,
 } from "../../scripts/deploy";
 import { main } from "../../scripts/probe";
@@ -2923,6 +2925,22 @@ describe("deployed container image", () => {
         "--image-only",
       ]),
     ).toEqual([]);
+  });
+
+  it("finds the evidence rule in wrangler's own lifecycle listing", () => {
+    const listing = readFileSync(
+      path.join(import.meta.dirname, "wrangler-r2-lifecycle-list.txt"),
+      "utf8",
+    );
+    expect(lifecycleRuleNames(listing)).toEqual([
+      "Default Multipart Abort Rule",
+      EVIDENCE_RULE,
+    ]);
+    expect(
+      lifecycleRuleNames(
+        listing.slice(0, listing.indexOf("\nname:     evidence")),
+      ),
+    ).toEqual(["Default Multipart Abort Rule"]);
   });
 
   it("builds the computed image reference for the lane platform", () => {

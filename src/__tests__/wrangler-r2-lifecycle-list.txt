@@ -1,0 +1,13 @@
+
+ ⛅️ wrangler 4.136.3 (update available 4.141.0)
+───────────────────────────────────────────────
+Listing lifecycle rules for bucket 'swarm-review-probes'...
+name:     Default Multipart Abort Rule
+enabled:  Yes
+prefix:   (all prefixes)
+action:   Abort incomplete multipart uploads after 7 days
+
+name:     evidence-30-days
+enabled:  Yes
+prefix:   evidence/
+action:   Expire objects after 30 days
