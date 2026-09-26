@@ -131,6 +131,7 @@ type AppReview = {
   outcome: string | null;
   briefNote: string | null;
   progress: string | null;
+  cancelFailures?: number;
 };
 
 const plain = (value: unknown) =>
@@ -151,6 +152,7 @@ const laneSummary = (receipt: SwarmReceipt) => {
     .join("\n");
 };
 
+const CANCEL_ATTEMPTS = 5;
 const SUPERSEDED_SUMMARY = "A newer pull request event superseded this review.";
 
 const refusedForGood = (error: unknown) =>
@@ -247,16 +249,27 @@ export class PullRequestReview extends DurableObject<ReviewPiEnv> {
       (await this.ctx.storage.get<AppReview[]>("superseded")) ?? [];
     const retired = new Set<number>();
     let wakeAt = 0;
+    const cancelFailures = new Map<number, number>();
     for (const previous of superseded) {
       try {
+        let summary = SUPERSEDED_SUMMARY;
         if (previous.reviewId)
-          await this.env.REVIEW_JOBS.getByName(previous.reviewId).cancel();
+          try {
+            await this.env.REVIEW_JOBS.getByName(previous.reviewId).cancel();
+          } catch (error) {
+            const failures = (previous.cancelFailures ?? 0) + 1;
+            if (failures < CANCEL_ATTEMPTS) {
+              cancelFailures.set(previous.generation, failures);
+              throw error;
+            }
+            summary = `${SUPERSEDED_SUMMARY} Its cloud review could not be stopped after ${failures} attempts: ${messageOf(error)}.`;
+          }
         await completeCheck(
           await this.token(previous.event),
           previous.event.repository,
           previous.checkRunId!,
           "neutral",
-          SUPERSEDED_SUMMARY,
+          summary,
         );
         retired.add(previous.generation);
       } catch (error) {
@@ -264,9 +277,16 @@ export class PullRequestReview extends DurableObject<ReviewPiEnv> {
         else wakeAt = Math.max(wakeAt, retryAfter(error));
       }
     }
-    const left = (
-      (await this.ctx.storage.get<AppReview[]>("superseded")) ?? []
-    ).filter((previous) => !retired.has(previous.generation));
+    const left = ((await this.ctx.storage.get<AppReview[]>("superseded")) ?? [])
+      .filter((previous) => !retired.has(previous.generation))
+      .map((previous) =>
+        cancelFailures.has(previous.generation)
+          ? {
+              ...previous,
+              cancelFailures: cancelFailures.get(previous.generation),
+            }
+          : previous,
+      );
     await this.ctx.storage.put("superseded", left);
     return left.length > 0 && wakeAt;
   }
@@ -319,11 +339,13 @@ export class PullRequestReview extends DurableObject<ReviewPiEnv> {
         if (!(await this.save(state))) return false;
         const brief = await readBrief(token, repository, state.event.base);
         state.briefNote = brief.note ?? null;
-        const reviewId = assertCloudRunId(`review-${crypto.randomUUID()}`);
+        state.reviewId ??= assertCloudRunId(`review-${crypto.randomUUID()}`);
+        const reviewId = state.reviewId;
         await putReviewJson(this.env, reviewId, "git", {
           repository,
           installationId: state.event.installationId,
         });
+        if (!(await this.save(state))) return false;
         await startReview(this.env, {
           reviewId,
           repository,
@@ -334,12 +356,8 @@ export class PullRequestReview extends DurableObject<ReviewPiEnv> {
           origin: state.origin,
           deadlineAt: new Date(Date.now() + REVIEW_DEADLINE_MS).toISOString(),
         });
-        state.reviewId = reviewId;
         state.phase = "running";
-        if (!(await this.save(state))) {
-          await this.env.REVIEW_JOBS.getByName(reviewId).cancel();
-          return false;
-        }
+        if (!(await this.save(state))) return false;
       }
       const receiptObject = await this.env.PROBE_RESULTS.get(
         reviewKey(state.reviewId!, "receipt"),

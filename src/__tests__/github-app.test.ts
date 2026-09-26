@@ -86,6 +86,7 @@ const MERGE_BASE = "c".repeat(40);
 const MOVED = "d".repeat(40);
 const API = "https://api.github.com/repos/acme/demo";
 const ORIGIN = "https://review.invalid";
+const SUPERSEDED = "A newer pull request event superseded this review.";
 const PULL = {
   repository: "acme/demo",
   number: 7,
@@ -1422,6 +1423,69 @@ describe("App review publication", () => {
       expect(stored.get("offers") ?? []).toEqual([]);
     },
   );
+  it("cancels a review superseded during its start even when the first cancel fails", async () => {
+    const { pr, env, stored, job } = fixture();
+    const gh = github();
+    job.start.mockImplementationOnce(async () => {
+      await pr.accept(PULL, "c2345678-1234-1234-1234-123456789abc", ORIGIN);
+    });
+    job.cancel.mockRejectedValueOnce(new Error("destroy_failed: busy"));
+    await pr.accept(PULL, "d2345678-1234-1234-1234-123456789abc", ORIGIN);
+    await pr.alarm();
+    const first = (job.start.mock.calls[0]![0] as { reviewId: string })
+      .reviewId;
+    expect(stored.get("superseded")).toEqual([
+      expect.objectContaining({ generation: 1, reviewId: first }),
+    ]);
+    env.REVIEW_JOBS.getByName.mockClear();
+    await pr.alarm();
+    expect(env.REVIEW_JOBS.getByName).toHaveBeenCalledWith(first);
+    expect(stored.get("superseded")).toEqual([
+      expect.objectContaining({ generation: 1, cancelFailures: 1 }),
+    ]);
+    expect(gh.checks()).toEqual([]);
+    env.REVIEW_JOBS.getByName.mockClear();
+    await pr.alarm();
+    expect(env.REVIEW_JOBS.getByName).toHaveBeenCalledWith(first);
+    expect(job.cancel).toHaveBeenCalledTimes(2);
+    expect(gh.checks()).toEqual([
+      expect.objectContaining({
+        url: `${API}/check-runs/99`,
+        conclusion: "neutral",
+        output: expect.objectContaining({ summary: SUPERSEDED }),
+      }),
+    ]);
+    expect(stored.get("superseded")).toEqual([]);
+  });
+
+  it("gives up on a cancel that keeps failing and records it on the superseded check", async () => {
+    const { pr, stored, storage, job, started } = fixture();
+    const gh = github();
+    await started();
+    job.cancel.mockRejectedValue(new Error("destroy_failed: busy"));
+    await pr.accept(PULL, "e2345678-1234-1234-1234-123456789abc", ORIGIN);
+    for (let attempt = 1; attempt < 5; attempt += 1) await pr.alarm();
+    expect(gh.checks()).toEqual([]);
+    expect(stored.get("superseded")).toEqual([
+      expect.objectContaining({ generation: 1, cancelFailures: 4 }),
+    ]);
+    await pr.alarm();
+    expect(job.cancel).toHaveBeenCalledTimes(5);
+    expect(gh.checks()).toEqual([
+      expect.objectContaining({
+        url: `${API}/check-runs/99`,
+        conclusion: "neutral",
+        output: {
+          title: "Swarm review could not complete",
+          summary: `${SUPERSEDED} Its cloud review could not be stopped after 5 attempts: destroy_failed: busy.`,
+        },
+      }),
+    ]);
+    expect(stored.get("superseded")).toEqual([]);
+    storage.setAlarm.mockClear();
+    await pr.alarm();
+    expect(job.cancel).toHaveBeenCalledTimes(5);
+  });
 });
 
 describe("superseded cloud review", () => {
