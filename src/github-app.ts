@@ -410,12 +410,21 @@ export async function readBrief(
       },
     );
     if (response.status === 404) return {};
-    if (!response.ok) return unused(`could not be read (${response.status})`);
-    const context = await response.text();
-    return context.length > BRIEF_MAX_CHARS
+    const text = await response.text();
+    if (!response.ok) {
+      const error = new GitHubRequestError(
+        `read_brief_${response.status}`,
+        response,
+        text,
+      );
+      if (error.retryAt !== null) throw error;
+      return unused(`could not be read (${response.status})`);
+    }
+    return text.length > BRIEF_MAX_CHARS
       ? unused(`is over ${BRIEF_MAX_CHARS} characters`)
-      : { context };
-  } catch {
+      : { context: text };
+  } catch (error) {
+    if (error instanceof GitHubRequestError) throw error;
     return unused("could not be read");
   }
 }

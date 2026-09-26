@@ -555,6 +555,50 @@ describe("GitHub App webhook", () => {
     },
   );
 
+  it("waits out a rate-limited brief read and then steers by the brief", async () => {
+    const { pr, job, stored, storage } = fixture();
+    const brief = "Money moves only through the ledger module.";
+    let limited = 1;
+    const gh = github({
+      routes: {
+        [`GET ${BRIEF_AT_BASE}`]: () =>
+          limited-- > 0
+            ? new Response("API rate limit exceeded", {
+                status: 403,
+                headers: {
+                  "x-ratelimit-remaining": "0",
+                  "x-ratelimit-reset": "4102444800",
+                },
+              })
+            : new Response(brief),
+      },
+    });
+    await pr.accept(PULL, "b2345678-1234-1234-1234-123456789abc", ORIGIN);
+    storage.setAlarm.mockClear();
+    await pr.alarm();
+    expect(job.start).not.toHaveBeenCalled();
+    expect(stored.get("current")).toMatchObject({
+      phase: "pending",
+      checkRunId: 99,
+      briefNote: null,
+    });
+    expect(storage.setAlarm).toHaveBeenCalledExactlyOnceWith(4_102_444_800_000);
+    await pr.alarm();
+    expect(
+      gh.calls
+        .filter((call) => call.url.includes("/contents/"))
+        .map((call) => `${call.method} ${call.url}`),
+    ).toEqual([`GET ${BRIEF_AT_BASE}`, `GET ${BRIEF_AT_BASE}`]);
+    expect(job.start).toHaveBeenCalledExactlyOnceWith(
+      expect.objectContaining({ context: brief }),
+    );
+    expect(stored.get("current")).toMatchObject({
+      phase: "running",
+      checkRunId: 99,
+      briefNote: null,
+    });
+  });
+
   it("updates the running check once per phase or reviewer change", async () => {
     const { pr, r2, stored, storage, started } = fixture();
     const gh = github();

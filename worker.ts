@@ -317,13 +317,13 @@ export class PullRequestReview extends DurableObject<ReviewPiEnv> {
           token,
         );
         if (!(await this.save(state))) return false;
+        const brief = await readBrief(token, repository, state.event.base);
+        state.briefNote = brief.note ?? null;
         const reviewId = assertCloudRunId(`review-${crypto.randomUUID()}`);
         await putReviewJson(this.env, reviewId, "git", {
           repository,
           installationId: state.event.installationId,
         });
-        const brief = await readBrief(token, repository, state.event.base);
-        state.briefNote = brief.note ?? null;
         await startReview(this.env, {
           reviewId,
           repository,
