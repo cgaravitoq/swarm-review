@@ -95,6 +95,7 @@ const PULL = {
   installationId: 42,
 };
 const BRIEF_AT_BASE = `${API}/contents/.swarm-review/brief.md?ref=${BASE}`;
+const CONFIG_AT_BASE = `${API}/contents/.swarm-review/config.json?ref=${BASE}`;
 const DIFF = `diff --git a/src/app.ts b/src/app.ts
 index 1111111..2222222 100644
 --- a/src/app.ts
@@ -441,7 +442,8 @@ describe("GitHub App webhook", () => {
       "Bearer installation-token",
     );
     expect(calls[3]).toMatchObject({ method: "GET", url: BRIEF_AT_BASE });
-    expect(calls[4]).toMatchObject({
+    expect(calls[4]).toMatchObject({ method: "GET", url: CONFIG_AT_BASE });
+    expect(calls[5]).toMatchObject({
       method: "PATCH",
       url: `${API}/check-runs/99`,
       body: {
@@ -452,9 +454,13 @@ describe("GitHub App webhook", () => {
         },
       },
     });
-    expect(calls).toHaveLength(5);
+    expect(calls).toHaveLength(6);
     expect(job.start.mock.calls[0]![0]).not.toHaveProperty("context");
-    expect(state).toMatchObject({ briefNote: null });
+    expect(state).toMatchObject({
+      briefNote: null,
+      shadow: false,
+      configNote: null,
+    });
   });
 
   it("ends an unsuccessful review neutrally with the failure reason and publishes nothing", async () => {
@@ -509,7 +515,7 @@ describe("GitHub App webhook", () => {
       },
     });
     const reviewId = await started();
-    const read = gh.calls.filter((call) => call.url.includes("/contents/"));
+    const read = gh.calls.filter((call) => call.url.includes("/brief.md"));
     expect(read).toHaveLength(1);
     expect(read[0]).toMatchObject({
       method: "GET",
@@ -547,7 +553,7 @@ describe("GitHub App webhook", () => {
       gh.calls
         .filter((call) => call.url.includes("/contents/"))
         .map((call) => `${call.method} ${call.url}`),
-    ).toEqual([`GET ${BRIEF_AT_BASE}`]);
+    ).toEqual([`GET ${BRIEF_AT_BASE}`, `GET ${CONFIG_AT_BASE}`]);
     expect(job.start).toHaveBeenCalledOnce();
     expect(job.start.mock.calls[0]![0]).not.toHaveProperty("context");
   });
@@ -612,7 +618,11 @@ describe("GitHub App webhook", () => {
       gh.calls
         .filter((call) => call.url.includes("/contents/"))
         .map((call) => `${call.method} ${call.url}`),
-    ).toEqual([`GET ${BRIEF_AT_BASE}`, `GET ${BRIEF_AT_BASE}`]);
+    ).toEqual([
+      `GET ${BRIEF_AT_BASE}`,
+      `GET ${BRIEF_AT_BASE}`,
+      `GET ${CONFIG_AT_BASE}`,
+    ]);
     expect(job.start).toHaveBeenCalledExactlyOnceWith(
       expect.objectContaining({ context: brief }),
     );

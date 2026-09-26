@@ -450,6 +450,48 @@ export async function readBrief(
     : { context: text };
 }
 
+export const CONFIG_PATH = ".swarm-review/config.json";
+
+/**
+ * The repository's review settings at the PR base. A config that is there but
+ * cannot be read or understood runs the review in shadow, because a repository
+ * that wrote one may have written it to keep reviews off its pull requests.
+ */
+export async function readConfig(
+  token: string,
+  repository: string,
+  base: string,
+): Promise<{ shadow: boolean; note?: string }> {
+  const shadowed = (why: string) => ({
+    shadow: true,
+    note: `The repository config \`${CONFIG_PATH}\` ${why}, so this review ran in shadow.`,
+  });
+  let text: string | null;
+  try {
+    text = await readAtBase(token, repository, base, CONFIG_PATH);
+  } catch (error) {
+    return shadowed(unreadable(error));
+  }
+  if (text === null) return { shadow: false };
+  let config: unknown;
+  try {
+    config = JSON.parse(text);
+  } catch {
+    return shadowed("is not valid JSON");
+  }
+  if (typeof config !== "object" || config === null || Array.isArray(config))
+    return shadowed("is not a JSON object");
+  const unknown = Object.keys(config).find((key) => key !== "shadow");
+  if (unknown !== undefined)
+    return shadowed(`has a key it does not know, \`${plainKey(unknown)}\``);
+  const { shadow = false } = config as { shadow?: unknown };
+  if (typeof shadow !== "boolean")
+    return shadowed("sets `shadow` to something other than true or false");
+  return { shadow };
+}
+
+const plainKey = (key: string) => key.replace(/[^\w.-]/g, "?").slice(0, 64);
+
 export async function updateCheck(
   token: string,
   repository: string,
