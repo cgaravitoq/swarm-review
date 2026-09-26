@@ -397,6 +397,39 @@ export async function completeCheck(
 export const BRIEF_PATH = ".swarm-review/brief.md";
 export const BRIEF_MAX_CHARS = 64_000;
 
+async function readAtBase(
+  token: string,
+  repository: string,
+  base: string,
+  path: string,
+) {
+  const response = await fetch(
+    `${api}/repos/${repository}/contents/${path}?ref=${base}`,
+    {
+      headers: {
+        ...headers(token),
+        accept: "application/vnd.github.raw+json",
+      },
+    },
+  );
+  if (response.status === 404) return null;
+  const text = await response.text();
+  if (!response.ok)
+    throw new GitHubRequestError(
+      `read_contents_${response.status}`,
+      response,
+      text,
+    );
+  return text;
+}
+
+/** Why a file at the base could not be read, or the rate limit to wait out. */
+const unreadable = (error: unknown) => {
+  if (!(error instanceof GitHubRequestError)) return "could not be read";
+  if (error.retryAt !== null) throw error;
+  return `could not be read (${error.status})`;
+};
+
 export async function readBrief(
   token: string,
   repository: string,
@@ -405,34 +438,16 @@ export async function readBrief(
   const unused = (why: string) => ({
     note: `The repository brief \`${BRIEF_PATH}\` ${why}, so the default brief steered this review.`,
   });
+  let text: string | null;
   try {
-    const response = await fetch(
-      `${api}/repos/${repository}/contents/${BRIEF_PATH}?ref=${base}`,
-      {
-        headers: {
-          ...headers(token),
-          accept: "application/vnd.github.raw+json",
-        },
-      },
-    );
-    if (response.status === 404) return {};
-    const text = await response.text();
-    if (!response.ok) {
-      const error = new GitHubRequestError(
-        `read_brief_${response.status}`,
-        response,
-        text,
-      );
-      if (error.retryAt !== null) throw error;
-      return unused(`could not be read (${response.status})`);
-    }
-    return text.length > BRIEF_MAX_CHARS
-      ? unused(`is over ${BRIEF_MAX_CHARS} characters`)
-      : { context: text };
+    text = await readAtBase(token, repository, base, BRIEF_PATH);
   } catch (error) {
-    if (error instanceof GitHubRequestError) throw error;
-    return unused("could not be read");
+    return unused(unreadable(error));
   }
+  if (text === null) return {};
+  return text.length > BRIEF_MAX_CHARS
+    ? unused(`is over ${BRIEF_MAX_CHARS} characters`)
+    : { context: text };
 }
 
 export async function updateCheck(
