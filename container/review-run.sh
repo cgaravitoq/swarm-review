@@ -834,7 +834,7 @@ function handlePiEvent(child, rawLine) {
     return;
   }
 
-  // The rest of the event table pi 0.85.1 documents for rpc mode. None of
+  // The rest of the event table pi 0.87.1 documents for rpc mode. None of
   // them ends a turn or settles the agent, so each is only the last thing pi
   // said. The stderr a turn is classified by never hears of them.
   if ([

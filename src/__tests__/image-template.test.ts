@@ -34,15 +34,6 @@ describe("the baked template", () => {
 });
 
 describe("the image's Pi", () => {
-  // Pi 0.86 hands providers a TranscriptContext without `systemPrompt` or
-  // `tools`, which the pinned Claude Code stream still reads, so a newer Pi
-  // would send the claude-code lanes no prompt and no tools.
-  it("stays on the Pi the Claude Code stream reads its context from", async () => {
-    const dockerfile = await containerFile("Dockerfile");
-    expect(dockerfile).toContain('"@earendil-works/pi-coding-agent@0.85.1"');
-    expect(dockerfile).toContain('"@cgaravitoq/pi-claude-code-auth@2.5.2"');
-  });
-
   // The request-shape tests drive the Pi in devDependencies, so they only
   // speak for the image while both pin the same Pi.
   it("is the Pi the request-shape tests drive", async () => {
@@ -56,6 +47,22 @@ describe("the image's Pi", () => {
     const pinned = pkg.devDependencies["@earendil-works/pi-coding-agent"];
     expect(pinned).toMatch(/^\d+\.\d+\.\d+$/);
     expect(dockerfile).toContain(`"@earendil-works/pi-coding-agent@${pinned}"`);
+  });
+
+  // claude-code-stream.test.ts drives the Claude Code stream in
+  // devDependencies, so it only speaks for the image while both pin the same
+  // stream: one written for another Pi drops a lane's prompt and tools.
+  it("runs the Claude Code stream the request-shape tests drive", async () => {
+    const dockerfile = await containerFile("Dockerfile");
+    const pkg = JSON.parse(
+      await readFile(
+        fileURLToPath(new URL("../../package.json", import.meta.url)),
+        "utf8",
+      ),
+    ) as { devDependencies: Record<string, string> };
+    const pinned = pkg.devDependencies["@cgaravitoq/pi-claude-code-auth"];
+    expect(pinned).toMatch(/^\d+\.\d+\.\d+$/);
+    expect(dockerfile).toContain(`"@cgaravitoq/pi-claude-code-auth@${pinned}"`);
   });
 
   // claude-code is a custom provider: models.json is its whole catalog, so a
@@ -78,7 +85,7 @@ describe("the image's Pi", () => {
     for (const model of named) expect(served).toContain(model);
   });
 
-  it("defines gpt-6-luna in full, since Pi 0.85.1 has no built-in entry to override", async () => {
+  it("defines gpt-6-luna in full rather than leaning on Pi's built-in catalog", async () => {
     const models = JSON.parse(await containerFile("models.json")) as {
       providers: Record<string, { models?: { id: string; api?: string }[] }>;
     };

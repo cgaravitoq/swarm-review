@@ -71,7 +71,7 @@ afterEach(() => {
   rmSync(dir, { recursive: true, force: true });
 });
 
-// Drives Pi 0.85.1's own model runtime over the models.json the Worker writes
+// Drives the image's Pi model runtime over the models.json the Worker writes
 // for a workers-ai lane, so the catalog entry, the lane's override and the
 // request builder are all Pi's, and returns what the model proxy receives.
 // The report turn runs at `--thinking off`, which Pi's agent turns into no
