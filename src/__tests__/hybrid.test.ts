@@ -90,7 +90,11 @@ if (process.env.PI_HANG === "runaway" || ((process.env.PI_HANG === "cap" || proc
   for (const delta of ["🧪".repeat(5000), report])
     event({type:"message_update",usage,assistantMessageEvent:{type:"text_delta",contentIndex:1,delta}});
   setInterval(() => {}, 1000);
-} else if (process.env.PI_HANG === "deadline" || (process.env.PI_HANG === "stall" && !reportTurn)) {
+} else if (process.env.PI_HANG === "silent" || process.env.PI_HANG === "deadline" || (process.env.PI_HANG === "stall" && !reportTurn)) {
+  if (process.env.PI_HANG !== "silent") {
+    event({type:"turn_start"});
+    event({type:"turn_end",message:{stopReason:"toolUse",usage:{input:1,output:1,totalTokens:2}}});
+  }
   setInterval(() => {}, 1000);
 } else {
   event({type:"turn_start"});
@@ -852,6 +856,28 @@ it("hands a reviewer still running at the review deadline one tools-off report t
   expect(receipt.lanes[0]).toMatchObject({ status: "completed" });
   expect(receipt.candidates).toHaveLength(1);
   expect(receipt.findings[0]?.status).toBe("confirmed");
+});
+
+it("cuts a reviewer whose first turn never ended at the review deadline, with no report turn", async () => {
+  // Pi writes nothing to the session before its first assistant message, so a
+  // report turn before one would start empty and answer it has no tools.
+  const input = await setup();
+  const config = JSON.parse(await readFile(input.lanes, "utf8"));
+  config.reviewers[0].env.PI_HANG = "silent";
+  await writeFile(input.lanes, JSON.stringify(config));
+  const result = run(input, 10);
+  expect(result.status, result.stderr).toBe(0);
+  const { receipt } = await windows(input.out);
+  const reviewer = (await calls(input.log)).filter(
+    (call) => call.family === "workers-ai",
+  );
+  expect(reviewer.map((call) => call.args.includes("--no-tools"))).toEqual([
+    false,
+  ]);
+  expect(receipt.lanes[0]).toMatchObject({
+    status: "cancelled",
+    stopReason: "review deadline",
+  });
 });
 
 it("declares a reviewer cut at the review deadline when its report turn does not finish", async () => {
