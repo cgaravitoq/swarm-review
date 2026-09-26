@@ -1,4 +1,6 @@
 import { createHash } from "node:crypto";
+import { readFileSync } from "node:fs";
+import { fileURLToPath, URL } from "node:url";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
 import {
@@ -1359,6 +1361,52 @@ describe("model proxy", () => {
       { input: null, output: null },
       { input: 10, output: 500 },
     ]);
+  });
+
+  it("marks the attempt after a 200 stream that ended before its terminal event as a retry", async () => {
+    // Captured from Workers AI's chat completions endpoint for DeepSeek V4
+    // Flash; its last line is the `data: [DONE]` a complete stream ends with.
+    const captured = readFileSync(
+      fileURLToPath(new URL("workers-ai-stream.sse", import.meta.url)),
+      "utf8",
+    );
+    const cut = captured.slice(0, captured.lastIndexOf("data: {"));
+    const retryableAfter = async (body: string, cancel = false) => {
+      vi.stubGlobal(
+        "fetch",
+        vi.fn<typeof fetch>(
+          async () =>
+            new Response(body, {
+              status: 200,
+              headers: { "content-type": "text/event-stream" },
+            }),
+        ),
+      );
+      const url = await proxyTarget("early-end-run");
+      const retryable: boolean[] = [];
+      const response = await proxyModelFetch(
+        new Request(url, {
+          method: "POST",
+          headers: { authorization: "Bearer review-pi-handle" },
+          body: "{}",
+        }),
+        url,
+        "control-secret",
+        sessionOpener(),
+        sessionConsumer(),
+        async (_runId, _usage, marked) => {
+          retryable.push(marked);
+        },
+      );
+      if (cancel) await response.body?.cancel();
+      else await response.text();
+      return retryable;
+    };
+
+    expect(captured.trimEnd().endsWith("data: [DONE]")).toBe(true);
+    expect(await retryableAfter(captured)).toEqual([false]);
+    expect(await retryableAfter(cut)).toEqual([true]);
+    expect(await retryableAfter(captured, true)).toEqual([false]);
   });
 
   it("seals the answer text it streamed", async () => {
