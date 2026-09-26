@@ -17,6 +17,10 @@
  */
 
 const ALLOWED = new Set(["info/refs", "git-upload-pack"]);
+// GitHub's edge rate-limits some of the addresses a Worker's requests leave
+// from, before it reads the credential, and the next request can leave from
+// another one.
+const RATE_LIMIT_ATTEMPTS = 5;
 
 const hex = (buffer: ArrayBuffer) =>
   Array.from(new Uint8Array(buffer))
@@ -77,12 +81,17 @@ export async function proxyGitFetch(
   const gitProtocol = request.headers.get("git-protocol");
   if (gitProtocol) headers.set("git-protocol", gitProtocol);
 
-  return fetch(upstream, {
-    method: request.method,
-    headers,
-    body: request.method === "POST" ? request.body : null,
-    // Streaming a pack response back to git is the whole point: the repository
-    // bytes pass through and are never held here.
-    ...(request.method === "POST" ? { duplex: "half" } : {}),
-  } as RequestInit);
+  // The request is want and have lines, small enough to hold and resend; the
+  // pack response still streams back to git and is never held here.
+  const body = request.method === "POST" ? await request.arrayBuffer() : null;
+  for (let attempt = 1; ; attempt++) {
+    const response = await fetch(upstream, {
+      method: request.method,
+      headers,
+      body,
+    });
+    if (response.status !== 429 || attempt === RATE_LIMIT_ATTEMPTS)
+      return response;
+    await response.body?.cancel();
+  }
 }
