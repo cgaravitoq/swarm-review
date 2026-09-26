@@ -126,10 +126,12 @@ export async function runCloud(argv: string[], io: CloudIo = defaultIo) {
     io.print(line.replaceAll(secret, "[redacted]"));
   const { head, base } = await revisions(argv, repo, pr);
 
+  let reviewId = `review-${crypto.randomUUID()}`;
   const submitted = await fetch(`${origin}/reviews`, {
     method: "POST",
     headers: { ...headers, "content-type": "application/json" },
     body: JSON.stringify({
+      reviewId,
       repository: repo,
       pr,
       head,
@@ -139,19 +141,22 @@ export async function runCloud(argv: string[], io: CloudIo = defaultIo) {
     signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
   }).catch((error: unknown) => error as Error);
   if (submitted instanceof Error) {
-    print(`cloud review not submitted: ${submitted.message}`);
-    return 1;
+    print(
+      `cloud review ${reviewId}: submit unanswered (${submitted.message}); following it in case the Worker started it`,
+    );
+  } else {
+    const accepted = await readBody(submitted);
+    const answered =
+      typeof accepted === "object" && accepted !== null
+        ? (accepted as { reviewId?: unknown }).reviewId
+        : undefined;
+    if (submitted.status !== 202 || typeof answered !== "string") {
+      print(`cloud review refused: ${describeRefusal(submitted, accepted)}`);
+      return 1;
+    }
+    reviewId = answered;
+    print(`cloud review ${reviewId}: accepted for ${repo}#${pr} at ${head}`);
   }
-  const accepted = await readBody(submitted);
-  const reviewId =
-    typeof accepted === "object" && accepted !== null
-      ? (accepted as { reviewId?: unknown }).reviewId
-      : undefined;
-  if (submitted.status !== 202 || typeof reviewId !== "string") {
-    print(`cloud review refused: ${describeRefusal(submitted, accepted)}`);
-    return 1;
-  }
-  print(`cloud review ${reviewId}: accepted for ${repo}#${pr} at ${head}`);
   await mkdir(out, { recursive: true });
 
   let deadline = io.now() + UNOBSERVED_DEADLINE_MS;

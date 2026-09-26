@@ -145,6 +145,9 @@ it("submits the PR at its head and merge base, follows it to a completed receipt
   expect(post?.headers.get("user-agent")).toBe("swarm-review-cli");
   expect(post?.headers.get("content-type")).toBe("application/json");
   expect(post?.body).toEqual({
+    reviewId: expect.stringMatching(
+      /^review-[0-9a-f]{8}(-[0-9a-f]{4}){3}-[0-9a-f]{12}$/,
+    ),
     repository: "octo/widget",
     pr: 7,
     head: HEAD,
@@ -188,6 +191,9 @@ it("sends explicit --head and --base without asking GitHub", async () => {
     `${ORIGIN}/reviews/review-2`,
   ]);
   expect(calls[0]?.body).toEqual({
+    reviewId: expect.stringMatching(
+      /^review-[0-9a-f]{8}(-[0-9a-f]{4}){3}-[0-9a-f]{12}$/,
+    ),
     repository: "octo/widget",
     pr: 7,
     head: HEAD,
@@ -292,27 +298,38 @@ function hangUntilAborted() {
   return { timers, hung, timeOut };
 }
 
-it("ends a submit the Worker never answers with one line once its request times out", async () => {
+it("follows a review whose submit went unanswered under the id it sent", async () => {
   const { timers, hung, timeOut } = hangUntilAborted();
-  const calls = stubFetch([]);
+  const calls = stubFetch([
+    json({
+      status: status("done", [], { candidates: 0, verified: 0 }),
+      receipt: { status: "completed" },
+    }),
+  ]);
   const fetchStub = vi.mocked(fetch);
   const answer = fetchStub.getMockImplementation()!;
   fetchStub.mockImplementation(async (input, init) =>
-    String(input).startsWith(ORIGIN) ? hung(init) : answer(input, init),
+    init?.method === "POST" ? hung(init) : answer(input, init),
   );
   const exit = runCloud(argv(), io);
   await timeOut(0);
-  expect(await exit).toBe(1);
-  expect(lines).toEqual([
-    "cloud review not submitted: The operation timed out.",
+  expect(await exit).toBe(0);
+  const [, submit] = fetchStub.mock.calls.find(
+    ([, init]) => init?.method === "POST",
+  )!;
+  const { reviewId } = JSON.parse(String(submit?.body)) as {
+    reviewId: string;
+  };
+  expect(submit?.signal).toBe(timers[0]?.controller.signal);
+  expect(timers[0]?.ms).toBe(30_000);
+  expect(workerCalls(calls).map((call) => call.url)).toEqual([
+    `${ORIGIN}/reviews/${reviewId}`,
   ]);
-  expect(timers.map((timer) => timer.ms)).toEqual([30_000]);
-  expect(
-    fetchStub.mock.calls
-      .filter(([input]) => String(input).startsWith(ORIGIN))
-      .map(([, init]) => init?.signal === timers[0]?.controller.signal),
-  ).toEqual([true]);
-  expect(calls.every((call) => !call.url.startsWith(ORIGIN))).toBe(true);
+  expect(lines).toEqual([
+    `cloud review ${reviewId}: submit unanswered (The operation timed out.); following it in case the Worker started it`,
+    `cloud review ${reviewId}: phase done | reviewers none | candidates 0 | verified 0`,
+    `cloud review ${reviewId}: completed`,
+  ]);
 });
 
 it("keeps polling past a poll the Worker never answers once that request times out", async () => {
