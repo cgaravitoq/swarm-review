@@ -23,6 +23,11 @@ updates:
         update-types:
           - patch
           - minor
+        # Pi is pinned again in container/Dockerfile, beside the Claude Code
+        # provider package that must support the same Pi, so its bump carries an
+        # image change and gets a pull request of its own.
+        exclude-patterns:
+          - "@earendil-works/pi-coding-agent"
   - package-ecosystem: docker
     directory: /container
     schedule:
