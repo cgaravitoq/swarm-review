@@ -4,7 +4,7 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { mkdir, readFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
-import { reviewerPrompt, verifierPrompt } from "../prompts/hybrid";
+import { reviewerPrompt, turnCap, verifierPrompt } from "../prompts/hybrid";
 import { writeAtomic } from "./attempt";
 import {
   packBudgetChars,
@@ -85,7 +85,6 @@ function parseLane(value: unknown): Lane {
   };
 }
 
-const turnCap = 8;
 const reviewShare = 0.6;
 const tools = "read,grep,find,ls";
 const finalTextTail = (value: string) => {
