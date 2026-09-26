@@ -383,6 +383,71 @@ describe("cloud reviews", () => {
     ]);
   });
 
+  it.each([
+    [
+      "light" as const,
+      "low",
+      ["workers-ai", "openai-codex"],
+      ["openai-codex", "workers-ai"],
+    ],
+    [
+      "deep" as const,
+      "high",
+      ["workers-ai", "openai-codex", "claude-code"],
+      ["claude-code", "openai-codex", "workers-ai"],
+    ],
+  ])(
+    "runs a %s review's lanes at %s thinking in its families and verifier order",
+    async (tier, thinking, reviewerFamilies, verifierFamilies) => {
+      const fixture = setup();
+      const reviewId = `review-${tier}`;
+      await fixture.job.start({
+        reviewId,
+        ...requestBody,
+        origin: "https://review.invalid",
+        deadlineAt: new Date(Date.now() + 8 * 60_000).toISOString(),
+        tier,
+      });
+      await fixture.job.alarm();
+      const lanes = JSON.parse(
+        fixture.files.get(`/workspace/runs/${reviewId}/lanes.json`) ?? "{}",
+      ) as Record<
+        "reviewers" | "verifiers",
+        { family: string; model: string; thinking?: string }[]
+      >;
+      const models = {
+        "workers-ai": "@cf/deepseek-ai/deepseek-v4-flash-0731",
+        "openai-codex": "gpt-6-luna",
+        "claude-code": "claude-opus-5-5",
+      };
+      const named = (families: string[]) =>
+        families.map((family) => ({
+          family,
+          model: models[family as keyof typeof models],
+          thinking,
+        }));
+      expect(lanes.reviewers).toEqual(
+        named(reviewerFamilies).map((lane) => expect.objectContaining(lane)),
+      );
+      expect(lanes.verifiers).toEqual(
+        named(verifierFamilies).map((lane) => expect.objectContaining(lane)),
+      );
+    },
+  );
+
+  it("leaves a standard review's lanes at Pi's own thinking level", async () => {
+    const fixture = setup();
+    const response = await post(fixture.reviewEnv);
+    const { reviewId } = (await response.json()) as { reviewId: string };
+    await fixture.job.alarm();
+    const lanes = JSON.parse(
+      fixture.files.get(`/workspace/runs/${reviewId}/lanes.json`) ?? "{}",
+    ) as Record<"reviewers" | "verifiers", object[]>;
+    expect([...lanes.reviewers, ...lanes.verifiers]).toHaveLength(6);
+    for (const lane of [...lanes.reviewers, ...lanes.verifiers])
+      expect(lane).not.toHaveProperty("thinking");
+  });
+
   it("names a failed deep review's own models as its unobserved reviewers", async () => {
     const fixture = setup("clone");
     const reviewId = "review-deep-failed";
