@@ -1,5 +1,5 @@
 import { execFileSync, spawnSync } from "node:child_process";
-import { mkdir, mkdtemp, readFile, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readdir, readFile, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, expect, it } from "vitest";
@@ -67,6 +67,7 @@ const env = Object.keys(process.env).sort();
 const phase = JSON.parse(readFileSync(process.env.PI_OUT + "/status.json", "utf8")).phase;
 const verifying = phase === "verifying";
 appendFileSync(process.env.PI_LOG, JSON.stringify({at: Date.now(), args, env, phase, family: process.env.PI_FAMILY, promptChars: prompt.length, prompt}) + "\\n");
+appendFileSync(args[args.indexOf("--session-dir") + 1] + "/2026-09-26T12-00-00-000Z_" + args[args.indexOf("--session-id") + 1] + ".jsonl", JSON.stringify({type: reportTurn ? "report" : "turn", family: process.env.PI_FAMILY}) + "\\n");
 const event = (data) => process.stdout.write(JSON.stringify(data) + "\\n");
 if (process.env.PI_HANG === "runaway" || ((process.env.PI_HANG === "cap" || process.env.PI_HANG === "time") && !reportTurn)) {
   setInterval(() => {
@@ -565,6 +566,32 @@ it("gives a lane at the tool-turn budget one tools-off report turn and publishes
   const sessionId = (args: string[]) => args[args.indexOf("--session-id") + 1];
   expect(sessionId(calls[1]!.args)).toBe(sessionId(calls[0]!.args));
   expect(calls[1]?.prompt).toContain("report now");
+});
+
+it("keeps each lane's Pi session under its lane id, the report turn included", async () => {
+  const input = await setup();
+  const config = JSON.parse(await readFile(input.lanes, "utf8"));
+  config.reviewers[0].env.PI_HANG = "cap";
+  await writeFile(input.lanes, JSON.stringify(config));
+  const result = run(input, 5);
+  expect(result.status, result.stderr).toBe(0);
+  const lanes = join(input.out, "lanes");
+  expect((await readdir(lanes)).sort()).toEqual([
+    "reviewer-1.jsonl",
+    "verifier-c1.jsonl",
+  ]);
+  const session = async (name: string) =>
+    (await readFile(join(lanes, name), "utf8"))
+      .trim()
+      .split("\n")
+      .map((line) => JSON.parse(line));
+  expect(await session("reviewer-1.jsonl")).toEqual([
+    { type: "turn", family: "workers-ai" },
+    { type: "report", family: "workers-ai" },
+  ]);
+  expect(await session("verifier-c1.jsonl")).toEqual([
+    { type: "turn", family: "openai-codex" },
+  ]);
 });
 
 it("kills a tools-off report turn that starts a second turn past the cap", async () => {
