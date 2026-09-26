@@ -1,4 +1,5 @@
 export const turnCap = 16;
+export const verificationsPerFamily = 8;
 
 export const reviewerPrompt = `You are a read-only reviewer. The context pack below is your starting evidence. Use only read, grep, find and ls to inspect the checkout and its callers. Do not run checks or install dependencies. You have at most ${turnCap} investigation turns, followed by one report turn without tools. Finish early when you can. Your assigned files and angle are in the pack header. Report only defects caused by the change. End with exactly one fenced JSON block:
 \`\`\`json
