@@ -11,21 +11,21 @@ const headers = (authorization: string) => ({
 export class GitHubRequestError extends Error {
   readonly status: number;
   readonly retryAt: number | null;
-  constructor(message: string, response: Response) {
+  constructor(message: string, response: Response, body = message) {
     super(message);
     this.status = response.status;
-    this.retryAt = rateLimitedUntil(response, message);
+    this.retryAt = rateLimitedUntil(response, body);
   }
 }
 
-function rateLimitedUntil(response: Response, message: string) {
+function rateLimitedUntil(response: Response, body: string) {
   if (response.status !== 403 && response.status !== 429) return null;
   const retryAfter = Number(response.headers.get("retry-after") ?? Number.NaN);
   if (Number.isFinite(retryAfter)) return Date.now() + retryAfter * 1000;
   const reset = Number(response.headers.get("x-ratelimit-reset") ?? Number.NaN);
   if (response.headers.get("x-ratelimit-remaining") === "0")
     return Number.isFinite(reset) ? reset * 1000 : Date.now() + 60_000;
-  return response.status === 429 || /rate limit/i.test(message)
+  return response.status === 429 || /rate limit/i.test(body)
     ? Date.now() + 60_000
     : null;
 }
@@ -204,7 +204,11 @@ export async function openPull(
     headers: headers(token),
   });
   if (!response.ok)
-    throw new GitHubRequestError(`fetch_pull_${response.status}`, response);
+    throw new GitHubRequestError(
+      `fetch_pull_${response.status}`,
+      response,
+      await response.text(),
+    );
   const pull: unknown = await response.json();
   return (pull as { state?: unknown } | null)?.state === "open"
     ? reviewablePull(repository, number, pull, installationId)
@@ -265,6 +269,7 @@ export async function installationToken(
     throw new GitHubRequestError(
       `installation_token_${response.status}`,
       response,
+      await response.text(),
     );
   const value: unknown = await response.json();
   if (
@@ -303,7 +308,11 @@ export async function createCheck(
     }),
   });
   if (!response.ok)
-    throw new GitHubRequestError(`create_check_${response.status}`, response);
+    throw new GitHubRequestError(
+      `create_check_${response.status}`,
+      response,
+      await response.text(),
+    );
   const value: unknown = await response.json();
   const id = (value as { id?: unknown })?.id;
   if (!Number.isSafeInteger(id)) throw new Error("invalid_check_run");
@@ -338,7 +347,11 @@ export async function offerCheck(
     }),
   });
   if (!response.ok)
-    throw new GitHubRequestError(`offer_check_${response.status}`, response);
+    throw new GitHubRequestError(
+      `offer_check_${response.status}`,
+      response,
+      await response.text(),
+    );
 }
 
 export async function completeCheck(
@@ -368,7 +381,11 @@ export async function completeCheck(
     },
   );
   if (!response.ok)
-    throw new GitHubRequestError(`update_check_${response.status}`, response);
+    throw new GitHubRequestError(
+      `update_check_${response.status}`,
+      response,
+      await response.text(),
+    );
 }
 
 export const BRIEF_PATH = ".swarm-review/brief.md";
@@ -421,5 +438,9 @@ export async function updateCheck(
     },
   );
   if (!response.ok)
-    throw new GitHubRequestError(`update_check_${response.status}`, response);
+    throw new GitHubRequestError(
+      `update_check_${response.status}`,
+      response,
+      await response.text(),
+    );
 }

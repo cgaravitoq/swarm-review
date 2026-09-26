@@ -702,6 +702,7 @@ export async function fetchPullRevisions(
     throw new GitHubRequestError(
       `GitHub pull request request failed: ${response.status}`,
       response,
+      await response.text(),
     );
   }
   return (await response.json()) as {
@@ -727,6 +728,7 @@ export async function fetchMergeBase(
     throw new GitHubRequestError(
       `GitHub three-dot compare failed: ${response.status}`,
       response,
+      await response.text(),
     );
   }
   const compared = (await response.json()) as {
@@ -750,6 +752,7 @@ export async function fetchIsAncestor(
     throw new GitHubRequestError(
       `GitHub three-dot compare failed: ${response.status}`,
       response,
+      await response.text(),
     );
   }
   const compared = (await response.json()) as { status: string };
@@ -771,6 +774,7 @@ export async function fetchThreeDotDiff(
     throw new GitHubRequestError(
       `GitHub three-dot diff request failed: ${response.status}`,
       response,
+      await response.text(),
     );
   }
   return response.text();
@@ -797,6 +801,7 @@ async function githubPages<T>(
       throw new GitHubRequestError(
         `GitHub ${what} request failed: ${response.status}`,
         response,
+        await response.text(),
       );
     }
     const batch = (await response.json()) as T[];
@@ -1265,6 +1270,7 @@ export async function fetchViewerLogin(token: string) {
     throw new GitHubRequestError(
       `GitHub viewer request failed: ${response.status}`,
       response,
+      await response.text(),
     );
   }
   const parsed = (await response.json()) as {

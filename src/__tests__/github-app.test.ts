@@ -85,6 +85,14 @@ const BASE = "b".repeat(40);
 const MERGE_BASE = "c".repeat(40);
 const MOVED = "d".repeat(40);
 const API = "https://api.github.com/repos/acme/demo";
+const ORIGIN = "https://review.invalid";
+const PULL = {
+  repository: "acme/demo",
+  number: 7,
+  head: HEAD,
+  base: BASE,
+  installationId: 42,
+};
 const BRIEF_AT_BASE = `${API}/contents/.swarm-review/brief.md?ref=${BASE}`;
 const DIFF = `diff --git a/src/app.ts b/src/app.ts
 index 1111111..2222222 100644
@@ -1269,6 +1277,44 @@ describe("App review publication", () => {
     expect(stored.get("current")).toMatchObject({
       generation: 2,
       phase: "running",
+    });
+    expect(job.start).toHaveBeenCalledOnce();
+  });
+  it("waits out a secondary rate limit GitHub names only in its body", async () => {
+    const { pr, stored, storage, job } = fixture();
+    const now = Date.now();
+    vi.spyOn(Date, "now").mockReturnValue(now);
+    let limited = 1;
+    const gh = github({
+      routes: {
+        [`POST ${API}/check-runs`]: () =>
+          limited-- > 0
+            ? Response.json(
+                {
+                  message:
+                    "You have exceeded a secondary rate limit. Please wait a few minutes before you try again.",
+                },
+                { status: 403 },
+              )
+            : undefined,
+      },
+    });
+    await pr.accept(PULL, "82345678-1234-1234-1234-123456789abc", ORIGIN);
+    storage.setAlarm.mockClear();
+    await pr.alarm();
+    expect(gh.sent()).toEqual([
+      expect.objectContaining({ method: "POST", url: `${API}/check-runs` }),
+    ]);
+    expect(stored.get("current")).toMatchObject({
+      phase: "pending",
+      checkRunId: null,
+      outcome: null,
+    });
+    expect(storage.setAlarm).toHaveBeenCalledExactlyOnceWith(now + 60_000);
+    await pr.alarm();
+    expect(stored.get("current")).toMatchObject({
+      phase: "running",
+      checkRunId: 99,
     });
     expect(job.start).toHaveBeenCalledOnce();
   });
