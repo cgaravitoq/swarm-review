@@ -741,7 +741,7 @@ export function parseVerdicts(
     id: string;
     status: (typeof VERDICT_STATUSES)[number];
     severity: (typeof VERDICT_SEVERITIES)[number] | null;
-    evidenceStrength: (typeof EVIDENCE_STRENGTHS)[number];
+    evidenceStrength: (typeof EVIDENCE_STRENGTHS)[number] | "unstated";
     reason: string;
     duplicateOf: string | null;
     command: string | null;
@@ -761,14 +761,16 @@ export function parseVerdicts(
       ? String(verdict["duplicateOf"]).trim()
       : null;
     // A rejected candidate is never published, so a strength it omits decides
-    // nothing and is recorded the way a duplicate's is.
+    // nothing; it is recorded as unstated rather than as one it never named.
     const strength =
-      status === "duplicate" ||
-      (status === "rejected" && verdict["evidenceStrength"] === undefined)
+      status === "duplicate"
         ? ("static" as const)
-        : EVIDENCE_STRENGTHS.find(
-            (known_) => known_ === verdict["evidenceStrength"],
-          );
+        : status === "rejected" &&
+            (verdict["evidenceStrength"] ?? null) === null
+          ? ("unstated" as const)
+          : EVIDENCE_STRENGTHS.find(
+              (known_) => known_ === verdict["evidenceStrength"],
+            );
     if (
       !status ||
       !strength ||

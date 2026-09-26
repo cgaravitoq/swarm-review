@@ -442,6 +442,9 @@ export async function proxyModelFetch(
   const sealer = responseSealer();
   const usage = usageReader({ lineChars: WORKER_SSE_LINE_CHARS });
   const reader = upstream.body.getReader();
+  const eventStream =
+    upstream.headers.get("content-type")?.includes("text/event-stream") ===
+    true;
   let recorded: Promise<void> | undefined;
   const finish = (complete: boolean, cancelled = false) => {
     const reported = usage.read();
@@ -450,7 +453,9 @@ export async function proxyModelFetch(
       complete || (!cancelled && usage.closed())
         ? reported
         : { input: null, output: null },
-      retryable,
+      // A stream the upstream ended before its terminal event is one the
+      // client repeats, whatever status opened it.
+      retryable || (eventStream && !cancelled && !sealer.terminal()),
       complete ? sealer.seal() : null,
       handle,
       outcome,

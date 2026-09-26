@@ -1333,10 +1333,40 @@ describe("deduplication and verification", () => {
       expect.objectContaining({
         id: "c2",
         status: "rejected",
-        evidenceStrength: "static",
+        evidenceStrength: "unstated",
       }),
     ]);
     expect(verdicts[0]?.reason).toMatch(/identifies no reachable defect/);
+  });
+
+  it("records a rejection's null strength as unstated and refuses an unknown one", () => {
+    const rejected = (evidenceStrength: unknown) =>
+      parseVerdicts(
+        fenced({
+          verdicts: [
+            {
+              id: "c1",
+              status: "rejected",
+              evidenceStrength,
+              reason: "no reachable defect",
+            },
+          ],
+        }),
+        ["c1"],
+      );
+
+    expect(rejected(null)).toMatchObject({
+      error: null,
+      verdicts: [{ id: "c1", evidenceStrength: "unstated" }],
+    });
+    expect(rejected("static")).toMatchObject({
+      error: null,
+      verdicts: [{ id: "c1", evidenceStrength: "static" }],
+    });
+    expect(rejected("proven")).toEqual({
+      error: "verdicts[0] does not satisfy the verdict contract",
+      verdicts: [],
+    });
   });
 
   it("still refuses a confirmed verdict that names no evidence strength", () => {
