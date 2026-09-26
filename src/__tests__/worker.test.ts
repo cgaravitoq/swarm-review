@@ -633,10 +633,11 @@ describe("cloud reviews", () => {
       const remote = command.match(
         /'(https:\/\/review\.invalid\/git\/[^']+)'/,
       )?.[1];
+      const capability = remote?.split("/").at(-1);
       const header = command.match(/x-review-run: ([^']+)'/)?.[1];
       return {
         stdout: "clone\n",
-        stderr: `${"x".repeat(10_000)}\nfatal: unable to access '${remote}/': The requested URL returned error: 503\n> GET /info/refs HTTP/1.1\n> x-review-run: ${header}\n`,
+        stderr: `${"x".repeat(10_000)}\nfatal: unable to access '${remote}/': The requested URL returned error: 503\n> GET /git/${capability}/info/refs?service=git-upload-pack HTTP/1.1\n> x-review-run: ${header}\n`,
         exitCode: 128,
       };
     });
@@ -655,7 +656,7 @@ describe("cloud reviews", () => {
     const stderr = receipt.failure.clone.stderr;
     expect(stderr).toHaveLength(4096);
     expect(stderr).toMatch(
-      /fatal: unable to access '\[redacted\]\/': The requested URL returned error: 503\n> GET \/info\/refs HTTP\/1\.1\n> x-review-run: \[redacted\]\n$/,
+      /fatal: unable to access '\[redacted\]\/': The requested URL returned error: 503\n> GET \/git\/\[redacted\]\/info\/refs\?service=git-upload-pack HTTP\/1\.1\n> x-review-run: \[redacted\]\n$/,
     );
     expect(stderr).not.toContain(reviewId);
     expect(receipt.failure.clone).toEqual({
