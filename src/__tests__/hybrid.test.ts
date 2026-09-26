@@ -323,6 +323,46 @@ it("sends a candidate to a family whose reviewer completed over one whose review
   expect(receipt.findings[0]?.status).toBe("confirmed");
 });
 
+it("offers a candidate to the first finder-free family in the Worker's verifier order when every reviewer completes", async () => {
+  const cases = [
+    { finder: "claude-code", verifier: "openai-codex" },
+    { finder: "openai-codex", verifier: "claude-code" },
+  ];
+  for (const { finder, verifier } of cases) {
+    const input = await setup();
+    await familyLanes(
+      input,
+      ["workers-ai", "openai-codex", "claude-code"].map((family) => [
+        family,
+        family === finder ? {} : { PI_REPORT: "none" },
+      ]),
+      [
+        ["openai-codex", {}],
+        ["claude-code", {}],
+        ["workers-ai", {}],
+      ],
+    );
+    const result = run(input);
+    expect(result.status, result.stderr).toBe(0);
+    const receipt = JSON.parse(
+      await readFile(join(input.out, "receipt.json"), "utf8"),
+    ) as HybridReceipt;
+    expect(
+      receipt.lanes.filter((lane) => lane.role === "reviewer"),
+    ).toMatchObject([
+      { family: "workers-ai", status: "completed" },
+      { family: "openai-codex", status: "completed" },
+      { family: "claude-code", status: "completed" },
+    ]);
+    expect(
+      (await calls(input.log))
+        .filter((call) => call.phase === "verifying")
+        .map((call) => call.family),
+    ).toEqual([verifier]);
+    expect(receipt.findings[0]?.status).toBe("confirmed");
+  }
+});
+
 it("never sends a candidate to a family whose reviewer failed", async () => {
   const input = await setup();
   await familyLanes(
