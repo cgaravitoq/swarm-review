@@ -43,6 +43,21 @@ describe("the image's Pi", () => {
     expect(dockerfile).toContain('"@cgaravitoq/pi-claude-code-auth@2.5.2"');
   });
 
+  // The request-shape tests drive the Pi in devDependencies, so they only
+  // speak for the image while both pin the same Pi.
+  it("is the Pi the request-shape tests drive", async () => {
+    const dockerfile = await containerFile("Dockerfile");
+    const pkg = JSON.parse(
+      await readFile(
+        fileURLToPath(new URL("../../package.json", import.meta.url)),
+        "utf8",
+      ),
+    ) as { devDependencies: Record<string, string> };
+    const pinned = pkg.devDependencies["@earendil-works/pi-coding-agent"];
+    expect(pinned).toMatch(/^\d+\.\d+\.\d+$/);
+    expect(dockerfile).toContain(`"@earendil-works/pi-coding-agent@${pinned}"`);
+  });
+
   // claude-code is a custom provider: models.json is its whole catalog, so a
   // model the Worker names and the file lacks fails as an unknown model.
   it("serves every claude-code model the Worker names", async () => {
