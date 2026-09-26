@@ -19,8 +19,9 @@
 const ALLOWED = new Set(["info/refs", "git-upload-pack"]);
 // GitHub's edge rate-limits some of the addresses a Worker's requests leave
 // from, before it reads the credential, and the next request can leave from
-// another one.
-const RATE_LIMIT_ATTEMPTS = 5;
+// another one. That answer carries no request id; a limit on the credential
+// comes from GitHub itself with one, and resending would only add to it.
+const EDGE_RATE_LIMIT_ATTEMPTS = 5;
 
 const hex = (buffer: ArrayBuffer) =>
   Array.from(new Uint8Array(buffer))
@@ -90,7 +91,11 @@ export async function proxyGitFetch(
       headers,
       body,
     });
-    if (response.status !== 429 || attempt === RATE_LIMIT_ATTEMPTS)
+    if (
+      response.status !== 429 ||
+      response.headers.has("x-github-request-id") ||
+      attempt === EDGE_RATE_LIMIT_ATTEMPTS
+    )
       return response;
     await response.body?.cancel();
   }
