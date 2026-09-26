@@ -1318,6 +1318,66 @@ describe("App review publication", () => {
     });
     expect(job.start).toHaveBeenCalledOnce();
   });
+  it.each([
+    [
+      "superseded check",
+      `PATCH ${API}/check-runs/99`,
+      (pr: InstanceType<typeof PullRequestReview>) =>
+        pr.accept(PULL, "92345678-1234-1234-1234-123456789abc", ORIGIN),
+    ],
+    [
+      "push offer",
+      `POST ${API}/check-runs`,
+      (pr: InstanceType<typeof PullRequestReview>) =>
+        pr.offer(
+          { ...PULL, head: MOVED },
+          "a2345678-1234-1234-1234-123456789abc",
+        ),
+    ],
+  ])(
+    "retries a rate-limited %s at the reset GitHub names",
+    async (_name, route, arrive) => {
+      const { pr, stored, storage, started } = fixture();
+      let limited = 1;
+      const gh = github({
+        routes: {
+          [route]: (call) =>
+            (call.body as { status: string; head_sha?: string }).status ===
+              "completed" && limited-- > 0
+              ? new Response("API rate limit exceeded", {
+                  status: 403,
+                  headers: {
+                    "x-ratelimit-remaining": "0",
+                    "x-ratelimit-reset": "4102444800",
+                  },
+                })
+              : undefined,
+        },
+      });
+      await started();
+      await arrive(pr);
+      storage.setAlarm.mockClear();
+      await pr.alarm();
+      expect(limited).toBe(0);
+      expect(storage.setAlarm).toHaveBeenCalledExactlyOnceWith(
+        4_102_444_800_000,
+      );
+      gh.calls.length = 0;
+      await pr.alarm();
+      expect(
+        gh.sent().filter((call) => `${call.method} ${call.url}` === route),
+      ).toEqual([
+        expect.objectContaining({
+          body: expect.objectContaining({
+            status: "completed",
+            conclusion: "neutral",
+          }),
+        }),
+      ]);
+      expect(stored.get("superseded") ?? []).toEqual([]);
+      expect(stored.get("offers") ?? []).toEqual([]);
+    },
+  );
 });
 
 describe("superseded cloud review", () => {

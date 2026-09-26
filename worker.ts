@@ -159,9 +159,7 @@ const refusedForGood = (error: unknown) =>
   [403, 404, 422].includes(error.status);
 
 const retryAfter = (error: unknown) =>
-  error instanceof GitHubRequestError && error.retryAt !== null
-    ? error.retryAt
-    : true;
+  error instanceof GitHubRequestError ? (error.retryAt ?? 0) : 0;
 
 export class PullRequestReview extends DurableObject<ReviewPiEnv> {
   async accept(event: PullRequestEvent, delivery: string, origin: string) {
@@ -248,6 +246,7 @@ export class PullRequestReview extends DurableObject<ReviewPiEnv> {
     const superseded =
       (await this.ctx.storage.get<AppReview[]>("superseded")) ?? [];
     const retired = new Set<number>();
+    let wakeAt = 0;
     for (const previous of superseded) {
       try {
         if (previous.reviewId)
@@ -262,32 +261,35 @@ export class PullRequestReview extends DurableObject<ReviewPiEnv> {
         retired.add(previous.generation);
       } catch (error) {
         if (refusedForGood(error)) retired.add(previous.generation);
+        else wakeAt = Math.max(wakeAt, retryAfter(error));
       }
     }
     const left = (
       (await this.ctx.storage.get<AppReview[]>("superseded")) ?? []
     ).filter((previous) => !retired.has(previous.generation));
     await this.ctx.storage.put("superseded", left);
-    return left.length > 0;
+    return left.length > 0 && wakeAt;
   }
 
   private async offerReviews() {
     const offers =
       (await this.ctx.storage.get<PullRequestEvent[]>("offers")) ?? [];
     const offered = new Set<string>();
+    let wakeAt = 0;
     for (const offer of offers) {
       try {
         await offerCheck(await this.token(offer), offer);
         offered.add(offer.head);
       } catch (error) {
         if (refusedForGood(error)) offered.add(offer.head);
+        else wakeAt = Math.max(wakeAt, retryAfter(error));
       }
     }
     const left = (
       (await this.ctx.storage.get<PullRequestEvent[]>("offers")) ?? []
     ).filter((offer) => !offered.has(offer.head));
     await this.ctx.storage.put("offers", left);
-    return left.length > 0;
+    return left.length > 0 && wakeAt;
   }
 
   private async advance(): Promise<boolean | number> {
