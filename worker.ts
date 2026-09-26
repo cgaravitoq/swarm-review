@@ -1011,12 +1011,45 @@ async function startReview(env: ReviewPiEnv, review: CloudReview) {
 
 type EngineFailure = { exitCode: number | null; stderr: string | null };
 
+const CLONE_STEPS = [
+  "clone",
+  "fetch_head",
+  "head_mismatch",
+  "fetch_base",
+  "merge_base",
+] as const;
+
+type CloneFailure = {
+  step: (typeof CLONE_STEPS)[number] | null;
+  exitCode: number;
+  stderr: string;
+};
+
+type FailureDetail = { engine: EngineFailure } | { clone: CloneFailure };
+
 const ENGINE_STDERR_TAIL = 4096;
+
+const cloneFailure = (
+  result: { stdout: string; stderr: string; exitCode: number },
+  secrets: string[],
+): CloneFailure => {
+  const lastStep = result.stdout.trim().split("\n").at(-1);
+  return {
+    step: CLONE_STEPS.find((step) => step === lastStep) ?? null,
+    exitCode: result.exitCode,
+    stderr: secrets
+      .reduce(
+        (stderr, secret) => stderr.replaceAll(secret, "[redacted]"),
+        result.stderr,
+      )
+      .slice(-ENGINE_STDERR_TAIL),
+  };
+};
 
 const failedReviewStatus = (
   review: CloudReview,
   reason: string,
-  engine: EngineFailure | null,
+  detail: FailureDetail | null,
   observed: Record<string, unknown> | null,
 ) => ({
   ...observed,
@@ -1032,7 +1065,7 @@ const failedReviewStatus = (
   verified: observed?.["verified"] ?? 0,
   deadlineAt: review.deadlineAt,
   reason,
-  ...(engine ? { engine } : {}),
+  ...detail,
 });
 
 async function finishReview(
@@ -1040,7 +1073,7 @@ async function finishReview(
   review: CloudReview,
   reason: string,
   receipt: unknown,
-  engine: EngineFailure | null = null,
+  detail: FailureDetail | null = null,
 ) {
   const status = await env.PROBE_RESULTS.get(
     reviewKey(review.reviewId, "status"),
@@ -1050,7 +1083,7 @@ async function finishReview(
     env,
     review.reviewId,
     "status",
-    failedReviewStatus(review, reason, engine, observed),
+    failedReviewStatus(review, reason, detail, observed),
   );
   const existingReceipt = await env.PROBE_RESULTS.head(
     reviewKey(review.reviewId, "receipt"),
@@ -1072,7 +1105,7 @@ async function finishReview(
     failure: {
       stage: reason === "deadline" ? "deadline" : "cloud_review",
       message: reason,
-      ...(engine ? { engine } : {}),
+      ...detail,
     },
   });
 }
@@ -1102,7 +1135,7 @@ async function runCloudReview(env: ReviewPiEnv, review: CloudReview) {
   const directory = runDir(review.reviewId);
   let reason: string | null = null;
   let receipt: Record<string, unknown> | null = null;
-  let engineFailure: EngineFailure | null = null;
+  let failureDetail: FailureDetail | null = null;
   try {
     reviewRemaining(review);
     if (!env.WORKERS_AI_API_KEY || !env.WORKERS_AI_ACCOUNT_ID) {
@@ -1132,20 +1165,34 @@ async function runCloudReview(env: ReviewPiEnv, review: CloudReview) {
       "review ownership",
       sandbox.exec(targetChownCommand(directory)),
     );
-    const remote = `${review.origin}/git/${await gitCapability(review.reviewId, env.CONTROL_SECRET, review.repository)}`;
+    const gitRemoteCapability = await gitCapability(
+      review.reviewId,
+      env.CONTROL_SECRET,
+      review.repository,
+    );
+    const remote = `${review.origin}/git/${gitRemoteCapability}`;
     const gitHeader = posixQuote(
       `http.extraHeader=x-review-run: ${review.reviewId}`,
     );
     const clone = `${directory}/clone`;
     const pullRef = posixQuote(`pull/${review.pr}/head`);
     const base = posixQuote(review.base);
-    const cloneCommand = `${asTarget} git -c ${gitHeader} clone --depth 1 --no-tags --quiet ${posixQuote(remote)} ${posixQuote(clone)} && cd ${posixQuote(clone)} && ${asTarget} git -c ${gitHeader} fetch --depth 1 origin ${pullRef} && ${asTarget} git checkout --quiet --detach ${posixQuote(review.head)} && test "$(${asTarget} git rev-parse HEAD)" = ${posixQuote(review.head)} && ${asTarget} git -c ${gitHeader} fetch --depth 1 origin ${base} && { while ! ${asTarget} git merge-base ${base} HEAD >/dev/null; do test "$(${asTarget} git rev-parse --is-shallow-repository)" = true || exit 1; ${asTarget} git -c ${gitHeader} fetch --deepen=64 origin ${pullRef} ${base} || exit 1; done; }`;
+    const cloneCommand = `echo clone && ${asTarget} git -c ${gitHeader} clone --depth 1 --no-tags --quiet ${posixQuote(remote)} ${posixQuote(clone)} && echo fetch_head && cd ${posixQuote(clone)} && ${asTarget} git -c ${gitHeader} fetch --depth 1 origin ${pullRef} && echo head_mismatch && ${asTarget} git checkout --quiet --detach ${posixQuote(review.head)} && test "$(${asTarget} git rev-parse HEAD)" = ${posixQuote(review.head)} && echo fetch_base && ${asTarget} git -c ${gitHeader} fetch --depth 1 origin ${base} && echo merge_base && { while ! ${asTarget} git merge-base ${base} HEAD >/dev/null; do test "$(${asTarget} git rev-parse --is-shallow-repository)" = true || exit 1; ${asTarget} git -c ${gitHeader} fetch --deepen=64 origin ${pullRef} ${base} || exit 1; done; }`;
     const cloned = await reviewStep(
       review,
       "review clone",
       sandbox.exec(cloneCommand),
     );
-    if (cloned.exitCode !== 0) throw new Error("clone_failed");
+    if (cloned.exitCode !== 0) {
+      failureDetail = {
+        clone: cloneFailure(cloned, [
+          remote,
+          gitRemoteCapability,
+          review.reviewId,
+        ]),
+      };
+      throw new Error("clone_failed");
+    }
 
     const laneModels = await reviewStep(
       review,
@@ -1332,12 +1379,14 @@ async function runCloudReview(env: ReviewPiEnv, review: CloudReview) {
         reviewStep(review, "review engine exit", process.waitForExit()),
         reviewStep(review, "review engine logs", process.getLogs()),
       ]);
-      engineFailure = {
-        exitCode: exit.status === "fulfilled" ? exit.value.exitCode : null,
-        stderr:
-          logs.status === "fulfilled"
-            ? logs.value.stderr.slice(-ENGINE_STDERR_TAIL)
-            : null,
+      failureDetail = {
+        engine: {
+          exitCode: exit.status === "fulfilled" ? exit.value.exitCode : null,
+          stderr:
+            logs.status === "fulfilled"
+              ? logs.value.stderr.slice(-ENGINE_STDERR_TAIL)
+              : null,
+        },
       };
       throw new Error("engine_failed");
     }
@@ -1376,7 +1425,7 @@ async function runCloudReview(env: ReviewPiEnv, review: CloudReview) {
     ).catch(() => undefined);
     const shutdown = await destroySandbox(sandbox);
     if (!shutdown.acknowledged) reason = `destroy_failed: ${shutdown.error}`;
-    if (reason) await finishReview(env, review, reason, receipt, engineFailure);
+    if (reason) await finishReview(env, review, reason, receipt, failureDetail);
   }
 }
 
