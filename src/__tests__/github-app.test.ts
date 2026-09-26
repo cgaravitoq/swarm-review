@@ -247,6 +247,8 @@ const fixture = () => {
     isDone: vi.fn(async () => true),
     cancel: vi.fn(async () => undefined),
   };
+  const destroy = vi.fn(async () => undefined);
+  getSandbox.mockReturnValue({ destroy });
   const env = {
     CONTROL_SECRET: "control-secret",
     GITHUB_APP_ID: "123",
@@ -257,6 +259,7 @@ const fixture = () => {
       "https://github.com/acme/demo.git,https://github.com/acme/other.git",
     PULL_REQUEST_REVIEWS: { getByName: vi.fn(() => pr) },
     REVIEW_JOBS: { getByName: vi.fn(() => job) },
+    REVIEW_SANDBOX: "sandboxes",
     PROBE_RESULTS: {
       put: vi.fn(async (key: string, body: string) => {
         r2.set(key, JSON.parse(body));
@@ -276,7 +279,7 @@ const fixture = () => {
     await pr.alarm();
     return (stored.get("current") as { reviewId: string }).reviewId;
   };
-  return { pr, env, stored, storage, r2, job, started };
+  return { pr, env, stored, storage, r2, job, destroy, started };
 };
 
 describe("GitHub App webhook", () => {
@@ -832,7 +835,7 @@ describe("GitHub App webhook", () => {
   ])(
     "starts a fresh review once when the platform lost the first: %s",
     async (message) => {
-      const { pr, r2, job, stored, started } = fixture();
+      const { pr, r2, job, destroy, stored, started } = fixture();
       const gh = github();
       const first = await started();
       r2.set(`reviews/${first}/receipt.json`, {
@@ -840,6 +843,9 @@ describe("GitHub App webhook", () => {
         failure: { stage: "cloud_review", message },
       });
       await pr.alarm();
+      expect(getSandbox).toHaveBeenLastCalledWith("sandboxes", first);
+      expect(destroy).toHaveBeenCalledOnce();
+      expect(job.start).toHaveBeenCalledOnce();
       await pr.alarm();
       const second = (stored.get("current") as { reviewId: string }).reviewId;
       expect(second).not.toBe(first);

@@ -176,7 +176,7 @@ const sentence = (text: unknown) => `${text}`.replace(/\.*$/, ".");
 
 const lostToPlatform = (message: unknown): message is string =>
   typeof message === "string" &&
-  /^(interrupted$|destroy_failed|image source )|Durable Object reset because its code was updated/.test(
+  /^(interrupted$|destroy_failed|image source |Durable Object reset because its code was updated)/.test(
     message,
   );
 
@@ -423,19 +423,26 @@ export class PullRequestReview extends DurableObject<ReviewPiEnv> {
       }
       if (receipt.status !== "completed" && receipt.status !== "partial") {
         const failure = receipt.failure?.message;
+        let notRetried = "";
         if (state.retriedAfter === undefined && lostToPlatform(failure)) {
-          state.retriedAfter = failure;
-          state.reviewId = null;
-          state.acceptedAt = Date.now();
-          state.progress = null;
-          state.phase = "pending";
-          return await this.save(state);
+          const shutdown = await destroySandbox(
+            getSandbox(this.env.REVIEW_SANDBOX, state.reviewId!),
+          );
+          if (shutdown.acknowledged) {
+            state.retriedAfter = failure;
+            state.reviewId = null;
+            state.acceptedAt = Date.now();
+            state.progress = null;
+            state.phase = "pending";
+            return await this.save(state);
+          }
+          notRetried = ` Not retried, because its sandbox could not be stopped: ${sentence(shutdown.error)}`;
         }
         await this.finish(
           token,
           state,
           "neutral",
-          `Review could not complete: ${sentence(receipt.failure?.message ?? `receipt status ${plain(receipt.status)}`)}\n\n${laneSummary(receipt)}`,
+          `Review could not complete: ${sentence(receipt.failure?.message ?? `receipt status ${plain(receipt.status)}`)}${notRetried}\n\n${laneSummary(receipt)}`,
         );
         return false;
       }
@@ -1175,7 +1182,7 @@ async function finishReview(
     findings: [],
     status: "failed",
     failure: {
-      stage: reason === "deadline" ? "deadline" : "cloud_review",
+      stage: reason.startsWith("deadline") ? "deadline" : "cloud_review",
       message: reason,
       ...detail,
     },
@@ -1503,7 +1510,10 @@ async function runCloudReview(env: ReviewPiEnv, review: CloudReview) {
       REVIEW_SESSION_CLEAR_MS,
     ).catch(() => undefined);
     const shutdown = await destroySandbox(sandbox);
-    if (!shutdown.acknowledged) reason = `destroy_failed: ${shutdown.error}`;
+    if (!shutdown.acknowledged)
+      reason = [reason, `destroy_failed: ${shutdown.error}`]
+        .filter(Boolean)
+        .join("; ");
     if (reason) await finishReview(env, review, reason, receipt, failureDetail);
   }
 }
