@@ -1,7 +1,7 @@
 import { spawn } from "node:child_process";
 import { createHash } from "node:crypto";
 import { cp, glob, mkdir, readFile, rm, stat } from "node:fs/promises";
-import { dirname, join, relative, resolve } from "node:path";
+import { basename, dirname, join, relative, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import ts from "typescript";
 import {
@@ -157,9 +157,11 @@ export const imageSourceHashes = async () =>
     ),
   );
 
-const wrangler = (args: string[], tee = false) =>
+const FAILURE_OUTPUT_CHARS = 2_000;
+
+export const captured = (command: string, args: string[], tee = false) =>
   new Promise<string>((resolvePromise, reject) => {
-    const child = spawn(wranglerBin, args, {
+    const child = spawn(command, args, {
       cwd: packageRoot,
       stdio: ["ignore", "pipe", "pipe"],
     });
@@ -177,10 +179,15 @@ const wrangler = (args: string[], tee = false) =>
       code === 0
         ? resolvePromise(output)
         : reject(
-            new Error(`wrangler ${args.join(" ")} exited with code ${code}`),
+            new Error(
+              `${basename(command)} ${args.join(" ")} exited with code ${code}${output.trim() ? `:\n${output.trim().slice(-FAILURE_OUTPUT_CHARS)}` : ""}`,
+            ),
           ),
     );
   });
+
+const wrangler = (args: string[], tee = false) =>
+  captured(wranglerBin, args, tee);
 
 const parseJson = <T>(output: string): T => {
   const lines = output.split("\n");
