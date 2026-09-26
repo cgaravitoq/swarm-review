@@ -25,6 +25,11 @@ jobs:
         with:
           bun-version: "1.4.0"
 
+      # The suite runs real Pi under Node, and Pi needs Node 22.19 or later.
+      - uses: actions/setup-node@v7
+        with:
+          node-version: "24.21.0"
+
       - name: Install
         run: bun install --frozen-lockfile
 
