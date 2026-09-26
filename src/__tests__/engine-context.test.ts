@@ -6,8 +6,10 @@ import {
   mkdtemp,
   readdir,
   readFile,
+  rename,
   rm,
   symlink,
+  utimes,
   writeFile,
 } from "node:fs/promises";
 import { tmpdir } from "node:os";
@@ -134,6 +136,48 @@ it("reads the engine after another run ended", async () => {
     await writeFile(release, "");
     expect(await firstExit).toBe(0);
     expect(existsSync(engine)).toBe(false);
+  });
+
+  it("removes the placeholder after a hard-killed run whose pid another process now holds", async () => {
+    const root = await stageSuite();
+    const engine = join(root, "container/context/swarm.js");
+    const started = join(root, "started");
+    await writeFile(
+      join(root, "src/__tests__/hang.test.ts"),
+      `import { writeFileSync } from "node:fs";
+import { it } from "vitest";
+it("hangs", async () => {
+  writeFileSync(${JSON.stringify(started)}, "");
+  await new Promise(() => {});
+});
+`,
+    );
+    const killed = spawn(join(root, "node_modules/.bin/vitest"), ["run"], {
+      cwd: root,
+      env: { ...process.env, EXPECTED_ENGINE: "test engine bundle" },
+    });
+    const exited = new Promise((resolve) => killed.once("exit", resolve));
+    while (!existsSync(started)) await sleep(50);
+    killed.kill("SIGKILL");
+    await exited;
+    await rm(join(root, "src/__tests__/hang.test.ts"));
+    const users = join(tmpdir(), "swarm-review-engine-users");
+    const left = (await readdir(users)).find((user) =>
+      user.endsWith(`-${killed.pid}`),
+    );
+    expect(left).toBeDefined();
+    const reused = join(
+      users,
+      left!.replace(`-${killed.pid}`, `-${process.pid}`),
+    );
+    await rename(join(users, left!), reused);
+    const hourAgo = new Date(Date.now() - 3_600_000);
+    await utimes(reused, hourAgo, hourAgo);
+    expect(existsSync(engine)).toBe(true);
+    const result = runSuite(root, "test engine bundle");
+    expect(result.status, result.stdout + result.stderr).toBe(0);
+    expect(existsSync(engine)).toBe(false);
+    expect(existsSync(reused)).toBe(false);
   });
 
   it("removes the placeholder when the run is interrupted", async () => {
