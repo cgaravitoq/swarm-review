@@ -28,7 +28,11 @@ type PiRuntime = {
         content: { type: "text"; text: string }[];
         timestamp: number;
       }[];
-      tools: [];
+      tools: {
+        name: string;
+        description: string;
+        parameters: { type: "object"; properties: Record<string, never> };
+      }[];
     },
     options: {
       reasoning?: "medium";
@@ -70,8 +74,15 @@ afterEach(() => {
 // Drives Pi 0.85.1's own model runtime over the models.json the Worker writes
 // for a workers-ai lane, so the catalog entry, the lane's override and the
 // request builder are all Pi's, and returns what the model proxy receives.
-// Pi's agent turns `--thinking off` into no `reasoning` at all.
-const laneRequest = async (reasoning: "medium" | undefined) => {
+// The report turn runs at `--thinking off`, which Pi's agent turns into no
+// `reasoning` at all, with no tools; a tool turn runs at Pi's default, medium.
+const READ_TOOL = {
+  name: "read",
+  description: "Read a file.",
+  parameters: { type: "object" as const, properties: {} },
+};
+
+const laneRequest = async (turn: "report" | "tool") => {
   const image = await readFile(
     fileURLToPath(new URL("../../container/models.json", import.meta.url)),
     "utf8",
@@ -99,10 +110,10 @@ const laneRequest = async (reasoning: "medium" | undefined) => {
           timestamp: 0,
         },
       ],
-      tools: [],
+      tools: turn === "tool" ? [READ_TOOL] : [],
     },
     {
-      ...(reasoning ? { reasoning } : {}),
+      ...(turn === "tool" ? { reasoning: "medium" as const } : {}),
       maxRetries: 0,
       fetch: async (input, init) => {
         requests.push({
@@ -124,21 +135,31 @@ const laneRequest = async (reasoning: "medium" | undefined) => {
 };
 
 describe("the workers-ai DeepSeek lane", () => {
-  // Workers AI documents `reasoning_effort` (max, high, low, none) for this
-  // model and no `thinking` field, so `thinking: {type: "disabled"}` streamed
-  // a full reasoning phase in the report turn.
-  it("sends reasoning_effort none on the report turn's --thinking off", async () => {
-    const body = await laneRequest(undefined);
+  // Against the model, `reasoning_effort: "none"` still reasoned and
+  // `chat_template_kwargs: {thinking: false}` did not, so the report turn
+  // switches thinking off through the chat template.
+  it("turns thinking off through the chat template on the report turn", async () => {
+    const body = await laneRequest("report");
 
-    expect(body).toMatchObject({ model: MODEL, reasoning_effort: "none" });
+    expect(body).toMatchObject({
+      model: MODEL,
+      chat_template_kwargs: { thinking: false },
+    });
+    expect(body).not.toHaveProperty("reasoning_effort");
     expect(body).not.toHaveProperty("thinking");
   });
 
-  // Pi's default thinking level is medium, which this model's catalog entry
-  // clamps to high: the level the tool turns ran at before.
-  it("keeps the tool turns at reasoning_effort high", async () => {
-    const body = await laneRequest("medium");
+  // With no `reasoning_effort` the model runs at its default, high: the level
+  // the tool turns ran at before.
+  it("keeps thinking on through the chat template on a tool turn", async () => {
+    const body = await laneRequest("tool");
 
-    expect(body).toMatchObject({ model: MODEL, reasoning_effort: "high" });
+    expect(body).toMatchObject({
+      model: MODEL,
+      tools: [{ type: "function", function: { name: "read" } }],
+      chat_template_kwargs: { thinking: true },
+    });
+    expect(body).not.toHaveProperty("reasoning_effort");
+    expect(body).not.toHaveProperty("thinking");
   });
 });
