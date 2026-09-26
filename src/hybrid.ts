@@ -103,6 +103,9 @@ function parseLane(value: unknown): Lane {
 
 const reviewShare = 0.6;
 const tools = "read,grep,find,ls";
+// Continuing a session full of tool calls, DeepSeek answers a report turn that only says it has no tools with a tool call written as text.
+const toolsOff =
+  "You have no tools, and any tool call you write will not run. Your answer must begin with ```json and contain nothing but that block.";
 const finalTextTail = (value: string) => {
   const bytes = Buffer.from(value);
   let start = Math.max(0, bytes.length - 16 * 1024);
@@ -504,8 +507,7 @@ export async function runHybrid(argv: string[]) {
           lane,
           source,
           prompt,
-          reportPrompt:
-            "Stop investigating and write your report now as the required fenced JSON. You have no tools. Use status partial and a blockerReason if the investigation is incomplete.",
+          reportPrompt: `Stop investigating and write your report now as the required fenced JSON. ${toolsOff} Use status partial and a blockerReason if the investigation is incomplete.`,
           deadlineAt: reviewDeadlineAt,
           cutReason: "review deadline",
           children,
@@ -630,8 +632,7 @@ export async function runHybrid(argv: string[]) {
           lane,
           source,
           prompt: `${verifierPrompt}\n\n${JSON.stringify(brief)}\n\n${pack.pack}`,
-          reportPrompt:
-            "Stop investigating and write your verdict now as the required fenced JSON. You have no tools. Confirm or reject only if the evidence supports it; otherwise state that you cannot decide. Never invent evidence.",
+          reportPrompt: `Stop investigating and write your verdict now as the required fenced JSON. ${toolsOff} Confirm or reject only if the evidence supports it; otherwise state that you cannot decide. Never invent evidence.`,
           deadlineAt: Math.min(Date.now() + 120_000, deadlineAt),
           cutReason: "deadline",
           children,

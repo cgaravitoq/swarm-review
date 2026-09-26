@@ -566,6 +566,9 @@ it("gives a lane at the tool-turn budget one tools-off report turn and publishes
   const sessionId = (args: string[]) => args[args.indexOf("--session-id") + 1];
   expect(sessionId(calls[1]!.args)).toBe(sessionId(calls[0]!.args));
   expect(calls[1]?.prompt).toContain("report now");
+  expect(calls[1]?.prompt).toContain(
+    "any tool call you write will not run. Your answer must begin with ```json",
+  );
 });
 
 it("keeps each lane's Pi session under its lane id, the report turn included", async () => {
@@ -730,6 +733,10 @@ it("gives a verifier at its tool-turn budget one tools-off verdict turn", async 
     .map((line) => JSON.parse(line) as { args: string[]; prompt: string });
   expect(calls[1]?.prompt).toContain("at most 16 investigation turns");
   expect(calls[2]?.args).toContain("--no-tools");
+  expect(calls[2]?.prompt).toContain("verdict now");
+  expect(calls[2]?.prompt).toContain(
+    "any tool call you write will not run. Your answer must begin with ```json",
+  );
 });
 
 it("cuts a slow verifier within its own time budget and leaves its candidate unverified", async () => {
