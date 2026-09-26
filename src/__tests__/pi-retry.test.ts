@@ -1,6 +1,6 @@
-import { spawn } from "node:child_process";
+import { type ChildProcess, spawn } from "node:child_process";
 import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
-import { createServer, type IncomingHttpHeaders } from "node:http";
+import { createServer, type IncomingHttpHeaders, type Server } from "node:http";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath, URL } from "node:url";
@@ -83,12 +83,31 @@ const completed = [
   .join("");
 
 let dir: string;
+let laneServer: Server | undefined;
+let laneChild: ChildProcess | undefined;
 
 beforeEach(() => {
   dir = mkdtempSync(join(tmpdir(), "pi-retry-"));
 });
 
-afterEach(() => {
+// Runs on a timed-out test too, so a hung Pi leaves no process or listener.
+afterEach(async () => {
+  const pid = laneChild?.pid;
+  laneChild = undefined;
+  if (pid !== undefined) {
+    try {
+      process.kill(-pid, "SIGKILL");
+    } catch (error) {
+      const code = (error as NodeJS.ErrnoException).code;
+      if (code !== "ESRCH" && code !== "EPERM") throw error;
+    }
+  }
+  const server = laneServer;
+  laneServer = undefined;
+  if (server?.listening) {
+    server.closeAllConnections();
+    await new Promise((resolve) => server.close(resolve));
+  }
   rmSync(dir, { recursive: true, force: true });
 });
 
@@ -122,6 +141,7 @@ const runLane = async (settings: unknown) => {
   server.on("upgrade", (_request, socket) => {
     socket.end("HTTP/1.1 404 Not Found\r\n\r\n");
   });
+  laneServer = server;
   await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
   const address = server.address();
   const port = typeof address === "object" && address ? address.port : 0;
@@ -164,8 +184,10 @@ const runLane = async (settings: unknown) => {
         PI_CODING_AGENT_DIR: dir,
       },
       stdio: ["ignore", "pipe", "pipe"],
+      detached: true,
     },
   );
+  laneChild = child;
   let stdout = "";
   let stderr = "";
   child.stdout.on("data", (chunk: Buffer) => {
@@ -177,7 +199,6 @@ const runLane = async (settings: unknown) => {
   const exitCode = await new Promise<number | null>((resolve) =>
     child.on("close", resolve),
   );
-  await new Promise((resolve) => server.close(resolve));
   const events = stdout
     .split("\n")
     .filter(Boolean)
