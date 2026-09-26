@@ -95,6 +95,7 @@ const PULL = {
   installationId: 42,
 };
 const BRIEF_AT_BASE = `${API}/contents/.swarm-review/brief.md?ref=${BASE}`;
+const CONFIG_AT_BASE = `${API}/contents/.swarm-review/config.json?ref=${BASE}`;
 const DIFF = `diff --git a/src/app.ts b/src/app.ts
 index 1111111..2222222 100644
 --- a/src/app.ts
@@ -441,7 +442,8 @@ describe("GitHub App webhook", () => {
       "Bearer installation-token",
     );
     expect(calls[3]).toMatchObject({ method: "GET", url: BRIEF_AT_BASE });
-    expect(calls[4]).toMatchObject({
+    expect(calls[4]).toMatchObject({ method: "GET", url: CONFIG_AT_BASE });
+    expect(calls[5]).toMatchObject({
       method: "PATCH",
       url: `${API}/check-runs/99`,
       body: {
@@ -452,9 +454,13 @@ describe("GitHub App webhook", () => {
         },
       },
     });
-    expect(calls).toHaveLength(5);
+    expect(calls).toHaveLength(6);
     expect(job.start.mock.calls[0]![0]).not.toHaveProperty("context");
-    expect(state).toMatchObject({ briefNote: null });
+    expect(state).toMatchObject({
+      briefNote: null,
+      shadow: false,
+      configNote: null,
+    });
   });
 
   it("ends an unsuccessful review neutrally with the failure reason and publishes nothing", async () => {
@@ -509,7 +515,7 @@ describe("GitHub App webhook", () => {
       },
     });
     const reviewId = await started();
-    const read = gh.calls.filter((call) => call.url.includes("/contents/"));
+    const read = gh.calls.filter((call) => call.url.includes("/brief.md"));
     expect(read).toHaveLength(1);
     expect(read[0]).toMatchObject({
       method: "GET",
@@ -547,7 +553,7 @@ describe("GitHub App webhook", () => {
       gh.calls
         .filter((call) => call.url.includes("/contents/"))
         .map((call) => `${call.method} ${call.url}`),
-    ).toEqual([`GET ${BRIEF_AT_BASE}`]);
+    ).toEqual([`GET ${BRIEF_AT_BASE}`, `GET ${CONFIG_AT_BASE}`]);
     expect(job.start).toHaveBeenCalledOnce();
     expect(job.start.mock.calls[0]![0]).not.toHaveProperty("context");
   });
@@ -578,6 +584,111 @@ describe("GitHub App webhook", () => {
       });
     },
   );
+
+  it("runs in shadow when the base config asks for it and posts nothing to the pull request", async () => {
+    const { pr, r2, stored, started } = fixture();
+    const gh = github({
+      routes: {
+        [`GET ${CONFIG_AT_BASE}`]: () => new Response('{"shadow": true}'),
+      },
+    });
+    const reviewId = await started();
+    expect(stored.get("current")).toMatchObject({
+      shadow: true,
+      configNote: null,
+    });
+    r2.set(`reviews/${reviewId}/receipt.json`, receipt);
+    await pr.alarm();
+    expect(gh.posts()).toEqual([]);
+    expect(gh.calls.some((call) => call.url === `${API}/pulls/7`)).toBe(false);
+    const output = gh.checks().at(-1)?.output as {
+      title: string;
+      summary: string;
+    };
+    expect(output.title).toBe("Swarm review completed");
+    expect(output.summary).toMatch(
+      /^Shadow review at aaaaaaa, not posted to the pull request\. 2 confirmed finding\(s\)\.\n\n<!-- review-pi run=hybrid-one sha=a{40} -->/,
+    );
+    expect(output.summary).toContain("mechanism inline");
+    expect(output.summary).toContain("mechanism unanchored");
+  });
+
+  it("posts the review as usual when the base config turns shadow off", async () => {
+    const { pr, r2, started } = fixture();
+    const gh = github({
+      routes: {
+        [`GET ${CONFIG_AT_BASE}`]: () => new Response('{"shadow": false}'),
+      },
+    });
+    const reviewId = await started();
+    r2.set(`reviews/${reviewId}/receipt.json`, receipt);
+    await pr.alarm();
+    expect(gh.posts()).toHaveLength(1);
+    expect(gh.checks().at(-1)?.output).toEqual({
+      title: "Swarm review completed",
+      summary: "Review published at aaaaaaa. 2 confirmed finding(s).",
+    });
+  });
+
+  it.each([
+    ["{", "is not valid JSON"],
+    ["[]", "is not a JSON object"],
+    ['{"shadow": false, "mode": "loud"}', "has a key it does not know, `mode`"],
+    ['{"shadow": "no"}', "sets `shadow` to something other than true or false"],
+    [500, "could not be read (500)"],
+  ])(
+    "runs in shadow and says why when the config at the base reads %s",
+    async (answer, why) => {
+      const { pr, r2, started } = fixture();
+      const gh = github({
+        routes: {
+          [`GET ${CONFIG_AT_BASE}`]: () =>
+            typeof answer === "number"
+              ? new Response("Server Error", { status: answer })
+              : new Response(answer),
+        },
+      });
+      const reviewId = await started();
+      r2.set(`reviews/${reviewId}/receipt.json`, receipt);
+      await pr.alarm();
+      expect(gh.posts()).toEqual([]);
+      const { summary } = gh.checks().at(-1)!.output as { summary: string };
+      expect(summary).toMatch(/^Shadow review at aaaaaaa/);
+      expect(
+        summary.endsWith(
+          `\n\nThe repository config \`.swarm-review/config.json\` ${why}, so this review ran in shadow.`,
+        ),
+      ).toBe(true);
+    },
+  );
+
+  it("keeps a long partial shadow review's check summary within GitHub's limit", async () => {
+    const { pr, r2, started } = fixture();
+    const gh = github({
+      routes: {
+        [`GET ${CONFIG_AT_BASE}`]: () => new Response('{"shadow": true}'),
+      },
+    });
+    const reviewId = await started();
+    r2.set(`reviews/${reviewId}/receipt.json`, {
+      ...receipt,
+      status: "partial",
+      findings: [{ ...finding("long", 40), mechanism: "x".repeat(62_000) }],
+      lanes: Array.from({ length: 27 }, () => ({
+        role: "verifier",
+        family: "openai-codex",
+        model: "gpt-6-luna",
+        status: "failed",
+        stopReason: "error",
+        error: "e".repeat(500),
+      })),
+    });
+    await pr.alarm();
+    const { summary } = gh.checks().at(-1)!.output as { summary: string };
+    expect(summary).toMatch(/^Shadow review at aaaaaaa/);
+    expect(summary.length).toBe(65_535);
+    expect(summary.endsWith("\n\n(Cut here to fit the check run.)")).toBe(true);
+  });
 
   it("waits out a rate-limited brief read and then steers by the brief", async () => {
     const { pr, job, stored, storage } = fixture();
@@ -612,7 +723,11 @@ describe("GitHub App webhook", () => {
       gh.calls
         .filter((call) => call.url.includes("/contents/"))
         .map((call) => `${call.method} ${call.url}`),
-    ).toEqual([`GET ${BRIEF_AT_BASE}`, `GET ${BRIEF_AT_BASE}`]);
+    ).toEqual([
+      `GET ${BRIEF_AT_BASE}`,
+      `GET ${BRIEF_AT_BASE}`,
+      `GET ${CONFIG_AT_BASE}`,
+    ]);
     expect(job.start).toHaveBeenCalledExactlyOnceWith(
       expect.objectContaining({ context: brief }),
     );

@@ -27,6 +27,7 @@ import {
   type PullRequestEvent,
   pullRequestEvent,
   readBrief,
+  readConfig,
   rerunEvent,
   updateCheck,
   verifyWebhook,
@@ -154,6 +155,8 @@ type AppReview = {
   retriedAfter?: string;
   completionFailures?: number;
   completionRetryAt?: number;
+  shadow?: boolean;
+  configNote?: string | null;
 };
 
 const plain = (value: unknown) =>
@@ -202,6 +205,7 @@ const withNotes = (state: AppReview, text: string) =>
     state.retriedAfter &&
       `Retried once: the first attempt ended with ${plain(state.retriedAfter)}.`,
     state.briefNote,
+    state.configNote,
   ]
     .filter(Boolean)
     .join("\n\n");
@@ -391,6 +395,9 @@ export class PullRequestReview extends DurableObject<ReviewPiEnv> {
         if (!(await this.save(state))) return false;
         const brief = await readBrief(token, repository, state.event.base);
         state.briefNote = brief.note ?? null;
+        const config = await readConfig(token, repository, state.event.base);
+        state.shadow = config.shadow;
+        state.configNote = config.note ?? null;
         state.reviewId ??= assertCloudRunId(`review-${crypto.randomUUID()}`);
         const reviewId = state.reviewId;
         await putReviewJson(this.env, reviewId, "git", {
@@ -552,15 +559,21 @@ export class PullRequestReview extends DurableObject<ReviewPiEnv> {
     const { repository, number } = state.event;
     const expected = { head: state.event.head, mergeBase: state.mergeBase! };
     let confirmed: number;
+    let body: string;
     try {
       assertPublishableReceipt(receipt, expected);
-      buildReview(receipt, new Map(), repository);
+      body = buildReview(receipt, new Map(), repository).body;
       confirmed = receipt.findings.filter(
         (finding) => finding.status === "confirmed",
       ).length;
     } catch (error) {
       return ["neutral", `Review not published: ${sentence(messageOf(error))}`];
     }
+    if (state.shadow)
+      return [
+        "success",
+        `Shadow review at ${expected.head.slice(0, 7)}, not posted to the pull request. ${confirmed} confirmed finding(s).\n\n${body}`,
+      ];
     try {
       const validated = await revalidatePullRequest(
         repository,

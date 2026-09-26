@@ -360,6 +360,10 @@ export async function offerCheck(
     );
 }
 
+// GitHub refuses a check run summary over 65535 characters.
+const CHECK_SUMMARY_MAX = 65_535;
+const CUT = "\n\n(Cut here to fit the check run.)";
+
 export async function completeCheck(
   token: string,
   repository: string,
@@ -381,7 +385,10 @@ export async function completeCheck(
             conclusion === "success"
               ? "Swarm review completed"
               : "Swarm review could not complete",
-          summary,
+          summary:
+            summary.length > CHECK_SUMMARY_MAX
+              ? `${summary.slice(0, CHECK_SUMMARY_MAX - CUT.length)}${CUT}`
+              : summary,
         },
       }),
     },
@@ -397,6 +404,39 @@ export async function completeCheck(
 export const BRIEF_PATH = ".swarm-review/brief.md";
 export const BRIEF_MAX_CHARS = 64_000;
 
+async function readAtBase(
+  token: string,
+  repository: string,
+  base: string,
+  path: string,
+) {
+  const response = await fetch(
+    `${api}/repos/${repository}/contents/${path}?ref=${base}`,
+    {
+      headers: {
+        ...headers(token),
+        accept: "application/vnd.github.raw+json",
+      },
+    },
+  );
+  if (response.status === 404) return null;
+  const text = await response.text();
+  if (!response.ok)
+    throw new GitHubRequestError(
+      `read_contents_${response.status}`,
+      response,
+      text,
+    );
+  return text;
+}
+
+/** Why a file at the base could not be read, or the rate limit to wait out. */
+const unreadable = (error: unknown) => {
+  if (!(error instanceof GitHubRequestError)) return "could not be read";
+  if (error.retryAt !== null) throw error;
+  return `could not be read (${error.status})`;
+};
+
 export async function readBrief(
   token: string,
   repository: string,
@@ -405,35 +445,59 @@ export async function readBrief(
   const unused = (why: string) => ({
     note: `The repository brief \`${BRIEF_PATH}\` ${why}, so the default brief steered this review.`,
   });
+  let text: string | null;
   try {
-    const response = await fetch(
-      `${api}/repos/${repository}/contents/${BRIEF_PATH}?ref=${base}`,
-      {
-        headers: {
-          ...headers(token),
-          accept: "application/vnd.github.raw+json",
-        },
-      },
-    );
-    if (response.status === 404) return {};
-    const text = await response.text();
-    if (!response.ok) {
-      const error = new GitHubRequestError(
-        `read_brief_${response.status}`,
-        response,
-        text,
-      );
-      if (error.retryAt !== null) throw error;
-      return unused(`could not be read (${response.status})`);
-    }
-    return text.length > BRIEF_MAX_CHARS
-      ? unused(`is over ${BRIEF_MAX_CHARS} characters`)
-      : { context: text };
+    text = await readAtBase(token, repository, base, BRIEF_PATH);
   } catch (error) {
-    if (error instanceof GitHubRequestError) throw error;
-    return unused("could not be read");
+    return unused(unreadable(error));
   }
+  if (text === null) return {};
+  return text.length > BRIEF_MAX_CHARS
+    ? unused(`is over ${BRIEF_MAX_CHARS} characters`)
+    : { context: text };
 }
+
+export const CONFIG_PATH = ".swarm-review/config.json";
+
+/**
+ * The repository's review settings at the PR base. A config that is there but
+ * cannot be read or understood runs the review in shadow, because a repository
+ * that wrote one may have written it to keep reviews off its pull requests.
+ */
+export async function readConfig(
+  token: string,
+  repository: string,
+  base: string,
+): Promise<{ shadow: boolean; note?: string }> {
+  const shadowed = (why: string) => ({
+    shadow: true,
+    note: `The repository config \`${CONFIG_PATH}\` ${why}, so this review ran in shadow.`,
+  });
+  let text: string | null;
+  try {
+    text = await readAtBase(token, repository, base, CONFIG_PATH);
+  } catch (error) {
+    return shadowed(unreadable(error));
+  }
+  if (text === null) return { shadow: false };
+  let config: unknown;
+  try {
+    config = JSON.parse(text);
+  } catch {
+    return shadowed("is not valid JSON");
+  }
+  if (typeof config !== "object" || config === null || Array.isArray(config))
+    return shadowed("is not a JSON object");
+  const unknown = Object.keys(config).find((key) => key !== "shadow");
+  if (unknown !== undefined)
+    return shadowed(`has a key it does not know, \`${plainKey(unknown)}\``);
+  const { shadow = false } = config as { shadow?: unknown };
+  if (typeof shadow !== "boolean")
+    return shadowed("sets `shadow` to something other than true or false");
+  return { shadow };
+}
+
+const plainKey = (key: string) => key.replace(/[^\w.-]/g, "?").slice(0, 64);
 
 export async function updateCheck(
   token: string,

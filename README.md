@@ -188,6 +188,9 @@ One Durable Object per PR deduplicates delivery IDs, starts the same cloud revie
 The review runs against the merge base of the PR's base and head, so its receipt is published as one PR review with inline comments on the lines the three-dot diff touches.
 The review's brief is `.swarm-review/brief.md` read at the PR's base commit, never its head, so a pull request cannot rewrite the instructions its own review follows.
 Without that file the review runs on the default brief; a brief over 64 000 characters or one that cannot be read also falls back, and the check says so.
+`.swarm-review/config.json`, read at the same base commit, holds the repository's settings; today its one key is `shadow`.
+With `{"shadow": true}` the review runs as usual but nothing is posted to the pull request: the check carries the review instead, so a team can compare it with the reviewer it already has before turning it on.
+A config that is there but cannot be read, is not a JSON object, names another key, or sets `shadow` to anything but a boolean runs the review in shadow, and the check says why.
 While the review runs, the check shows its phase and each reviewer's family, model and state, updated when one of them changes.
 The object records a publish intent before the POST, and every retry looks for the review's marker on the PR first, so a review is posted once.
 A head that moved on top of the reviewed commit still gets the review at that commit; a commit force-pushed away gets none.
