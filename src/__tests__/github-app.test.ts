@@ -867,6 +867,7 @@ describe("GitHub App webhook", () => {
     "deadline",
     "deadline; destroy_failed: Durable Object reset because its code was updated.",
     "engine_failed; destroy_failed: busy",
+    "destroy_failed: Durable Object reset because its code was updated.",
   ])(
     "ends neutral without a retry when the platform did not cause the loss: %s",
     async (message) => {
